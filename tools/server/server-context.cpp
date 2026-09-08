@@ -2579,6 +2579,27 @@ private:
                         break;
                     }
 
+                    // Also persist the draft-model context when speculative decoding is
+                    // active. llama_state_seq_save_file only covers ctx_tgt; without this,
+                    // a slot running with a draft model (ctx_dft != nullptr) silently loses
+                    // its draft KV cache across a save/restore cycle. Stored as a companion
+                    // file next to the main save so older saves (no .dft file) still restore
+                    // cleanly -- see the matching restore-side handling below.
+                    if (ctx_dft != nullptr) {
+                        const size_t dft_size = llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        std::vector<uint8_t> dft_data(dft_size);
+                        const size_t dft_got = llama_state_seq_get_data_ext(ctx_dft, dft_data.data(), dft_size, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        if (dft_got != dft_size) {
+                            send_error(task, "Unable to capture draft-model state for save", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        std::ofstream dft_out(filepath + ".dft", std::ios::binary | std::ios::trunc);
+                        if (!dft_out || !dft_out.write(reinterpret_cast<const char *>(dft_data.data()), (std::streamsize) dft_data.size())) {
+                            send_error(task, "Unable to write draft-model state file", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2638,6 +2659,44 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // Restore the draft-model context too, if this save has a companion
+                        // .dft file (written by the SLOT_SAVE patch above) and this slot is
+                        // running with a draft model. A missing file (older save, or a
+                        // non-speculative deployment) is not an error -- the slot just starts
+                        // with a clean draft state, same as it would after SLOT_ERASE.
+                        if (ctx_dft != nullptr) {
+                            std::ifstream dft_in(filepath + ".dft", std::ios::binary | std::ios::ate);
+                            if (dft_in) {
+                                const std::streamsize dft_size = dft_in.tellg();
+                                dft_in.seekg(0, std::ios::beg);
+                                std::vector<uint8_t> dft_data((size_t) dft_size);
+                                if (!dft_in.read(reinterpret_cast<char *>(dft_data.data()), dft_size)) {
+                                    throw std::runtime_error("Unable to read draft-model state file");
+                                }
+                                const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (n_dft != dft_data.size()) {
+                                    throw std::runtime_error("Draft-model state size mismatch on restore");
+                                }
+                            }
+                        }
+
+                        // Seed a checkpoint covering the full restored range. Without this,
+                        // the reuse-validity check later in the processing loop (the one that
+                        // searches slot.prompt.checkpoints before trusting any computed
+                        // n_past) always finds an empty list right after a restore and forces
+                        // a full cold reprocess -- even when get_available_slot's own LCP
+                        // check reports a perfect prefix match moments earlier. This mirrors
+                        // exactly what create_checkpoint() does mid-generation, just run once
+                        // here against the state we just loaded instead of the current batch.
+                        if (!slot->prompt.tokens.empty()) {
+                            auto & ckpt = slot->prompt.checkpoints.emplace_back();
+                            ckpt.id_task = -1;
+                            ckpt.update_pos((int64_t) slot->prompt.tokens.size(), 0, (llama_pos) slot->prompt.tokens.size() - 1);
+                            ckpt.update_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.update_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            common_speculative_get_state(spec.get(), slot->id, ckpt.data_spec);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
