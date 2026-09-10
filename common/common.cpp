@@ -2306,6 +2306,23 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    // a checkpoint can be created while still in the prompt-prefill phase of
+    // a request (see create_checkpoint()'s periodic min-step trigger in
+    // tools/server/server-context.cpp), before the draft/speculative model
+    // has ever run a forward pass for this sequence -- draft-mtp and other
+    // speculative types only decode during token generation, not prefill.
+    // Under a split (non-unified) KV cache -- forced by --parallel>1 on
+    // hybrid/recurrent-layer architectures -- an unused sequence's backing
+    // buffer is not yet allocated, so reading it here would hit an
+    // unallocated tensor and hard-abort the whole process. Treat "nothing
+    // decoded yet" the same as "no draft context at all" (ctx == nullptr
+    // above): data_dft stays empty, and load_dft() already no-ops on an
+    // empty data_dft.
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) < 0) {
+        data_dft.clear();
+        return;
+    }
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
