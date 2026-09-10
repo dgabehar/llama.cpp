@@ -428,6 +428,32 @@ private:
                 return _add_rule("dot", rule);
             };
 
+            // Translates a PCRE-style shorthand character-class escape (\d, \D, \w, \W, \s, \S)
+            // that appears OUTSIDE of a [...] bracket expression into its own standalone GBNF
+            // character-class rule (analogous to get_dot() above for '.'). Unlike a shorthand
+            // escape mixed inside a [...] class, a standalone shorthand escape (positive or
+            // negated) always has a clean, exact GBNF translation. GBNF itself has no such escape
+            // (see gbnf_escape_length() above), so left untranslated this used to throw
+            // unsupported_pattern out of the literal branch below, which is a soft-fail
+            // (accept-any-string) rather than the loud, informative error such a common regex
+            // shorthand deserves -- handling it here keeps it a normal, composable token instead.
+            auto get_shorthand_class = [&](char esc) -> std::string {
+                switch (esc) {
+                    case 'd': return _add_rule("d",     "[0-9]");
+                    case 'D': return _add_rule("not-d", "[^0-9]");
+                    case 'w': return _add_rule("w",     "[A-Za-z0-9_]");
+                    case 'W': return _add_rule("not-w", "[^A-Za-z0-9_]");
+                    case 's': return _add_rule("s",     "[ \\t\\n\\r]");
+                    case 'S': return _add_rule("not-s", "[^ \\t\\n\\r]");
+                    default:
+                        // unreachable: only invoked for d/D/w/W/s/S, see dispatch below.
+                        throw unsupported_pattern("shorthand class '\\" + std::string(1, esc) + "'");
+                }
+            };
+            auto is_shorthand_class = [](char c) {
+                return c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S';
+            };
+
             // Joins the sequence, merging consecutive literals together.
             auto join_seq = [&]() {
                 std::vector<literal_or_rule> ret;
@@ -466,6 +492,12 @@ private:
                 if (c == '.') {
                     seq.emplace_back(get_dot(), false);
                     i++;
+                } else if (c == '\\' && i + 1 < length && is_shorthand_class(sub_pattern[i + 1])) {
+                    // Standalone \d, \D, \w, \W, \s, \S (i.e. not nested inside a [...] class):
+                    // translate to their own GBNF character-class rule so this token composes with
+                    // quantifiers (*, +, ?, {m,n}) exactly like get_dot()'s "." handling above.
+                    seq.emplace_back(get_shorthand_class(sub_pattern[i + 1]), false);
+                    i += 2;
                 } else if (c == '(') {
                     i++;
                     if (i < length && sub_pattern[i] == '?') {
@@ -494,7 +526,45 @@ private:
                     std::string square_brackets = std::string(1, c);
                     i++;
                     while (i < length && sub_pattern[i] != ']') {
-                        if (sub_pattern[i] == '\\') {
+                        if (sub_pattern[i] == '\\' && i + 1 < length && is_shorthand_class(sub_pattern[i + 1])) {
+                            // PCRE shorthand classes have no GBNF escape of their own (GBNF's [...]
+                            // only understands gbnf_escape_length()'s literal/hex escapes) -- without
+                            // this branch these would fall into the generic unsupported_pattern throw
+                            // below. \d/\w/\s are positive classes, so they can always be inlined as
+                            // extra members of this (possibly mixed) [...] class. \D/\W/\S are negated
+                            // classes: inlining them alongside other members of a positive class has no
+                            // single-range GBNF equivalent (e.g. [\D2468] can't be expressed as one flat
+                            // GBNF character class). Deliberately thrown as invalid_pattern (hard
+                            // conversion failure), NOT unsupported_pattern (which _visit_pattern
+                            // catches and silently downgrades to "accept any string" -- the wrong
+                            // outcome for a schema-critical field like a validated ID/format string,
+                            // which would then silently accept anything instead of surfacing the
+                            // pattern-authoring mistake) -- named error over silent grammar-text
+                            // corruption is the whole point of this fix, see this patch's own commit
+                            // message for the production incident this addresses.
+                            char esc = sub_pattern[i + 1];
+                            switch (esc) {
+                                case 'd':
+                                    square_brackets += "0-9";
+                                    i += 2;
+                                    break;
+                                case 'w':
+                                    square_brackets += "A-Za-z0-9_";
+                                    i += 2;
+                                    break;
+                                case 's':
+                                    square_brackets += " \\t\\n\\r";
+                                    i += 2;
+                                    break;
+                                default:
+                                    throw invalid_pattern(
+                                        "Pattern '" + pattern + "': negated shorthand class '\\" + std::string(1, esc) +
+                                        "' is not supported inside a [...] character class (GBNF has no single-range "
+                                        "equivalent for a negated shorthand mixed with other class members); rewrite "
+                                        "the pattern to use '\\" + std::string(1, esc) + "' on its own outside of "
+                                        "brackets, or replace it with an explicit negated range, e.g. [^0-9] for \\D");
+                            }
+                        } else if (sub_pattern[i] == '\\') {
                             auto escape_length = gbnf_escape_length(sub_pattern, i);
                             if (escape_length == 0) {
                                 throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
@@ -585,6 +655,16 @@ private:
                                 throw invalid_pattern("trailing backslash");
                             }
                             char next = sub_pattern[i + 1];
+                            if (is_shorthand_class(next)) {
+                                // Don't swallow \d/\D/\w/\W/\s/\S into the literal run: break out
+                                // (flushing whatever literal text was collected so far) and let the
+                                // outer dispatch loop's shorthand-class branch above handle it as its
+                                // own token, the same way it would if it started the token. Without
+                                // this, e.g. the \d in "^\d{4}-\d{2}-\d{2}$" right after the '-' would
+                                // otherwise reach gbnf_escape_length() below and throw
+                                // unsupported_pattern instead of composing correctly.
+                                break;
+                            }
                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
                                 i++;
                                 literal += sub_pattern[i];
