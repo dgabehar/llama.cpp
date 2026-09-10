@@ -1,0 +1,107 @@
+name: Sync fleet-patches with upstream
+
+# Keeps the `fleet-patches` branch (home-infrastructure's llamacpp-rpc image
+# build source, see deployments/llamacpp-rpc/image/Dockerfile's LLAMACPP_REF
+# header comment there) rebased on top of ggml-org/llama.cpp master. This
+# replaces the old workflow of manually re-checking `git apply --check`
+# against a new pin and hand-editing patch files -- a clean rebase here IS
+# that re-verification, done by git itself.
+#
+# - Clean rebase: force-pushed automatically. The branch always ends up as
+#   "current upstream master + our 4 patch commits", nothing more.
+# - Conflicting rebase: aborted, branch left untouched at its last-known-good
+#   state, and a single tracking issue is opened (or left alone if one is
+#   already open) describing the conflict for manual resolution.
+#
+# Bumping home-infrastructure's Dockerfile LLAMACPP_REF pin to a newer
+# fleet-patches commit after a sync stays a separate, deliberate step in
+# that repo (same re-verification discipline as any other pin bump) -- this
+# workflow never touches anything outside this repo.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. Scheduled workflows are disabled by default
+    # on GitHub for a repo with no recent activity -- re-enable under this
+    # repo's Actions tab if it ever goes quiet and this stops firing.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fleet-patches (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: fleet-patches
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "fleet-patches sync bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch upstream master
+
+      - name: Attempt rebase onto upstream/master
+        id: rebase
+        run: |
+          set +e
+          git rebase upstream/master
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          # Compare against the pre-rebase remote tip so a fully-up-to-date
+          # branch (nothing to rebase) is a silent no-op, not a force-push.
+          before="$(git rev-parse origin/fleet-patches)"
+          after="$(git rev-parse HEAD)"
+          if [ "$before" = "$after" ]; then
+            echo "Already up to date with upstream/master -- nothing to push."
+          else
+            git push --force-with-lease origin fleet-patches:fleet-patches
+            echo "Pushed rebased fleet-patches: $before -> $after"
+          fi
+
+      - name: Open or update conflict tracking issue
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --search 'in:title "fleet-patches rebase conflict"' \
+            --state open --json number --jq '.[0].number')"
+          upstream_sha="$(git rev-parse upstream/master)"
+
+          if [ -n "$existing" ]; then
+            printf 'Still conflicting as of upstream master `%s` (%s). fleet-patches was left untouched at its last-known-good commit.\n' \
+              "$upstream_sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/comment-body.md
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment-body.md
+          else
+            {
+              printf 'The scheduled sync workflow could not cleanly rebase `fleet-patches` onto `upstream/master` (`%s`). The branch has been left untouched at its last-known-good commit -- no broken state was pushed.\n' "$upstream_sha"
+              echo
+              echo 'Manual resolution needed: fetch this repo, `git rebase upstream/master` on `fleet-patches` locally, resolve conflicts, force-push. See each patch commit'"'"'s own message for the rationale behind that specific change, to help judge how to resolve a conflict in it.'
+              echo
+              echo 'Close this issue once resolved and pushed.'
+            } > /tmp/issue-body.md
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "fleet-patches rebase conflict against upstream master" \
+              --body-file /tmp/issue-body.md
+          fi
