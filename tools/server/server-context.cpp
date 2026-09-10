@@ -2371,6 +2371,128 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // Disk slot save/restore (POST /slots/{id}?action=save|restore) persists the raw
+    // KV state and token list but, absent this, discards slot.prompt.checkpoints
+    // entirely -- SLOT_RESTORE has no way to reconstruct them after the fact (a
+    // recurrent/SWA state cannot be rewound), so the reuse-validity check a few
+    // lines into the *next* request's processing always finds an empty checkpoint
+    // list and force-resets to a full cold reprocess, no matter how good the actual
+    // token-level match is. Vendored from ggml-org/llama.cpp PR #26004 (open,
+    // mergeable, regression-tested, not yet merged upstream as of this vendoring --
+    // see this file's own patch header for the full citation) rather than
+    // reinventing a weaker fix: this persists the checkpoints that already existed
+    // at save time (each with its own data_tgt/data_dft/data_spec), which correctly
+    // covers non-monotonic/divergent continuations, not just ones that strictly
+    // extend the saved prefix.
+    static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
+    static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+
+    static bool ckpt_read(std::ifstream & ifs, void * dst, size_t size, size_t & n_read) {
+        if (!ifs.read((char *) dst, size)) {
+            return false;
+        }
+        n_read += size;
+        return true;
+    }
+
+    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t & n_read) {
+        uint64_t n = 0;
+        // 16 GiB cap, in case the size field itself is corrupted
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > (1ull << 34)) {
+            return false;
+        }
+        buf.resize(n);
+        return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
+    }
+
+    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
+        ofs.write((const char *) src, size);
+        n_written += size;
+    }
+
+    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+        const uint64_t n = buf.size();
+        ckpt_write(ofs, &n, sizeof(n), n_written);
+        if (n > 0) {
+            ckpt_write(ofs, buf.data(), n, n_written);
+        }
+    }
+
+    size_t save_slot_checkpoints(const std::string & filepath, const server_slot & slot) const {
+        if (slot.prompt.checkpoints.empty()) {
+            return 0;
+        }
+        std::ofstream ofs(filepath, std::ios::binary | std::ios::app);
+        if (!ofs) {
+            SRV_WRN("failed to append context checkpoints to '%s'\n", filepath.c_str());
+            return 0;
+        }
+        size_t n_written = 0;
+        const uint32_t magic   = SLOT_CKPT_MAGIC;
+        const uint32_t version = SLOT_CKPT_VERSION;
+        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+        ckpt_write(ofs, &version, sizeof(version), n_written);
+        ckpt_write(ofs, &count,   sizeof(count),   n_written);
+        for (const auto & cur : slot.prompt.checkpoints) {
+            ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
+            ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
+            ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
+            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
+            ckpt_write_buf(ofs, cur.data_dft,  n_written);
+            ckpt_write_buf(ofs, cur.data_spec, n_written);
+        }
+        ofs.flush();
+        if (!ofs) {
+            SRV_WRN("failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+            return 0;
+        }
+        SRV_INF("appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
+                count, (float) n_written / 1024 / 1024, filepath.c_str());
+        return n_written;
+    }
+
+    // returns the number of bytes consumed, 0 if there is no usable appendix
+    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
+        std::ifstream ifs(filepath, std::ios::binary);
+        if (!ifs || !ifs.seekg(offset)) {
+            return 0;
+        }
+        size_t n_read = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        uint32_t count   = 0;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_CKPT_MAGIC) {
+            return 0;
+        }
+        if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_CKPT_VERSION ||
+            !ckpt_read(ifs, &count,   sizeof(count),   n_read) || count > 1024) {
+            SRV_WRN("invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+            return 0;
+        }
+        std::list<common_prompt_checkpoint> checkpoints;
+        for (uint32_t i = 0; i < count; ++i) {
+            common_prompt_checkpoint cur;
+            cur.id_task = -1;
+            if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
+                !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
+                !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
+                !ckpt_read_buf(ifs, cur.data_tgt,  n_read) ||
+                !ckpt_read_buf(ifs, cur.data_dft,  n_read) ||
+                !ckpt_read_buf(ifs, cur.data_spec, n_read)) {
+                SRV_WRN("truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
+                return 0;
+            }
+            checkpoints.push_back(std::move(cur));
+        }
+        while (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
+            checkpoints.pop_front();
+        }
+        slot.prompt.checkpoints = std::move(checkpoints);
+        SRV_INF("restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
+        return n_read;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2579,6 +2701,32 @@ private:
                         break;
                     }
 
+                    // Also persist the draft-model context when speculative decoding is
+                    // active. llama_state_seq_save_file only covers ctx_tgt; without this,
+                    // a slot running with a draft model (ctx_dft != nullptr) silently loses
+                    // its LIVE draft KV cache across a save/restore cycle -- complementary
+                    // to save_slot_checkpoints() below, which only preserves data_dft for
+                    // whatever checkpoints happen to already exist (none, on a short
+                    // conversation that hasn't hit its first checkpoint yet). Stored as a
+                    // companion file next to the main save so older saves (no .dft file)
+                    // still restore cleanly -- see the matching restore-side handling below.
+                    if (ctx_dft != nullptr) {
+                        const size_t dft_size = llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        std::vector<uint8_t> dft_data(dft_size);
+                        const size_t dft_got = llama_state_seq_get_data_ext(ctx_dft, dft_data.data(), dft_size, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        if (dft_got != dft_size) {
+                            send_error(task, "Unable to capture draft-model state for save", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        std::ofstream dft_out(filepath + ".dft", std::ios::binary | std::ios::trunc);
+                        if (!dft_out || !dft_out.write(reinterpret_cast<const char *>(dft_data.data()), (std::streamsize) dft_data.size())) {
+                            send_error(task, "Unable to write draft-model state file", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+
+                    const size_t nwrite_ckpt = save_slot_checkpoints(filepath, *slot);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2588,7 +2736,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_ckpt;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2638,11 +2786,40 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // Restore the draft-model context too, if this save has a companion
+                        // .dft file (written by the SLOT_SAVE patch above) and this slot is
+                        // running with a draft model. A missing file (older save, or a
+                        // non-speculative deployment) is not an error -- the slot just starts
+                        // with a clean draft state, same as it would after SLOT_ERASE.
+                        if (ctx_dft != nullptr) {
+                            std::ifstream dft_in(filepath + ".dft", std::ios::binary | std::ios::ate);
+                            if (dft_in) {
+                                const std::streamsize dft_size = dft_in.tellg();
+                                dft_in.seekg(0, std::ios::beg);
+                                std::vector<uint8_t> dft_data((size_t) dft_size);
+                                if (!dft_in.read(reinterpret_cast<char *>(dft_data.data()), dft_size)) {
+                                    throw std::runtime_error("Unable to read draft-model state file");
+                                }
+                                const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (n_dft != dft_data.size()) {
+                                    throw std::runtime_error("Draft-model state size mismatch on restore");
+                                }
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+
+                    // nread is the end offset of the llama state payload within the file --
+                    // the checkpoint appendix (if any) starts there. See
+                    // save_slot_checkpoints/load_slot_checkpoints above for why this exists:
+                    // without it, the next request's reuse-validity check always finds an
+                    // empty checkpoint list and force-resets to a full cold reprocess, no
+                    // matter how good the actual token-level match is.
+                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2653,7 +2830,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + nread_ckpt;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
