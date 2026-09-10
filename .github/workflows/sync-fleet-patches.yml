@@ -88,15 +88,20 @@ jobs:
             --search 'in:title "fleet-patches rebase conflict"' \
             --state open --json number --jq '.[0].number')"
           upstream_sha="$(git rev-parse upstream/master)"
+
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
-              --body "Still conflicting as of upstream master \`$upstream_sha\` ($(date -u +%Y-%m-%dT%H:%M:%SZ)). fleet-patches was left untouched at its last-known-good commit."
+            printf 'Still conflicting as of upstream master `%s` (%s). fleet-patches was left untouched at its last-known-good commit.\n' \
+              "$upstream_sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/comment-body.md
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment-body.md
           else
+            {
+              printf 'The scheduled sync workflow could not cleanly rebase `fleet-patches` onto `upstream/master` (`%s`). The branch has been left untouched at its last-known-good commit -- no broken state was pushed.\n' "$upstream_sha"
+              echo
+              echo 'Manual resolution needed: fetch this repo, `git rebase upstream/master` on `fleet-patches` locally, resolve conflicts, force-push. See each patch commit'"'"'s own message for the rationale behind that specific change, to help judge how to resolve a conflict in it.'
+              echo
+              echo 'Close this issue once resolved and pushed.'
+            } > /tmp/issue-body.md
             gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "fleet-patches rebase conflict against upstream master" \
-              --body "The scheduled sync workflow could not cleanly rebase \`fleet-patches\` onto \`upstream/master\` (\`$upstream_sha\`). The branch has been left untouched at its last-known-good commit -- no broken state was pushed.
-
-Manual resolution needed: fetch this repo, \`git rebase upstream/master\` on \`fleet-patches\` locally, resolve conflicts, force-push. See each patch commit's own message for the rationale behind that specific change, to help judge how to resolve a conflict in it.
-
-Close this issue once resolved and pushed."
+              --body-file /tmp/issue-body.md
           fi
