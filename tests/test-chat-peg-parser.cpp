@@ -358,6 +358,11 @@ static void test_example_native(testing & t) {
             auto parser  = build_parser(tc);
             auto lazy    = !tc.tools.empty() && tc.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
             auto grammar = build_grammar([&](const common_grammar_builder & builder) {
+                for (const auto & def : tc.tools) {
+                    auto function   = def.at("function");
+                    auto parameters = function.at("parameters");
+                    builder.resolve_refs(parameters);
+                };
                 parser.build_grammar(builder, lazy);
             });
 
@@ -435,6 +440,11 @@ static void test_example_qwen3_coder(testing & t) {
     });
 
     auto grammar = build_grammar([&](const common_grammar_builder & builder) {
+        for (const auto & def : tools) {
+            auto function   = def.at("function");
+            auto parameters = function.at("parameters");
+            builder.resolve_refs(parameters);
+        };
         parser.build_grammar(builder);
     });
 
@@ -503,6 +513,11 @@ static void test_example_qwen3_non_coder(testing & t) {
     });
 
     auto grammar = build_grammar([&](const common_grammar_builder & builder) {
+        for (const auto & def : tools) {
+            auto function   = def.at("function");
+            auto parameters = function.at("parameters");
+            builder.resolve_refs(parameters);
+        };
         parser.build_grammar(builder);
     });
 
