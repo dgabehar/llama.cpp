@@ -3494,6 +3494,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
+    // Never fused with bias/silu (ggml_vk_can_fuse_ssm_conv only matches the
+    // plain GGML_OP_SSM_CONV enum), so this is the only pipeline variant needed.
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32, "ssm_conv_split_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 4, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -8758,6 +8762,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_SSM_CONV_SPLIT:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_ssm_conv_split_f32;
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
@@ -9277,8 +9286,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         }
         break;
     case GGML_OP_SSM_CONV:
+    case GGML_OP_SSM_CONV_SPLIT:
         {
-            const uint32_t nr  = src0->ne[1];
+            const uint32_t nr  = src0->ne[1]; // d_inner -- src0 is sx (SSM_CONV) or prefix (SSM_CONV_SPLIT), both axis-1 d_inner
             const uint32_t n_t = dst->ne[1];
             const uint32_t n_s = dst->ne[2];
             elements = { nr, n_t, n_s };
@@ -9934,6 +9944,28 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src1->ne[0],
         (uint32_t)src0->ne[0],
         (uint32_t)src0->ne[1],
+        (uint32_t)dst->ne[1],
+        (uint32_t)dst->ne[2],
+    });
+}
+
+void ggml_vk_ssm_conv_split(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * prefix     = dst->src[0];
+    const ggml_tensor * new_tokens = dst->src[1];
+    const ggml_tensor * conv_w     = dst->src[2];
+
+    // Never fused (ggml_vk_can_fuse_ssm_conv only matches the plain
+    // GGML_OP_SSM_CONV enum), so unlike ggml_vk_ssm_conv above there's no
+    // fused-chain dst lookup and no optional bias.
+    ggml_vk_op_f32<vk_op_ssm_conv_split_push_constants>(ctx, subctx, prefix, new_tokens, conv_w, nullptr, dst, GGML_OP_SSM_CONV_SPLIT, {
+        (uint32_t)prefix->nb[1], (uint32_t)prefix->nb[2],
+        (uint32_t)new_tokens->nb[0], (uint32_t)new_tokens->nb[1], (uint32_t)new_tokens->nb[2],
+        (uint32_t)conv_w->nb[1],
+        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+        (uint32_t)conv_w->ne[0],
+        (uint32_t)prefix->ne[0],
+        (uint32_t)prefix->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
     });
@@ -12290,6 +12322,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+    case GGML_OP_SSM_CONV_SPLIT:
+        ggml_vk_ssm_conv_split(ctx, compute_ctx, cgraph, node_idx);
 
         break;
 
@@ -15481,6 +15517,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_CONV_SPLIT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:

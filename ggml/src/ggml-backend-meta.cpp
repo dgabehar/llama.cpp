@@ -810,6 +810,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
+    // GGML_OP_SSM_CONV_SPLIT is ggml_ssm_conv's sx argument split in two
+    // (prefix, new_tokens) so the caller doesn't have to materialize their
+    // concatenation -- src_ss[0]/[1] are the two halves of what used to be
+    // one axis-0-contiguous tensor, so they must carry the same split state
+    // as each other, and the pair as a whole is handled exactly like
+    // handle_ssm_conv above treats its single sx argument against c.
+    // NOT exercised by any topology this fleet currently runs (no
+    // LLAMA_SPLIT_MODE_TENSOR / `-sm tensor` usage anywhere in
+    // home-infrastructure's llamacpp-rpc chart) and therefore not validated
+    // against real multi-device execution -- derived by direct analogy with
+    // handle_ssm_conv rather than tested.
+    auto handle_ssm_conv_split = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+        if (src_ss[0].axis == src_ss[2].axis) {
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+            }
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            }
+        }
+        return handle_generic(src_ss, /*scalar_only =*/ false);
+    };
+
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
@@ -1057,6 +1081,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_OPT_STEP_SGD:
             case GGML_OP_GLU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_SSM_CONV_SPLIT: {
+                split_state = handle_ssm_conv_split(src_ss);
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));

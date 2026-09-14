@@ -699,6 +699,14 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_ssm_conv_split_push_constants {
+    uint32_t p_nb1, p_nb2;
+    uint32_t nt_nb0, nt_nb1, nt_nb2; // nt_nb0 is the only stride here that isn't assumed to be sizeof(float)
+    uint32_t c_nb1;
+    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, dm1, nr, n_t, n_s;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;

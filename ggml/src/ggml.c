@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SSM_CONV_SPLIT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "ssm_conv_split(prefix, new_tokens, c)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5678,6 +5682,44 @@ struct ggml_tensor * ggml_ssm_conv(
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
     result->src[1] = c;
+
+    return result;
+}
+
+// ggml_ssm_conv_split
+
+struct ggml_tensor * ggml_ssm_conv_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * new_tokens,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(prefix));
+    GGML_ASSERT(ggml_is_3d(new_tokens));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(prefix));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = new_tokens->ne[0];
+    const int64_t n_s     = prefix->ne[2];
+
+    // TODO: maybe support other strides than 1?
+    GGML_ASSERT(prefix->ne[0]     == d_conv - 1);
+    GGML_ASSERT(prefix->ne[1]     == d_inner);
+    GGML_ASSERT(new_tokens->ne[1] == d_inner);
+    GGML_ASSERT(new_tokens->ne[2] == n_s);
+    GGML_ASSERT(n_t >= 0);
+
+    // new_tokens is deliberately allowed to be a non-contiguous view (e.g. a
+    // transpose) -- that is the whole point of this op: the caller no longer
+    // has to materialize concat(prefix, new_tokens) into one contiguous buffer.
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV_SPLIT;
+    result->src[0] = prefix;
+    result->src[1] = new_tokens;
+    result->src[2] = c;
 
     return result;
 }
