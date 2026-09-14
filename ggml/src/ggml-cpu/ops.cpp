@@ -9768,6 +9768,98 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_ssm_conv_split
+//
+// Same math as ggml_compute_forward_ssm_conv, but reads the sliding window
+// from two separate sources instead of one pre-concatenated buffer: a small
+// contiguous `prefix` (the last d_conv-1 columns carried over from the
+// previous step) and `new_tokens`, which may be a non-contiguous view (e.g.
+// a transpose) -- so this cannot use the single-flat-index trick the fused
+// kernel uses and instead computes each tap's source and byte offset
+// explicitly.
+
+static void ggml_compute_forward_ssm_conv_split_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * prefix     = dst->src[0];
+    const ggml_tensor * new_tokens = dst->src[1];
+    const ggml_tensor * conv_w     = dst->src[2]; // conv1d.weight
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = conv_w->ne[0]; // d_conv
+    const int dm1 = prefix->ne[0]; // d_conv - 1
+    const int nr  = conv_w->ne[1]; // d_inner
+    const int n_t =  dst->ne[1];   // tokens per sequence
+    const int n_s =  dst->ne[2];   // number of sequences in the batch
+
+    GGML_ASSERT( dst->ne[0] == nr);
+    GGML_ASSERT(prefix->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_w->nb[0] == sizeof(float));
+    GGML_ASSERT(prefix->nb[1] == prefix->ne[0]*sizeof(float));
+    GGML_ASSERT(dm1 == nc - 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir  = ir1 - ir0;
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        const char * p_base  = (const char *) prefix->data     + ir0*prefix->nb[1]     + i3*prefix->nb[2];
+        const char * nt_base = (const char *) new_tokens->data + ir0*new_tokens->nb[1] + i3*new_tokens->nb[2];
+        const char * c_base  = (const char *) conv_w->data     + ir0*conv_w->nb[1];
+
+        for (int i2 = 0; i2 < n_t; ++i2) {
+            float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
+
+            // d_inner
+            for (int i1 = 0; i1 < ir; ++i1) {
+                const float * c = (const float *) (c_base + i1*conv_w->nb[1]); // {d_conv, d_inner}
+
+                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
+                float sumf = 0.0f;
+
+                // d_conv -- tap i0 reads position (i2 + i0) of the logical
+                // concat(prefix, new_tokens) buffer without materializing it
+                for (int i0 = 0; i0 < nc; ++i0) {
+                    const int pos = i2 + i0;
+
+                    float v;
+                    if (pos < dm1) {
+                        v = *(const float *) (p_base + i1*prefix->nb[1] + pos*prefix->nb[0]);
+                    } else {
+                        const int nt_pos = pos - dm1;
+                        v = *(const float *) (nt_base + i1*new_tokens->nb[1] + nt_pos*new_tokens->nb[0]);
+                    }
+
+                    sumf += v * c[i0];
+                }
+
+                x[i1] = sumf;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_split(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_split_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(

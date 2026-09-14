@@ -4306,6 +4306,49 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// like test_ssm_conv, but exercises ggml_ssm_conv_split: prefix and new_tokens
+// are two separate tensors instead of one pre-concatenated buffer, and
+// new_tokens can be a non-contiguous view (transpose_new = true), mirroring
+// delta-net-base.cpp's real call site (build_conv_state's `qkv_mixed` is
+// always passed through ggml_transpose before reaching this op).
+struct test_ssm_conv_split : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 3> ne_prefix;     // [d_conv - 1, d_inner, n_s]
+    const std::array<int64_t, 3> ne_new_tokens; // [n_t, d_inner, n_s], logical shape
+    const std::array<int64_t, 2> ne_c;          // [d_conv, d_inner]
+    const bool transpose_new;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne_prefix, ne_new_tokens, ne_c, transpose_new);
+    }
+
+    test_ssm_conv_split(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 3> ne_prefix     = {3, 10, 1},
+            std::array<int64_t, 3> ne_new_tokens = {10, 10, 1},
+            std::array<int64_t, 2> ne_c          = {4, 10},
+            bool transpose_new = false)
+        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * prefix = ggml_new_tensor_3d(ctx, type, ne_prefix[0], ne_prefix[1], ne_prefix[2]);
+        ggml_tensor * c      = ggml_new_tensor_2d(ctx, type, ne_c[0], ne_c[1]);
+
+        ggml_tensor * new_tokens;
+        if (transpose_new) {
+            // [d_inner, n_t, n_s] source, transposed to [n_t, d_inner, n_s] --
+            // a genuinely non-contiguous, non-unit ne[0]-stride view, not just
+            // a mechanically-contiguous tensor of the right shape.
+            ggml_tensor * src = ggml_new_tensor_3d(ctx, type, ne_new_tokens[1], ne_new_tokens[0], ne_new_tokens[2]);
+            new_tokens = ggml_transpose(ctx, src);
+        } else {
+            new_tokens = ggml_new_tensor_3d(ctx, type, ne_new_tokens[0], ne_new_tokens[1], ne_new_tokens[2]);
+        }
+
+        ggml_tensor * out = ggml_ssm_conv_split(ctx, prefix, new_tokens, c);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -9702,6 +9745,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+
+            for (bool transpose_new : {false, true}) {
+                // n_t == 1: single-token decode, the common case where the tap window
+                // straddles the prefix/new_tokens boundary (n_t < d_conv - 1 always here).
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {1, d_inner, 1}, {d_conv, d_inner}, transpose_new));
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 4}, {1, d_inner, 4}, {d_conv, d_inner}, transpose_new));
+                // n_t == d_conv - 1: boundary case, s_idx == n_t == d_conv - 1 (window falls
+                // entirely in new_tokens, exercising that edge exactly).
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {d_conv - 1, d_inner, 1}, {d_conv, d_inner}, transpose_new));
+                // long token (n_t > 32): prefill-like, window entirely within new_tokens.
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {64, d_inner, 1}, {d_conv, d_inner}, transpose_new));
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 4}, {64, d_inner, 4}, {d_conv, d_inner}, transpose_new));
+            }
         }
     }
 
@@ -11334,6 +11390,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+
+    for (bool transpose_new : {false, true}) {
+        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 3328, 1}, {512, 3328, 1}, {4, 3328}, transpose_new)); // prefill
+        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 8192, 1}, {934, 8192, 1}, {4, 8192}, transpose_new)); // prefill
+        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 3328, 1}, {1,   3328, 1}, {4, 3328}, transpose_new)); // generate
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill

@@ -601,6 +601,15 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Kept at the end of the enum (not grouped with GGML_OP_SSM_CONV
+        // above) so this backend-scoped (CPU+Vulkan only) addition doesn't
+        // shift the numeric value of every later op -- ggml-rpc.h's wire
+        // protocol serializes tensors by raw ggml_op value, and this fleet
+        // runs a distributed RPC backend with a one-node-at-a-time rollout
+        // convention, so minimizing the blast radius of a transient
+        // version-mismatched master/worker pair matters here.
+        GGML_OP_SSM_CONV_SPLIT,
+
         GGML_OP_COUNT,
     };
 
@@ -2524,6 +2533,17 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
+            struct ggml_tensor  * c);
+
+    // like ggml_ssm_conv, but avoids materializing sx = concat(prefix, new_tokens):
+    // prefix     [d_conv-1, d_inner, n_s], contiguous
+    // new_tokens [n_t,      d_inner, n_s], may be a non-contiguous view (e.g. a transpose)
+    // c          [d_conv, d_inner]
+    // CPU and Vulkan backends only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * new_tokens,
             struct ggml_tensor  * c);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
