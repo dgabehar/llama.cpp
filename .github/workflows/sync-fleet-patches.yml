@@ -8,10 +8,20 @@ name: Sync fleet-patches with upstream
 # that re-verification, done by git itself.
 #
 # - Clean rebase: force-pushed automatically. The branch always ends up as
-#   "current upstream master + our 4 patch commits", nothing more.
+#   "current upstream master + our own patch commits", nothing more (patch
+#   count grows over time -- don't hardcode it here or in this comment).
 # - Conflicting rebase: aborted, branch left untouched at its last-known-good
 #   state, and a single tracking issue is opened (or left alone if one is
 #   already open) describing the conflict for manual resolution.
+# - Rebase succeeds but the push fails: this happens specifically when the
+#   rebase pulls in an upstream change to a file under .github/workflows/ --
+#   GitHub's default GITHUB_TOKEN can NEVER push to workflow files, as a
+#   hardcoded anti-privilege-escalation rule with no permissions: key that
+#   overrides it (confirmed 2026-09-14: adding `workflows: write` isn't just
+#   ineffective, it's not even a valid key -- workflow_dispatch itself then
+#   fails to parse). The rebase itself is still valid and safe to push
+#   manually (`git push --force-with-lease origin fleet-patches:fleet-patches`
+#   from a normal authenticated clone) when this specific failure occurs.
 #
 # Bumping home-infrastructure's Dockerfile LLAMACPP_REF pin to a newer
 # fleet-patches commit after a sync stays a separate, deliberate step in
@@ -29,7 +39,6 @@ on:
 permissions:
   contents: write
   issues: write
-  workflows: write
 
 jobs:
   sync:
