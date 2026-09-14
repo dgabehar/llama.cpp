@@ -76,9 +76,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
-    // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
-    // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
-    ggml_tensor * build_conv_state(
+    // read conv state from cache, write the new tail state back (single slot or per-token)
+    // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns {prefix, new_tokens} for ggml_ssm_conv_split:
+    //   prefix:     (kernel_size - 1, channels, n_seqs), contiguous
+    //   new_tokens: (n_seq_tokens, channels, n_seqs), a transposed (non-contiguous) view of qkv_mixed
+    // Does NOT concat prefix and new_tokens (that used to be this function's whole job) --
+    // callers pass both straight to ggml_ssm_conv_split, which reads across the split itself.
+    std::pair<ggml_tensor *, ggml_tensor *> build_conv_state(
             llm_graph_input_rs * inp,
             ggml_tensor *        conv_states_all,
             ggml_tensor *        qkv_mixed,

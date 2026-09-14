@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+// Same computation as ssm_conv.comp, but the sliding window is read from two
+// separate sources instead of one pre-concatenated buffer: Prefix (the last
+// d_conv-1 columns carried over from the previous step, always contiguous)
+// and NewTokens, which may be a non-contiguous view (e.g. a transpose) --
+// nt_nb0 is therefore a real, possibly non-4-byte stride, unlike every other
+// stride here. This op is never fused with bias/silu (ggml_vk_can_fuse_ssm_conv
+// only matches the plain GGML_OP_SSM_CONV enum), so there is no APPLY_BIAS/
+// APPLY_SILU path and no vec4 fast path for nc == 4 -- the strided NewTokens
+// read can't use it.
+layout(binding = 0) readonly buffer Prefix    { float prefix[]; };
+layout(binding = 1) readonly buffer NewTokens { float new_tokens[]; };
+layout(binding = 2) readonly buffer ConvW     { float conv_w[]; };
+layout(binding = 3) buffer Dst { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint p_nb1; uint p_nb2;
+    uint nt_nb0; uint nt_nb1; uint nt_nb2;
+    uint c_nb1;
+    uint dst_nb0; uint dst_nb1; uint dst_nb2;
+    uint nc; uint dm1; uint nr; uint n_t; uint n_s;
+};
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint i3 = gl_WorkGroupID.z;
+
+    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+        return;
+    }
+
+    const uint p_base  = i3 * (p_nb2  / 4) + i1 * (p_nb1  / 4);
+    const uint nt_base = i3 * (nt_nb2 / 4) + i1 * (nt_nb1 / 4);
+    const uint c_base  = i1 * c_nb1 / 4;
+
+    float sum = 0.0;
+
+    // d_conv taps: tap i0 reads logical position (i2 + i0) of
+    // concat(prefix, new_tokens) without materializing it.
+    [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+        const uint pos = i2 + i0;
+
+        float v;
+        if (pos < dm1) {
+            v = prefix[p_base + pos];
+        } else {
+            const uint nt_pos = pos - dm1;
+            v = new_tokens[nt_base + nt_pos * (nt_nb0 / 4)];
+        }
+
+        sum += v * conv_w[c_base + i0];
+    }
+
+    const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+    dst[dst_idx] = sum;
+}

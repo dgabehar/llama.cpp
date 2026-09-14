@@ -446,7 +446,53 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
-ggml_tensor * llm_build_delta_net_base::build_conv_state(
+// Build the width-(conv_kernel_size - 1) window starting at logical column
+// `s_idx` of what used to be the materialized concat(prefix, new_tokens)
+// buffer, without materializing that full buffer. The window either falls
+// entirely inside `prefix` (s_idx == 0), entirely inside `new_tokens`
+// (s_idx >= dm1), or straddles the boundary between them (0 < s_idx < dm1) --
+// s_idx < dm1 only happens when n_t < dm1, i.e. during single/small-token
+// decode steps, since prefill's n_t is normally far larger than the conv
+// kernel width. The straddling case is the one the old concat-based code got
+// "for free"; here it costs a small (at most dm1-wide) concat instead of one
+// sized by the full n_t.
+static ggml_tensor * build_conv_window(
+        ggml_context * ctx0,
+        ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
+        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], possibly non-contiguous
+        int64_t        dm1,
+        int64_t        conv_channels,
+        int64_t        n_seqs,
+        int64_t        s_idx) {
+    GGML_ASSERT(s_idx >= 0 && s_idx <= new_tokens->ne[0]);
+
+    if (s_idx == 0) {
+        return prefix;
+    }
+
+    if (s_idx >= dm1) {
+        return ggml_view_3d(ctx0, new_tokens,
+                dm1, conv_channels, n_seqs,
+                new_tokens->nb[1], new_tokens->nb[2],
+                (s_idx - dm1) * new_tokens->nb[0]);
+    }
+
+    ggml_tensor * prefix_part =
+        ggml_view_3d(ctx0, prefix,
+                dm1 - s_idx, conv_channels, n_seqs,
+                prefix->nb[1], prefix->nb[2],
+                s_idx * prefix->nb[0]);
+
+    ggml_tensor * new_tokens_part =
+        ggml_view_3d(ctx0, new_tokens,
+                s_idx, conv_channels, n_seqs,
+                new_tokens->nb[1], new_tokens->nb[2],
+                0);
+
+    return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        qkv_mixed,
@@ -459,32 +505,28 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const auto mem_size = mctx_cur->get_size();
 
     const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t dm1    = conv_kernel_size - 1;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, dm1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
-    cb(qkv_mixed, "qkv_mixed_transposed", il);
+    ggml_tensor * new_tokens = ggml_transpose(ctx0, qkv_mixed);
+    cb(new_tokens, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
-    cb(conv_input, "conv_input", il);
+    const int64_t n_t = new_tokens->ne[0];
 
-    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+    const int64_t row_count = dm1 * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
     if (cparams.n_rs_seq == 0) {
-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t s_idx  = n_t;
         const int64_t s_slot = 0;
 
-        ggml_tensor * conv_state_last =
-            ggml_view_3d(ctx0, conv_input,
-                    conv_kernel_size - 1, conv_channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =
@@ -502,14 +544,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
         for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_idx  = std::max<int64_t>(0, n_t - K + t);
             const int64_t s_slot = K - t;
 
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(ctx0, conv_input,
-                        conv_kernel_size - 1, conv_channels, n_seqs,
-                        conv_input->nb[1], conv_input->nb[2],
-                        ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
 
             ggml_tensor * conv_state_update =
                 ggml_view_2d(ctx0,
@@ -521,7 +559,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         }
     }
 
-    return conv_input;
+    return { conv_states, new_tokens };
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
