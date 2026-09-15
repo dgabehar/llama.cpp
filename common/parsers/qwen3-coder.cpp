@@ -88,8 +88,21 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // Bound the string value the same defensive way the `reasoning` rule above
+            // bounds its own span (until_one_of, not a bare until on the expected
+            // terminator alone) -- a runaway/degenerate generation must never be able to
+            // smuggle another structural tag (a real llama.cpp/server incident, live-
+            // traced on gabesrv06 2026-09-15: MTP speculative decoding occasionally flips
+            // a close greedy call at this exact template boundary, and a bare `until`
+            // silently absorbed the resulting <parameter=.../<tool_call>/</function>
+            // repetition as "valid" string content since none of it equalled the single
+            // terminator). Excluding these from the value's own GBNF rule makes the
+            // grammar itself reject the bad continuation and force a resample, instead of
+            // silently corrupting the argument -- regardless of what causes the flip.
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of({
+                    "\n</parameter>\n", "<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter="
+                })) + arg_close, "\n</parameter>\n"));
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
