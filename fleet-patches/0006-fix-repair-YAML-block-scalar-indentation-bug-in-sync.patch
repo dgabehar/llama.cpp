@@ -1,0 +1,47 @@
+From 290b1023df0be7717da0befea44bf9d707a05f03 Mon Sep 17 00:00:00 2001
+From: Doug Gabehart <dgabehar@gmail.com>
+Date: Wed, 9 Sep 2026 21:01:01 -0500
+Subject: [PATCH] fix: repair YAML block-scalar indentation bug in sync
+ workflow
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+---
+ .github/workflows/sync-fleet-patches.yml | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/.github/workflows/sync-fleet-patches.yml b/.github/workflows/sync-fleet-patches.yml
+index 258a40b59..35509aa10 100644
+--- a/.github/workflows/sync-fleet-patches.yml
++++ b/.github/workflows/sync-fleet-patches.yml
+@@ -88,15 +88,20 @@ jobs:
+             --search 'in:title "fleet-patches rebase conflict"' \
+             --state open --json number --jq '.[0].number')"
+           upstream_sha="$(git rev-parse upstream/master)"
++
+           if [ -n "$existing" ]; then
+-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+-              --body "Still conflicting as of upstream master \`$upstream_sha\` ($(date -u +%Y-%m-%dT%H:%M:%SZ)). fleet-patches was left untouched at its last-known-good commit."
++            printf 'Still conflicting as of upstream master `%s` (%s). fleet-patches was left untouched at its last-known-good commit.\n' \
++              "$upstream_sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/comment-body.md
++            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment-body.md
+           else
++            {
++              printf 'The scheduled sync workflow could not cleanly rebase `fleet-patches` onto `upstream/master` (`%s`). The branch has been left untouched at its last-known-good commit -- no broken state was pushed.\n' "$upstream_sha"
++              echo
++              echo 'Manual resolution needed: fetch this repo, `git rebase upstream/master` on `fleet-patches` locally, resolve conflicts, force-push. See each patch commit'"'"'s own message for the rationale behind that specific change, to help judge how to resolve a conflict in it.'
++              echo
++              echo 'Close this issue once resolved and pushed.'
++            } > /tmp/issue-body.md
+             gh issue create --repo "$GITHUB_REPOSITORY" \
+               --title "fleet-patches rebase conflict against upstream master" \
+-              --body "The scheduled sync workflow could not cleanly rebase \`fleet-patches\` onto \`upstream/master\` (\`$upstream_sha\`). The branch has been left untouched at its last-known-good commit -- no broken state was pushed.
+-
+-Manual resolution needed: fetch this repo, \`git rebase upstream/master\` on \`fleet-patches\` locally, resolve conflicts, force-push. See each patch commit's own message for the rationale behind that specific change, to help judge how to resolve a conflict in it.
+-
+-Close this issue once resolved and pushed."
++              --body-file /tmp/issue-body.md
+           fi
+-- 
+2.43.0
+

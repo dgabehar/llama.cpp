@@ -1,0 +1,870 @@
+From 87b0c16d45277d535447e7d10bd46da012989555 Mon Sep 17 00:00:00 2001
+From: Doug Gabehart <dgabehar@gmail.com>
+Date: Mon, 14 Sep 2026 13:10:48 -0500
+Subject: [PATCH] ggml: add GGML_OP_SSM_CONV_SPLIT (CPU+Vulkan) to skip the
+ per-layer conv-state concat
+
+delta-net-base.cpp's build_conv_state materialized concat(prefix, new_tokens)
+before every ggml_ssm_conv call in the qwen35/qwen35moe/qwen3next GDN path --
+a full-size copy on every layer just to satisfy ggml_ssm_conv's single-buffer
+contract. GGML_OP_SSM_CONV_SPLIT takes the two pieces directly (prefix always
+contiguous, new_tokens a possibly non-contiguous transposed view) and reads
+across the split itself, so the concat is no longer needed.
+
+Scoped to CPU and Vulkan only -- the two backends this fleet actually runs --
+not the ~11 other ggml_ssm_conv backends or the non-delta-net call sites
+(lfm2.cpp, mtmd audio). The tail-rows state-save logic in build_conv_state,
+which used to slice the concatenated buffer, is reworked into a small bounded
+window (build_conv_window) that straddles the prefix/new_tokens boundary only
+when it actually needs to (n_t < d_conv - 1, i.e. during decode).
+
+New op appended at the end of ggml_op (not grouped next to SSM_CONV) to avoid
+shifting every later op's wire value for ggml-rpc's version-checked protocol,
+and given a case in ggml-backend-meta.cpp's split-state switch so a future
+LLAMA_SPLIT_MODE_TENSOR user doesn't hit an unhandled-op abort (untested
+against real multi-device execution -- this fleet never uses that mode).
+
+Verified: 90/90 test-backend-ops cases pass on CPU and Vulkan (contiguous and
+transposed new_tokens, boundary and prefill-sized cases). Measured on
+gabesrv10 (Radeon 8060S, production paused for exclusive GPU access):
+Qwen3.8-27B-UD-Q4_K_XL pp1024 255.9-251.9 t/s baseline -> 266.6-267.1 t/s
+modified (~4-5%, matches the fleet profiling report's predicted ~4.4%).
+GGML_VK_PERF_LOGGER confirms the per-layer CONCAT (214.6ms/pass baseline) is
+gone entirely in the modified build.
+
+Assisted-by: Claude Sonnet 5
+---
+ ggml/include/ggml-rpc.h                       |  4 +-
+ ggml/include/ggml.h                           | 20 ++++
+ ggml/src/ggml-backend-meta.cpp                | 27 ++++++
+ ggml/src/ggml-cpu/ggml-cpu.c                  |  5 +
+ ggml/src/ggml-cpu/ops.cpp                     | 92 +++++++++++++++++++
+ ggml/src/ggml-cpu/ops.h                       |  1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 51 +++++++++-
+ .../vulkan-shaders/ssm_conv_split.comp        | 67 ++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  2 +
+ ggml/src/ggml.c                               | 46 +++++++++-
+ src/models/delta-net-base.cpp                 | 78 ++++++++++++----
+ src/models/models.h                           | 10 +-
+ src/models/qwen35.cpp                         |  4 +-
+ src/models/qwen35moe.cpp                      |  4 +-
+ src/models/qwen3next.cpp                      |  4 +-
+ tests/test-backend-ops.cpp                    | 62 +++++++++++++
+ 16 files changed, 443 insertions(+), 34 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index cbfe40013..c4a35c1d3 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    6
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    1
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 85a1ae7ae..038c2e472 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -601,6 +601,15 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        // Kept at the end of the enum (not grouped with GGML_OP_SSM_CONV
++        // above) so this backend-scoped (CPU+Vulkan only) addition doesn't
++        // shift the numeric value of every later op -- ggml-rpc.h's wire
++        // protocol serializes tensors by raw ggml_op value, and this fleet
++        // runs a distributed RPC backend with a one-node-at-a-time rollout
++        // convention, so minimizing the blast radius of a transient
++        // version-mismatched master/worker pair matters here.
++        GGML_OP_SSM_CONV_SPLIT,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -2526,6 +2535,17 @@ extern "C" {
+             struct ggml_tensor  * sx,
+             struct ggml_tensor  * c);
+ 
++    // like ggml_ssm_conv, but avoids materializing sx = concat(prefix, new_tokens):
++    // prefix     [d_conv-1, d_inner, n_s], contiguous
++    // new_tokens [n_t,      d_inner, n_s], may be a non-contiguous view (e.g. a transpose)
++    // c          [d_conv, d_inner]
++    // CPU and Vulkan backends only.
++    GGML_API struct ggml_tensor * ggml_ssm_conv_split(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * prefix,
++            struct ggml_tensor  * new_tokens,
++            struct ggml_tensor  * c);
++
+     GGML_API struct ggml_tensor * ggml_ssm_scan(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * s,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3ec40fb1a..199cf7d48 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -810,6 +810,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         return handle_generic(src_ss, /*scalar_only =*/ false);
+     };
+ 
++    // GGML_OP_SSM_CONV_SPLIT is ggml_ssm_conv's sx argument split in two
++    // (prefix, new_tokens) so the caller doesn't have to materialize their
++    // concatenation -- src_ss[0]/[1] are the two halves of what used to be
++    // one axis-0-contiguous tensor, so they must carry the same split state
++    // as each other, and the pair as a whole is handled exactly like
++    // handle_ssm_conv above treats its single sx argument against c.
++    // NOT exercised by any topology this fleet currently runs (no
++    // LLAMA_SPLIT_MODE_TENSOR / `-sm tensor` usage anywhere in
++    // home-infrastructure's llamacpp-rpc chart) and therefore not validated
++    // against real multi-device execution -- derived by direct analogy with
++    // handle_ssm_conv rather than tested.
++    auto handle_ssm_conv_split = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
++        if (src_ss[0].axis == src_ss[2].axis) {
++            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
++                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
++            }
++            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
++                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
++            }
++        }
++        return handle_generic(src_ss, /*scalar_only =*/ false);
++    };
++
+     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+@@ -1058,6 +1082,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_GLU: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+             } break;
++            case GGML_OP_SSM_CONV_SPLIT: {
++                split_state = handle_ssm_conv_split(src_ss);
++            } break;
+             default: {
+                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 87a329f26..cd6f01552 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2037,6 +2037,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_ssm_conv(params, tensor);
+             } break;
++        case GGML_OP_SSM_CONV_SPLIT:
++            {
++                ggml_compute_forward_ssm_conv_split(params, tensor);
++            } break;
+         case GGML_OP_SSM_SCAN:
+             {
+                 ggml_compute_forward_ssm_scan(params, tensor);
+@@ -2424,6 +2428,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_FLASH_ATTN_EXT:
+         case GGML_OP_FLASH_ATTN_BACK:
+         case GGML_OP_SSM_CONV:
++        case GGML_OP_SSM_CONV_SPLIT:
+         case GGML_OP_SSM_SCAN:
+         case GGML_OP_LIGHTNING_INDEXER:
+             {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 266261c5e..5dce15eb0 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9768,6 +9768,98 @@ void ggml_compute_forward_ssm_conv(
+     }
+ }
+ 
++// ggml_compute_forward_ssm_conv_split
++//
++// Same math as ggml_compute_forward_ssm_conv, but reads the sliding window
++// from two separate sources instead of one pre-concatenated buffer: a small
++// contiguous `prefix` (the last d_conv-1 columns carried over from the
++// previous step) and `new_tokens`, which may be a non-contiguous view (e.g.
++// a transpose) -- so this cannot use the single-flat-index trick the fused
++// kernel uses and instead computes each tap's source and byte offset
++// explicitly.
++
++static void ggml_compute_forward_ssm_conv_split_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * prefix     = dst->src[0];
++    const ggml_tensor * new_tokens = dst->src[1];
++    const ggml_tensor * conv_w     = dst->src[2]; // conv1d.weight
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int nc  = conv_w->ne[0]; // d_conv
++    const int dm1 = prefix->ne[0]; // d_conv - 1
++    const int nr  = conv_w->ne[1]; // d_inner
++    const int n_t =  dst->ne[1];   // tokens per sequence
++    const int n_s =  dst->ne[2];   // number of sequences in the batch
++
++    GGML_ASSERT( dst->ne[0] == nr);
++    GGML_ASSERT(prefix->nb[0] == sizeof(float));
++    GGML_ASSERT(conv_w->nb[0] == sizeof(float));
++    GGML_ASSERT(prefix->nb[1] == prefix->ne[0]*sizeof(float));
++    GGML_ASSERT(dm1 == nc - 1);
++
++    // rows per thread
++    const int dr = (nr + nth - 1)/nth;
++
++    // row range for this thread
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++    const int ir  = ir1 - ir0;
++
++    for (int i3 = 0; i3 < n_s; ++i3) {
++        const char * p_base  = (const char *) prefix->data     + ir0*prefix->nb[1]     + i3*prefix->nb[2];
++        const char * nt_base = (const char *) new_tokens->data + ir0*new_tokens->nb[1] + i3*new_tokens->nb[2];
++        const char * c_base  = (const char *) conv_w->data     + ir0*conv_w->nb[1];
++
++        for (int i2 = 0; i2 < n_t; ++i2) {
++            float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
++
++            // d_inner
++            for (int i1 = 0; i1 < ir; ++i1) {
++                const float * c = (const float *) (c_base + i1*conv_w->nb[1]); // {d_conv, d_inner}
++
++                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
++                float sumf = 0.0f;
++
++                // d_conv -- tap i0 reads position (i2 + i0) of the logical
++                // concat(prefix, new_tokens) buffer without materializing it
++                for (int i0 = 0; i0 < nc; ++i0) {
++                    const int pos = i2 + i0;
++
++                    float v;
++                    if (pos < dm1) {
++                        v = *(const float *) (p_base + i1*prefix->nb[1] + pos*prefix->nb[0]);
++                    } else {
++                        const int nt_pos = pos - dm1;
++                        v = *(const float *) (nt_base + i1*new_tokens->nb[1] + nt_pos*new_tokens->nb[0]);
++                    }
++
++                    sumf += v * c[i0];
++                }
++
++                x[i1] = sumf;
++            }
++        }
++    }
++}
++
++void ggml_compute_forward_ssm_conv_split(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_ssm_conv_split_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_ssm_scan
+ 
+ static void ggml_compute_forward_ssm_scan_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08b6..3f374659e 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -92,6 +92,7 @@ void ggml_compute_forward_flash_attn_back(
+         const bool masked,
+         struct ggml_tensor * dst);
+ void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_ssm_conv_split(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_ssm_scan(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_win_part(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 0dfa44dbf..4c85b933a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1156,6 +1156,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_ssm_conv_f32;
+     vk_pipeline pipeline_ssm_conv_silu_f32;
+     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
++    vk_pipeline pipeline_ssm_conv_split_f32;
+     vk_pipeline pipeline_opt_step_adamw_f32;
+     vk_pipeline pipeline_opt_step_sgd_f32;
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
+@@ -2042,6 +2043,14 @@ struct vk_op_ssm_conv_push_constants {
+     uint32_t nc, ncs, nr, n_t, n_s;
+ };
+ 
++struct vk_op_ssm_conv_split_push_constants {
++    uint32_t p_nb1, p_nb2;
++    uint32_t nt_nb0, nt_nb1, nt_nb2; // nt_nb0 is the only stride here that isn't assumed to be sizeof(float)
++    uint32_t c_nb1;
++    uint32_t dst_nb0, dst_nb1, dst_nb2;
++    uint32_t nc, dm1, nr, n_t, n_s;
++};
++
+ struct vk_op_conv2d_push_constants {
+     uint32_t Cout;
+     uint32_t Cin;
+@@ -6281,6 +6290,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+ 
++    // Never fused with bias/silu (ggml_vk_can_fuse_ssm_conv only matches the
++    // plain GGML_OP_SSM_CONV enum), so this is the only pipeline variant needed.
++    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_split_f32, "ssm_conv_split_f32", ssm_conv_split_f32_len, ssm_conv_split_f32_data, "main", 4, sizeof(vk_op_ssm_conv_split_push_constants), {32, 16, 1}, {32, 16}, 1);
++
+     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+@@ -12136,6 +12149,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             }
+         }
+         return nullptr;
++    case GGML_OP_SSM_CONV_SPLIT:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_ssm_conv_split_f32;
++        }
++        return nullptr;
+     case GGML_OP_OPT_STEP_ADAMW:
+         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_opt_step_adamw_f32;
+@@ -12762,8 +12780,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         }
+         break;
+     case GGML_OP_SSM_CONV:
++    case GGML_OP_SSM_CONV_SPLIT:
+         {
+-            const uint32_t nr  = src0->ne[1];
++            const uint32_t nr  = src0->ne[1]; // d_inner -- src0 is sx (SSM_CONV) or prefix (SSM_CONV_SPLIT), both axis-1 d_inner
+             const uint32_t n_t = dst->ne[1];
+             const uint32_t n_s = dst->ne[2];
+             elements = { nr, n_t, n_s };
+@@ -13425,6 +13444,28 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx,
+     });
+ }
+ 
++static void ggml_vk_ssm_conv_split(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
++    ggml_tensor * dst = cgraph->nodes[node_idx];
++    const ggml_tensor * prefix     = dst->src[0];
++    const ggml_tensor * new_tokens = dst->src[1];
++    const ggml_tensor * conv_w     = dst->src[2];
++
++    // Never fused (ggml_vk_can_fuse_ssm_conv only matches the plain
++    // GGML_OP_SSM_CONV enum), so unlike ggml_vk_ssm_conv above there's no
++    // fused-chain dst lookup and no optional bias.
++    ggml_vk_op_f32<vk_op_ssm_conv_split_push_constants>(ctx, subctx, prefix, new_tokens, conv_w, nullptr, dst, GGML_OP_SSM_CONV_SPLIT, {
++        (uint32_t)prefix->nb[1], (uint32_t)prefix->nb[2],
++        (uint32_t)new_tokens->nb[0], (uint32_t)new_tokens->nb[1], (uint32_t)new_tokens->nb[2],
++        (uint32_t)conv_w->nb[1],
++        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
++        (uint32_t)conv_w->ne[0],
++        (uint32_t)prefix->ne[0],
++        (uint32_t)prefix->ne[1],
++        (uint32_t)dst->ne[1],
++        (uint32_t)dst->ne[2],
++    });
++}
++
+ static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
+     const ggml_tensor * x = dst->src[0];
+     const ggml_tensor * g = dst->src[1];
+@@ -16510,6 +16551,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_SSM_CONV:
+         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+ 
++        break;
++    case GGML_OP_SSM_CONV_SPLIT:
++        ggml_vk_ssm_conv_split(ctx, compute_ctx, cgraph, node_idx);
++
+         break;
+ 
+     case GGML_OP_OPT_STEP_ADAMW:
+@@ -19753,6 +19798,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             }
+         case GGML_OP_SSM_CONV:
+             return op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_SSM_CONV_SPLIT:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+         case GGML_OP_COL2IM_1D:
+@@ -20738,6 +20785,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
+         } else if (tensor->op == GGML_OP_SSM_CONV) {
+             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
++        } else if (tensor->op == GGML_OP_SSM_CONV_SPLIT) {
++            tensor_clone = ggml_ssm_conv_split(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+         } else if (tensor->op == GGML_OP_ROLL) {
+             const int32_t s0 = tensor->op_params[0];
+             const int32_t s1 = tensor->op_params[1];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
+new file mode 100644
+index 000000000..1a693d902
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
+@@ -0,0 +1,67 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++
++#include "types.glsl"
++
++layout(constant_id = 0) const uint BLOCK_SIZE = 32;
++layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
++
++layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
++
++// Same computation as ssm_conv.comp, but the sliding window is read from two
++// separate sources instead of one pre-concatenated buffer: Prefix (the last
++// d_conv-1 columns carried over from the previous step, always contiguous)
++// and NewTokens, which may be a non-contiguous view (e.g. a transpose) --
++// nt_nb0 is therefore a real, possibly non-4-byte stride, unlike every other
++// stride here. This op is never fused with bias/silu (ggml_vk_can_fuse_ssm_conv
++// only matches the plain GGML_OP_SSM_CONV enum), so there is no APPLY_BIAS/
++// APPLY_SILU path and no vec4 fast path for nc == 4 -- the strided NewTokens
++// read can't use it.
++layout(binding = 0) readonly buffer Prefix    { float prefix[]; };
++layout(binding = 1) readonly buffer NewTokens { float new_tokens[]; };
++layout(binding = 2) readonly buffer ConvW     { float conv_w[]; };
++layout(binding = 3) buffer Dst { float dst[]; };
++
++layout(push_constant) uniform PushConstants {
++    uint p_nb1; uint p_nb2;
++    uint nt_nb0; uint nt_nb1; uint nt_nb2;
++    uint c_nb1;
++    uint dst_nb0; uint dst_nb1; uint dst_nb2;
++    uint nc; uint dm1; uint nr; uint n_t; uint n_s;
++};
++
++void main() {
++    const uint i1 = gl_GlobalInvocationID.x;
++    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
++    const uint i3 = gl_WorkGroupID.z;
++
++    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
++        return;
++    }
++
++    const uint p_base  = i3 * (p_nb2  / 4) + i1 * (p_nb1  / 4);
++    const uint nt_base = i3 * (nt_nb2 / 4) + i1 * (nt_nb1 / 4);
++    const uint c_base  = i1 * c_nb1 / 4;
++
++    float sum = 0.0;
++
++    // d_conv taps: tap i0 reads logical position (i2 + i0) of
++    // concat(prefix, new_tokens) without materializing it.
++    [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
++        const uint pos = i2 + i0;
++
++        float v;
++        if (pos < dm1) {
++            v = prefix[p_base + pos];
++        } else {
++            const uint nt_pos = pos - dm1;
++            v = new_tokens[nt_base + nt_pos * (nt_nb0 / 4)];
++        }
++
++        sum += v * conv_w[c_base + i0];
++    }
++
++    const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
++    dst[dst_idx] = sum;
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 30fe0884e..88e536958 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1219,6 +1219,8 @@ void process_shaders() {
+ 
+     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+ 
++    string_to_spv("ssm_conv_split_f32", "ssm_conv_split.comp", {{"A_TYPE", "float"}});
++
+     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+ 
+     for (auto &c : compiles) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5ef03e190..15c51927c 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "SSM_CONV_SPLIT",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "ssm_conv_split(prefix, new_tokens, c)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5682,6 +5686,44 @@ struct ggml_tensor * ggml_ssm_conv(
+     return result;
+ }
+ 
++// ggml_ssm_conv_split
++
++struct ggml_tensor * ggml_ssm_conv_split(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * prefix,
++        struct ggml_tensor  * new_tokens,
++        struct ggml_tensor  * c) {
++    GGML_ASSERT(ggml_is_3d(prefix));
++    GGML_ASSERT(ggml_is_3d(new_tokens));
++    GGML_ASSERT(ggml_is_matrix(c));
++    GGML_ASSERT(ggml_is_contiguous(prefix));
++
++    const int64_t d_conv  = c->ne[0];
++    const int64_t d_inner = c->ne[1];
++    const int64_t n_t     = new_tokens->ne[0];
++    const int64_t n_s     = prefix->ne[2];
++
++    // TODO: maybe support other strides than 1?
++    GGML_ASSERT(prefix->ne[0]     == d_conv - 1);
++    GGML_ASSERT(prefix->ne[1]     == d_inner);
++    GGML_ASSERT(new_tokens->ne[1] == d_inner);
++    GGML_ASSERT(new_tokens->ne[2] == n_s);
++    GGML_ASSERT(n_t >= 0);
++
++    // new_tokens is deliberately allowed to be a non-contiguous view (e.g. a
++    // transpose) -- that is the whole point of this op: the caller no longer
++    // has to materialize concat(prefix, new_tokens) into one contiguous buffer.
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
++
++    result->op     = GGML_OP_SSM_CONV_SPLIT;
++    result->src[0] = prefix;
++    result->src[1] = new_tokens;
++    result->src[2] = c;
++
++    return result;
++}
++
+ // ggml_ssm_scan
+ 
+ struct ggml_tensor * ggml_ssm_scan(
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad6612647..93866b61d 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -446,7 +446,53 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     return build_delta_net_chunking(q, k, v, g, b, s, il);
+ }
+ 
+-ggml_tensor * llm_build_delta_net_base::build_conv_state(
++// Build the width-(conv_kernel_size - 1) window starting at logical column
++// `s_idx` of what used to be the materialized concat(prefix, new_tokens)
++// buffer, without materializing that full buffer. The window either falls
++// entirely inside `prefix` (s_idx == 0), entirely inside `new_tokens`
++// (s_idx >= dm1), or straddles the boundary between them (0 < s_idx < dm1) --
++// s_idx < dm1 only happens when n_t < dm1, i.e. during single/small-token
++// decode steps, since prefill's n_t is normally far larger than the conv
++// kernel width. The straddling case is the one the old concat-based code got
++// "for free"; here it costs a small (at most dm1-wide) concat instead of one
++// sized by the full n_t.
++static ggml_tensor * build_conv_window(
++        ggml_context * ctx0,
++        ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
++        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], possibly non-contiguous
++        int64_t        dm1,
++        int64_t        conv_channels,
++        int64_t        n_seqs,
++        int64_t        s_idx) {
++    GGML_ASSERT(s_idx >= 0 && s_idx <= new_tokens->ne[0]);
++
++    if (s_idx == 0) {
++        return prefix;
++    }
++
++    if (s_idx >= dm1) {
++        return ggml_view_3d(ctx0, new_tokens,
++                dm1, conv_channels, n_seqs,
++                new_tokens->nb[1], new_tokens->nb[2],
++                (s_idx - dm1) * new_tokens->nb[0]);
++    }
++
++    ggml_tensor * prefix_part =
++        ggml_view_3d(ctx0, prefix,
++                dm1 - s_idx, conv_channels, n_seqs,
++                prefix->nb[1], prefix->nb[2],
++                s_idx * prefix->nb[0]);
++
++    ggml_tensor * new_tokens_part =
++        ggml_view_3d(ctx0, new_tokens,
++                s_idx, conv_channels, n_seqs,
++                new_tokens->nb[1], new_tokens->nb[2],
++                0);
++
++    return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
++}
++
++std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_state(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        conv_states_all,
+         ggml_tensor *        qkv_mixed,
+@@ -459,32 +505,28 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     const auto mem_size = mctx_cur->get_size();
+ 
+     const int64_t n_seqs = ubatch.n_seqs;
++    const int64_t dm1    = conv_kernel_size - 1;
+ 
+     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+     cb(conv_states, "conv_states", il);
+ 
+-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
++    conv_states = ggml_reshape_3d(ctx0, conv_states, dm1, conv_channels, n_seqs);
+     cb(conv_states, "conv_states_reshaped", il);
+ 
+-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+-    cb(qkv_mixed, "qkv_mixed_transposed", il);
++    ggml_tensor * new_tokens = ggml_transpose(ctx0, qkv_mixed);
++    cb(new_tokens, "qkv_mixed_transposed", il);
+ 
+-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+-    cb(conv_input, "conv_input", il);
++    const int64_t n_t = new_tokens->ne[0];
+ 
+-    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
++    const int64_t row_count = dm1 * conv_channels;
+ 
+     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+ 
+     if (cparams.n_rs_seq == 0) {
+-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
++        const int64_t s_idx  = n_t;
+         const int64_t s_slot = 0;
+ 
+-        ggml_tensor * conv_state_last =
+-            ggml_view_3d(ctx0, conv_input,
+-                    conv_kernel_size - 1, conv_channels, n_seqs,
+-                    conv_input->nb[1], conv_input->nb[2],
+-                    ggml_row_size(conv_input->type, s_idx));
++        ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+         cb(conv_state_last, "conv_state_last", il);
+ 
+         ggml_tensor * conv_state_update =
+@@ -502,14 +544,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+ 
+         for (int64_t t = 1; t <= K; ++t) {
+-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
++            const int64_t s_idx  = std::max<int64_t>(0, n_t - K + t);
+             const int64_t s_slot = K - t;
+ 
+-            ggml_tensor * conv_state_last =
+-                ggml_view_3d(ctx0, conv_input,
+-                        conv_kernel_size - 1, conv_channels, n_seqs,
+-                        conv_input->nb[1], conv_input->nb[2],
+-                        ggml_row_size(conv_input->type, s_idx));
++            ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+ 
+             ggml_tensor * conv_state_update =
+                 ggml_view_2d(ctx0,
+@@ -521,7 +559,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         }
+     }
+ 
+-    return conv_input;
++    return { conv_states, new_tokens };
+ }
+ 
+ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+diff --git a/src/models/models.h b/src/models/models.h
+index da519dcfd..38aaafb1f 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -76,9 +76,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
+                 ggml_tensor * s,
+                         int   il);
+ 
+-    // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
+-    // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
+-    ggml_tensor * build_conv_state(
++    // read conv state from cache, write the new tail state back (single slot or per-token)
++    // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns {prefix, new_tokens} for ggml_ssm_conv_split:
++    //   prefix:     (kernel_size - 1, channels, n_seqs), contiguous
++    //   new_tokens: (n_seq_tokens, channels, n_seqs), a transposed (non-contiguous) view of qkv_mixed
++    // Does NOT concat prefix and new_tokens (that used to be this function's whole job) --
++    // callers pass both straight to ggml_ssm_conv_split, which reads across the split itself.
++    std::pair<ggml_tensor *, ggml_tensor *> build_conv_state(
+             llm_graph_input_rs * inp,
+             ggml_tensor *        conv_states_all,
+             ggml_tensor *        qkv_mixed,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a1e263500..6f3592325 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -382,13 +382,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+ 
+-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
++    auto [conv_prefix, conv_new_tokens] = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+     cb(state, "state_predelta", il);
+ 
+-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    ggml_tensor * conv_output_proper = ggml_ssm_conv_split(ctx0, conv_prefix, conv_new_tokens, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index bdf772625..af4894f60 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -406,13 +406,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+ 
+-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
++    auto [conv_prefix, conv_new_tokens] = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+     cb(state, "state_predelta", il);
+ 
+-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    ggml_tensor * conv_output_proper = ggml_ssm_conv_split(ctx0, conv_prefix, conv_new_tokens, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index b63fc9c6a..1f7ad9742 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -462,13 +462,13 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+ 
+-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
++    auto [conv_prefix, conv_new_tokens] = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+     cb(state, "state_predelta", il);
+ 
+-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    ggml_tensor * conv_output_proper = ggml_ssm_conv_split(ctx0, conv_prefix, conv_new_tokens, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f650e0123..5cbadff51 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4306,6 +4306,49 @@ struct test_ssm_conv : public test_case {
+     }
+ };
+ 
++// like test_ssm_conv, but exercises ggml_ssm_conv_split: prefix and new_tokens
++// are two separate tensors instead of one pre-concatenated buffer, and
++// new_tokens can be a non-contiguous view (transpose_new = true), mirroring
++// delta-net-base.cpp's real call site (build_conv_state's `qkv_mixed` is
++// always passed through ggml_transpose before reaching this op).
++struct test_ssm_conv_split : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 3> ne_prefix;     // [d_conv - 1, d_inner, n_s]
++    const std::array<int64_t, 3> ne_new_tokens; // [n_t, d_inner, n_s], logical shape
++    const std::array<int64_t, 2> ne_c;          // [d_conv, d_inner]
++    const bool transpose_new;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type, ne_prefix, ne_new_tokens, ne_c, transpose_new);
++    }
++
++    test_ssm_conv_split(ggml_type type = GGML_TYPE_F32,
++            std::array<int64_t, 3> ne_prefix     = {3, 10, 1},
++            std::array<int64_t, 3> ne_new_tokens = {10, 10, 1},
++            std::array<int64_t, 2> ne_c          = {4, 10},
++            bool transpose_new = false)
++        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * prefix = ggml_new_tensor_3d(ctx, type, ne_prefix[0], ne_prefix[1], ne_prefix[2]);
++        ggml_tensor * c      = ggml_new_tensor_2d(ctx, type, ne_c[0], ne_c[1]);
++
++        ggml_tensor * new_tokens;
++        if (transpose_new) {
++            // [d_inner, n_t, n_s] source, transposed to [n_t, d_inner, n_s] --
++            // a genuinely non-contiguous, non-unit ne[0]-stride view, not just
++            // a mechanically-contiguous tensor of the right shape.
++            ggml_tensor * src = ggml_new_tensor_3d(ctx, type, ne_new_tokens[1], ne_new_tokens[0], ne_new_tokens[2]);
++            new_tokens = ggml_transpose(ctx, src);
++        } else {
++            new_tokens = ggml_new_tensor_3d(ctx, type, ne_new_tokens[0], ne_new_tokens[1], ne_new_tokens[2]);
++        }
++
++        ggml_tensor * out = ggml_ssm_conv_split(ctx, prefix, new_tokens, c);
++        return out;
++    }
++};
++
+ // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
+ struct test_ssm_conv_bias_silu : public test_case {
+     const ggml_type type;
+@@ -9702,6 +9745,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             // long token (n_t > 32, exercises the long_token kernel path)
+             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
+             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
++
++            for (bool transpose_new : {false, true}) {
++                // n_t == 1: single-token decode, the common case where the tap window
++                // straddles the prefix/new_tokens boundary (n_t < d_conv - 1 always here).
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {1, d_inner, 1}, {d_conv, d_inner}, transpose_new));
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 4}, {1, d_inner, 4}, {d_conv, d_inner}, transpose_new));
++                // n_t == d_conv - 1: boundary case, s_idx == n_t == d_conv - 1 (window falls
++                // entirely in new_tokens, exercising that edge exactly).
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {d_conv - 1, d_inner, 1}, {d_conv, d_inner}, transpose_new));
++                // long token (n_t > 32): prefill-like, window entirely within new_tokens.
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 1}, {64, d_inner, 1}, {d_conv, d_inner}, transpose_new));
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 4}, {64, d_inner, 4}, {d_conv, d_inner}, transpose_new));
++            }
+         }
+     }
+ 
+@@ -11334,6 +11390,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
+     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
+     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
++
++    for (bool transpose_new : {false, true}) {
++        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 3328, 1}, {512, 3328, 1}, {4, 3328}, transpose_new)); // prefill
++        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 8192, 1}, {934, 8192, 1}, {4, 8192}, transpose_new)); // prefill
++        test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 3328, 1}, {1,   3328, 1}, {4, 3328}, transpose_new)); // generate
++    }
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
+-- 
+2.43.0
+
