@@ -10038,6 +10038,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32, 588, {1, 1}, {1, 1})); // 14*14*3, e.g. conv_2d im2col
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {4, 1}, {1, 1}));
 
+    // Boundary M/N shapes straddling the Vulkan backend's S/M/L matmul tile
+    // crossover thresholds (32/64/128), to exercise the occupancy-aware
+    // non-coopmat2 tile selector (ggml-vulkan.cpp's matmul_tile_selector)
+    // right at the points where its decision can flip.
+    for (int64_t mn : {31, 32, 33, 63, 64, 65, 127, 128, 129}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mn, mn, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, mn, mn, 256, {1, 1}, {1, 1}));
+    }
+    // Realistic MoE-expert-routing-shaped skinny cases (small m, large n) --
+    // the case matmul_id_tile_selector shares this fix with.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 129, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 65,  4096, {1, 1}, {1, 1}));
+
 #if 0
     // test the mat-mat path for Metal
     for (int k = 1; k < 512; ++k) {
