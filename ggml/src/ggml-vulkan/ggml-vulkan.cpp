@@ -2619,26 +2619,44 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     // Set up tile selector functions
+    //
+    // Occupancy-aware S/M/L tile selection, shared by the coopmat2 path and (as of
+    // this fork) the non-coopmat2/AMD-RDNA/Intel-int-dot path below. Originally only
+    // the coopmat2 branch computed real occupancy (tiles-vs-shader_core_count,
+    // prefer_large) -- the non-coopmat2 branch used only static m/n thresholds with
+    // no awareness of the GPU's actual core count (this fleet's own Vulkan
+    // profiling report, F1; matches the gap upstream PR #12319's author asked
+    // someone to "hook up... for other hardware" -- but #12319 itself proposed a
+    // different, NVIDIA-register-count-driven mechanism for ggml_vk_guess_split_k
+    // that its own author abandoned after it regressed even NVIDIA hardware; this
+    // is not that -- it's the coopmat2 branch's own already-shipped tile-shape
+    // logic, reused rather than reinvented). shader_core_count is already
+    // populated correctly for AMD via VK_AMD_shader_core_properties2's
+    // activeComputeUnitCount -- this was a logic gap, not a missing-data gap.
+    auto occupancy_tile_selector = [](uint32_t m, uint32_t n, uint32_t shader_core_count,
+                                      const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
+        if (configs.size() <= 1) return 0;
+        uint32_t last = (uint32_t)configs.size() - 1;
+        if (configs.size() == 2) {
+            uint32_t crossover = configs[0].unaligned->wg_denoms[1];
+            return (n > crossover) ? 1 : 0;
+        }
+        // 3+ configs: s=0, m=1, l=2
+        const uint32_t tiles_l = CEIL_DIV(m, configs[last].unaligned->wg_denoms[0]) * CEIL_DIV(n, configs[last].unaligned->wg_denoms[1]);
+        const uint32_t tiles_m = CEIL_DIV(m, configs[1].unaligned->wg_denoms[0]) * CEIL_DIV(n, configs[1].unaligned->wg_denoms[1]);
+        uint32_t crossover_large = configs[1].unaligned->wg_denoms[1];
+        bool prefer_large = tiles_m > shader_core_count || tiles_l > shader_core_count ||
+                            (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
+        if (n > crossover_large && prefer_large) return last;
+        uint32_t crossover_medium_m = configs[0].unaligned->wg_denoms[0];
+        uint32_t crossover_medium_n = configs[0].unaligned->wg_denoms[1];
+        if (m > crossover_medium_m && n > crossover_medium_n) return 1;
+        return 0;
+    };
     if (device->coopmat2) {
-        device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t shader_core_count,
+        device->matmul_tile_selector = [occupancy_tile_selector](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t shader_core_count,
                                           const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
-            if (configs.size() <= 1) return 0;
-            uint32_t last = (uint32_t)configs.size() - 1;
-            if (configs.size() == 2) {
-                uint32_t crossover = configs[0].unaligned->wg_denoms[1];
-                return (n > crossover) ? 1 : 0;
-            }
-            // 3+ configs: s=0, m=1, l=2
-            const uint32_t tiles_l = CEIL_DIV(m, configs[last].unaligned->wg_denoms[0]) * CEIL_DIV(n, configs[last].unaligned->wg_denoms[1]);
-            const uint32_t tiles_m = CEIL_DIV(m, configs[1].unaligned->wg_denoms[0]) * CEIL_DIV(n, configs[1].unaligned->wg_denoms[1]);
-            uint32_t crossover_large = configs[1].unaligned->wg_denoms[1];
-            bool prefer_large = tiles_m > shader_core_count || tiles_l > shader_core_count ||
-                                (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
-            if (n > crossover_large && prefer_large) return last;
-            uint32_t crossover_medium_m = configs[0].unaligned->wg_denoms[0];
-            uint32_t crossover_medium_n = configs[0].unaligned->wg_denoms[1];
-            if (m > crossover_medium_m && n > crossover_medium_n) return 1;
-            return 0;
+            return occupancy_tile_selector(m, n, shader_core_count, configs);
         };
         device->matmul_id_tile_selector = [](uint32_t /*m*/, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
                                              const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
@@ -2655,9 +2673,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return 0;
         };
     } else {
-        device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+        // LLAMA_VK_TILE_OCCUPANCY: development-only A/B gate, forces the legacy
+        // static-threshold selector even when shader_core_count is known, so the
+        // occupancy-aware path can be A/B'd against today's behavior without a
+        // rebuild. Remove this gate (make the occupancy path unconditional) once a
+        // real fleet benchmark justifies keeping the change permanently.
+        static const bool force_legacy_tile_selector = getenv("LLAMA_VK_TILE_OCCUPANCY") != nullptr &&
+                                                         strcmp(getenv("LLAMA_VK_TILE_OCCUPANCY"), "0") == 0;
+        device->matmul_tile_selector = [occupancy_tile_selector](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t shader_core_count,
                                           const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
             if (configs.size() <= 1) return 0;
+            if (shader_core_count != 0 && !force_legacy_tile_selector) {
+                return occupancy_tile_selector(m, n, shader_core_count, configs);
+            }
+            // Legacy static-threshold fallback -- used when shader_core_count is
+            // unavailable (e.g. an older AMDVLK without VK_AMD_shader_core_properties2),
+            // or when explicitly forced via LLAMA_VK_TILE_OCCUPANCY=0 for A/B testing.
             if (m <= 32 || n <= 32) return 0;
             if (configs.size() == 2) return 1;
             if (m <= 64 || n <= 64) return 1;
