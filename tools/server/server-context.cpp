@@ -487,6 +487,29 @@ struct server_slot {
             return 0;
         }
 
+        // Disable speculative decoding for grammar-constrained requests (tool-calling,
+        // JSON-schema output, etc). Root-caused live on gabesrv06 (2026-09-15): under
+        // MTP speculative decoding, the qwen3-coder tool-call template has several
+        // structurally-ambiguous decision points (e.g. "keep emitting <parameter=...>
+        // template tags" vs "start the actual argument value") where the model's own
+        // greedy pick is only narrowly favored (margins as low as ~0.03 logits observed
+        // live, vs. 10+ at unambiguous positions) -- batched-vs-sequential GPU execution
+        // numerical differences are enough to tip these close calls, and once tipped the
+        // model confidently continues down the wrong path, producing runaway
+        // <parameter=.../</function>/<tool_call> tag-repetition that corrupts the JSON
+        // string content a permissive string-type grammar rule can't reject (it's
+        // syntactically valid, just semantically wrong). Not reproducible with
+        // speculative decoding off; confirmed independent of ngram-mod (still corrupts
+        // with only --spec-type draft-mtp). See FLEET.md's "Known-fragile areas" and
+        // upstream ggml-org/llama.cpp#23577 (open, matches this failure family) /
+        // #23335 (closed as expected: "different kernels for different batch sizes" --
+        // the milder, already-mitigated version of the same underlying phenomenon).
+        // Plain chat/completion requests (no grammar) keep the full speculative-decoding
+        // speed win.
+        if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
