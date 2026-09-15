@@ -52,16 +52,33 @@ discipline by standing convention).
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
   runs in production. Two real bugs found and patched here (`a1e979568`,
   `b74b2e31c`), both around checkpoint-based slot save/restore interacting
-  with the draft model's own KV state. A third, still-unpatched symptom
-  (2026-09-15): MTP speculative decoding, combined with grammar-constrained
-  (tool-call) decoding, produces runaway repeated-token degenerate output --
-  matches the broad shape of the still-open, unresolved upstream tracking
-  issue [ggml-org/llama.cpp#23577](https://github.com/ggml-org/llama.cpp/issues/23577)
-  ("MTP with Qwen3.6 27B outputs repeated `////` after long session"), which
-  multiple reporters tie to draft-acceptance collapsing to 0 during context
-  checkpoint restoration -- exactly this fleet's own `slotSavePath` feature.
-  Confirmed via direct reproduction against gabesrv06 (2026-09-15): the
-  identical multi-tool-call request corrupts reliably with speculative
-  decoding on, and reproduces cleanly (0/4 corrupted) with it off. Not yet
-  root-caused to a specific fix; speculative decoding is disabled on
-  gabesrv06 as a stopgap pending a real patch.
+  with the draft model's own KV state. A third symptom, root-caused and
+  FIXED (2026-09-15): MTP speculative decoding, combined with
+  grammar-constrained (tool-call) decoding, corrupted tool-call output by
+  occasionally re-emitting structural template tags (`<parameter=...>`,
+  `</function>`, `<tool_call>`) as literal string content -- matches the
+  broad shape of the still-open upstream tracking issue
+  [ggml-org/llama.cpp#23577](https://github.com/ggml-org/llama.cpp/issues/23577)
+  and the closed, "expected behavior"
+  [ggml-org/llama.cpp#23335](https://github.com/ggml-org/llama.cpp/issues/23335)
+  ("different kernels for different batch sizes"). Live logit-margin tracing
+  on gabesrv06 pinned the mechanism precisely: near-tied greedy picks (margins
+  as low as ~0.03) at the qwen3-coder template's structurally-ambiguous
+  decision points, consistent with batch-size numerical noise, not a
+  checkpoint-restore/grammar-desync bug (ruled out via direct tracing --
+  zero restore events fired during a traced corrupted run). Fixed with two
+  layered patches:
+  - **Primary fix** (`d4836a23c`, `server: disable speculative decoding for
+    grammar-constrained requests`): `get_n_draft_max()` returns 0 whenever
+    the request's sampling params carry an active grammar (tool-calling,
+    JSON-schema output). Confirmed correctly scoped -- plain chat requests
+    still draft normally (`draft_n > 0`).
+  - **Defense-in-depth** (`92a035776`, `qwen3-coder: bound xml-arg-string
+    with until_one_of, not a bare until`): hardens the tool-call parser's
+    string-argument grammar rule to exclude all structural tags from the
+    matched span, not just the single expected terminator. Tested alone and
+    found insufficient by itself (converts silent corruption into silent
+    failure -- no tool call produced at all) -- kept as a second layer
+    behind the primary fix, not a replacement for it.
+  Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
+  `fleet-patches`.

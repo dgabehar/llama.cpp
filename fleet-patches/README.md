@@ -41,6 +41,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0007 | `c5f91197b` | server: include `id_slot` in OAI-compatible chat completion responses |
 | 0008 | `87b0c16d4` | ggml: add `GGML_OP_SSM_CONV_SPLIT` (CPU+Vulkan) to skip the per-layer conv-state concat |
 | 0009 | `b7fd9fc37` | fleet: revert qwen3-coder complex-type parsing regression (upstream #28736/#28742) |
+| 0010 | `f60302abe` | fleet: mirror fork patches to disk, document fleet workflow separately |
+| 0011 | `17ecd9d52` | server: disable speculative decoding for grammar-constrained requests |
+| 0012 | `3c4e5bf4b` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new
