@@ -44,6 +44,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0010 | `f60302abe` | fleet: mirror fork patches to disk, document fleet workflow separately |
 | 0011 | `17ecd9d52` | server: disable speculative decoding for grammar-constrained requests |
 | 0012 | `3c4e5bf4b` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
+| 0014 | `a1b3b4199` | vulkan: occupancy-aware S/M/L tile selector for non-coopmat2 path (AMD/Intel) |
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new
