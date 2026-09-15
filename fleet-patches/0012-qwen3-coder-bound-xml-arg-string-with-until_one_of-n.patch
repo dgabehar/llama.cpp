@@ -1,0 +1,68 @@
+From 3c4e5bf4baac5bdb383ccd950290153d3ae08de4 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 15 Sep 2026 11:59:57 -0500
+Subject: [PATCH] qwen3-coder: bound xml-arg-string with until_one_of, not a
+ bare until
+
+Root cause (live-traced on gabesrv06, 2026-09-15): under MTP speculative
+decoding, the qwen3-coder tool-call template has structurally-ambiguous
+decision points where the model's own greedy pick occasionally flips
+(logit margins as low as ~0.03 observed live) toward re-emitting a
+structural tag (<parameter=.../<tool_call>/</function>) instead of the
+actual argument value. The xml-arg-string rule's bare `until("\n</parameter>\n")`
+has no escape valve, so this degenerate repetition gets silently absorbed
+as "valid" string content -- it's syntactically fine, just semantically
+wrong, and none of it happens to equal the single expected terminator.
+
+The `reasoning` rule directly above this one already guards against the
+same class of problem with until_one_of({"</think>", "<tool_call>"}) --
+this rule never got the same treatment. Fix: bound xml-arg-string's value
+with until_one_of, adding the tool-call structural tags as bail-out
+terminators alongside the real closing delimiter. Because this rule also
+compiles into the sampling grammar (gbnf_excluding_grammar), this isn't
+just a post-hoc parse fix -- it makes the grammar itself reject the model
+selecting these tokens mid-value and forces a resample, closing off the
+whole failure class regardless of what causes the initial flip (this
+fleet's MTP interaction, or anything else). Costs nothing: doesn't touch
+speculative decoding, so tool-calling requests keep full MTP speed.
+
+The same bare-until gap exists in deepseek.cpp, kimi-k3.cpp, minicpm5.cpp,
+muse-glimmer.cpp, and minimax-m3.cpp's own arg-string rules -- not fixed
+here since this fleet doesn't run those models and the bug is unconfirmed
+there; worth a follow-up sweep or an upstream report.
+
+Assisted-by: Claude Sonnet 5
+---
+ common/parsers/qwen3-coder.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index 8a1e52137..9553804fb 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -88,8 +88,21 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+         // Tool call parser
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
++            // Bound the string value the same defensive way the `reasoning` rule above
++            // bounds its own span (until_one_of, not a bare until on the expected
++            // terminator alone) -- a runaway/degenerate generation must never be able to
++            // smuggle another structural tag (a real llama.cpp/server incident, live-
++            // traced on gabesrv06 2026-09-15: MTP speculative decoding occasionally flips
++            // a close greedy call at this exact template boundary, and a bare `until`
++            // silently absorbed the resulting <parameter=.../<tool_call>/</function>
++            // repetition as "valid" string content since none of it equalled the single
++            // terminator). Excluding these from the value's own GBNF rule makes the
++            // grammar itself reject the bad continuation and force a resample, instead of
++            // silently corrupting the argument -- regardless of what causes the flip.
+             auto arg_string = p.rule("xml-arg-string",
+-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
++                p.ac(p.tool_arg_string_value(p.until_one_of({
++                    "\n</parameter>\n", "<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter="
++                })) + arg_close, "\n</parameter>\n"));
+ 
+             auto tool_choice = p.choice();
+             foreach_function(inputs.tools, [&](const json & tool) {
+-- 
+2.43.0
+
