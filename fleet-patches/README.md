@@ -1,0 +1,47 @@
+# Fleet patches (mirror, not source of truth)
+
+This directory is a **disk-backed mirror** of the commits this fork carries on
+top of `upstream/master`, generated with `git format-patch`. The `fleet-patches`
+branch itself (its git history) is still the source of truth -- these files
+exist so a patch can be inspected, diffed, or reapplied without a working
+clone of the branch, and so a rebase conflict has a static reference to work
+from instead of only `git show <sha>` on a branch that's mid-rebase.
+
+**Regenerate after any change to the fork-exclusive commit set** (a new patch,
+a squash, a rebase that changes commit hashes):
+
+```sh
+./fleet-patches/regenerate.sh
+```
+
+**Reapply onto a fresh checkout** (disaster recovery, or rebuilding
+`fleet-patches` from scratch against a newer `upstream/master`):
+
+```sh
+git checkout -b fleet-patches upstream/master
+git am fleet-patches/*.patch
+```
+
+If `git am` conflicts on a patch, that means upstream changed the same code
+this patch touches -- resolve it the same way any rebase conflict is
+resolved (read the patch's own commit message for *why* the change exists,
+re-derive the equivalent change against the new upstream code, `git am
+--continue`).
+
+## Current patches (regenerated 2026-09-15)
+
+| # | Commit | Summary |
+|---|---|---|
+| 0001 | `467589f6b` | grammar: translate PCRE shorthand escapes (`\d \w \s`) to GBNF classes |
+| 0002 | `a1e979568` | server: fix slot save/restore losing checkpoint-based cache reuse |
+| 0003 | `b74b2e31c` | common: guard checkpoint `update_dft` against an empty draft sequence |
+| 0004 | `5078faa5e` | ggml-alloc: finalize view init in a pass after all buft max_size splits |
+| 0005 | `9950b9dd4` | ci: add sync-with-upstream workflow (mirror of the master copy) |
+| 0006 | `290b1023d` | fix: repair YAML block-scalar indentation bug in sync workflow |
+| 0007 | `c5f91197b` | server: include `id_slot` in OAI-compatible chat completion responses |
+| 0008 | `87b0c16d4` | ggml: add `GGML_OP_SSM_CONV_SPLIT` (CPU+Vulkan) to skip the per-layer conv-state concat |
+| 0009 | `b7fd9fc37` | fleet: revert qwen3-coder complex-type parsing regression (upstream #28736/#28742) |
+
+See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
+full workflow this fits into (weekly upstream rebase, when to add a new
+patch vs. amend an existing one, the `sync-with-upstream` CI workflow).

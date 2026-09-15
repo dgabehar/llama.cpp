@@ -1,0 +1,159 @@
+From 5078faa5e80b839332e6ce3e4729bcf75b3e4a77 Mon Sep 17 00:00:00 2001
+From: Doug Gabehart <dgabehar@gmail.com>
+Date: Wed, 9 Sep 2026 20:54:43 -0500
+Subject: [PATCH] ggml-alloc: finalize view init in a pass after all buft
+ max_size splits
+
+Root cause and fix for a separate --parallel>1 draft-mtp SIGSEGV/abort
+crash: GGML_ASSERT(tensor->data != NULL && "tensor not allocated")
+aborting the whole process on periodic checkpoint creation
+(common_prompt_checkpoint::update_dft -> server_context_impl::create_checkpoint
+-> llama_state_seq_get_data_ext -> ggml_backend_tensor_get), reproduced
+live on Qwen3.8-27B-UD-Q4_K_XL (Vulkan/gfx1151) with --parallel 3 and
+draft-mtp speculative decoding, via direct kubectl port-forward + log
+capture. A live diagnostic build confirmed the crashing tensor is a
+per-stream KV-cache view (layer 64 MTP k_stream) with
+data=(nil) buffer=(nil) view_src=<valid, allocated> -- i.e. the VIEW
+itself was never initialized even though its backing storage was.
+
+Note: this is a distinct bug from the empty-draft-sequence crash fixed
+by the preceding commit -- that one is a genuinely never-touched sequence
+being read at all; this one is a sequence whose backing view was never
+initialized even though it had been used and has real data.
+
+This is a confirmed, independently-reported-upstream bug, not something
+specific to this fleet's config:
+- Issue https://github.com/ggml-org/llama.cpp/issues/23737 ("Eval bug:
+  GGML_ASSERT(tensor->data != NULL) on Vulkan since b9318") -- exact
+  assert match, multiple independent reporters on different hardware
+  (RADEON AI PRO r9700) and different models (gemma-4-31B-it,
+  gemma-4-26B-A4B), confirming this is a general Vulkan-backend
+  multi-stream/view-allocation bug, not MTP- or model-specific.
+- PR https://github.com/ggml-org/llama.cpp/pull/27738 (closed, not
+  merged, by its own author in favor of the PR below) describes the exact
+  same reproduction: model Qwen3.8-27B-UD-Q4_K_XL, MTP/nextn layer 64,
+  same call stack (common_prompt_checkpoint::update_dft ->
+  server_context_impl::create_checkpoint -> pre_decode). Root cause per
+  that PR's own body: "The k_stream/v_stream views are created before the
+  k/v tensors are allocated. On allocation paths that skip
+  ggml_backend_view_init ... they keep tensor->data == NULL forever while
+  their storage lives on view_src."
+- PR https://github.com/ggml-org/llama.cpp/pull/25584 ("ggml: fix view
+  init skipped after buft max_size split", open/unmerged as of vendoring)
+  is the fix applied here -- named by #27738's own closing comment as
+  "the better fix," fixing it at the ggml allocator level rather than the
+  KV-cache call site, predating #27738 by six weeks, and additionally
+  covering two related issues (#19839, #21762).
+
+ROOT CAUSE: when ggml_backend_alloc_ctx_tensors_from_buft splits a
+context's allocation across multiple buffers because a tensor would
+exceed the backend buft max_size (Vulkan's default is 1 GiB -- exactly
+the class of split a ~27B model's KV-cache tensors can trigger), a
+view-only tail at the end of a split range can skip alloc_tensor_range
+entirely, so any persistent view landing in that tail (this fleet's
+layer-64 MTP k_stream/v_stream) never gets ggml_backend_view_init and
+keeps data == NULL indefinitely, even though its view_src is fully
+allocated.
+
+FIX: instead of trying to allocate-or-view-init each tensor inline during
+a single pass over one split range (the old alloc_tensor_range logic,
+exactly what a view-only tail could skip), allocate ONLY real (non-view)
+tensors during the per-range pass, then run one final pass over the WHOLE
+context after all splits complete, initializing any tensor whose
+view_src is set but whose buffer is still NULL. This guarantees every
+view gets initialized regardless of which split range its parent
+tensor's allocation landed in.
+
+TEST FILE NOT PORTED: this PR's own tests/test-alloc.cpp addition
+(test_view_init_after_max_size_split) does not apply cleanly against this
+commit (context drift from the PR's own last rebase point, same class of
+drift as patch 0001's grammar fix) and was not hand-re-ported here. Low
+priority to re-port since the fleet's own build disables
+LLAMA_BUILD_TESTS anyway; worth doing if this repo's tests are ever
+turned back on.
+
+VERIFIED: applies clean (git apply --check) against this exact pinned
+commit with zero context drift, and gcc -fsyntax-only clean on the
+modified file. Live-verified end-to-end on real fleet hardware: the exact
+original crash repro (>16K-token prompt, --parallel 3, draft-mtp,
+kv_unified=false, mid-prefill checkpoint) completed cleanly (HTTP 200, 0
+pod restarts) against an image built from this commit, where the prior
+image reliably aborted on an identical repro.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+---
+ ggml/src/ggml-alloc.c | 41 +++++++++++++++++++++++++----------------
+ 1 file changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index a71838eaf..96f4c463c 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -1124,6 +1124,20 @@ static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buff
+     free(*buffers);
+ }
+ 
++static bool alloc_ctx_tensors_finalize_views(struct ggml_context * ctx) {
++    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++        if (t->view_src != NULL && t->buffer == NULL) {
++            enum ggml_status status = ggml_backend_view_init(t);
++            if (status != GGML_STATUS_SUCCESS) {
++                GGML_LOG_ERROR("%s: failed to initialize view tensor %s\n", __func__, t->name);
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
+ static bool alloc_tensor_range(struct ggml_context * ctx,
+         struct ggml_tensor * first, struct ggml_tensor * last,
+         ggml_backend_buffer_type_t buft, size_t size,
+@@ -1142,24 +1156,14 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
+     struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+ 
+     for (struct ggml_tensor * t = first; t != last; t = ggml_get_next_tensor(ctx, t)) {
+-        enum ggml_status status = GGML_STATUS_SUCCESS;
+-        if (t->data == NULL) {
+-            if (t->view_src == NULL) {
+-                status = ggml_tallocr_alloc(&tallocr, t);
+-            } else if (t->buffer == NULL) {
+-                status = ggml_backend_view_init(t);
+-            }
+-        } else {
+-            if (t->view_src != NULL && t->buffer == NULL) {
+-                // view of a pre-allocated tensor
+-                status = ggml_backend_view_init(t);
++        if (t->view_src == NULL && t->data == NULL) {
++            enum ggml_status status = ggml_tallocr_alloc(&tallocr, t);
++            if (status != GGML_STATUS_SUCCESS) {
++                GGML_LOG_ERROR("%s: failed to allocate tensor %s\n", __func__, t->name);
++                free_buffers(buffers, n_buffers);
++                return false;
+             }
+         }
+-        if (status != GGML_STATUS_SUCCESS) {
+-            GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
+-            free_buffers(buffers, n_buffers);
+-            return false;
+-        }
+     }
+ 
+     return true;
+@@ -1217,6 +1221,11 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
+         return NULL;
+     }
+ 
++    if (!alloc_ctx_tensors_finalize_views(ctx)) {
++        free_buffers(&buffers, &n_buffers);
++        return NULL;
++    }
++
+     ggml_backend_buffer_t buffer;
+     if (n_buffers == 1) {
+         buffer = buffers[0];
+-- 
+2.43.0
+

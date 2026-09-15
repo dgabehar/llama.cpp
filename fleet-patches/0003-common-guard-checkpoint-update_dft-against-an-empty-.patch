@@ -1,0 +1,105 @@
+From b74b2e31c1eb5a2133e1ae9c326f2b8e7bede114 Mon Sep 17 00:00:00 2001
+From: Doug Gabehart <dgabehar@gmail.com>
+Date: Wed, 9 Sep 2026 20:53:47 -0500
+Subject: [PATCH] common: guard checkpoint update_dft against an empty draft
+ sequence
+
+SIGSEGV / GGML_ASSERT("tensor not allocated") crash in create_checkpoint
+-> update_dft, taking down the whole llama-server process, under
+`--parallel>1` + draft-mtp (or any speculative type). Found live while
+root-causing a --parallel N-slot collapse rollout crash.
+
+REPRODUCTION: single request, no concurrent traffic, long prompt (>16K
+tokens, crossing the second `checkpoint_min_step` boundary at
+2*8192=16384) sent to a fresh, previously-idle slot under `--parallel 3`.
+Crashed mid PROMPT PROCESSING (prefill), before any token generation
+began:
+
+  I slot print_timing: id  2 | task 0 | prompt processing, n_tokens = 16477
+  D slot   operator(): id  2 | task 0 | main/do_checkpoint = yes, pos_min = 16476, pos_max = 16476
+  /app/ggml/src/ggml-backend.cpp:359: GGML_ASSERT(tensor->data != NULL && "tensor not allocated") failed
+  ... state_seq_get_data -> common_prompt_checkpoint::update_dft -> create_checkpoint ...
+
+ROOT CAUSE: create_checkpoint() (tools/server/server-context.cpp)
+unconditionally calls common_prompt_checkpoint::update_dft(ctx_dft,
+slot.id, ...) whenever a checkpoint is created -- including one triggered
+by the periodic checkpoint_min_step threshold during PURE PROMPT PREFILL,
+before the draft/speculative model has ever performed a forward pass for
+that slot's sequence (draft-mtp, like every speculative type, only runs
+during token generation, never during prefill). update_dft then calls
+llama_state_seq_get_data_ext on ctx_dft for that sequence unconditionally.
+
+Under a UNIFIED KV cache (kv_unified = true, what --parallel 1 produces),
+the single shared backing buffer is fully allocated at context-creation
+time regardless of write history, so reading an as-yet-unused sequence's
+(empty but allocated) region never crashes.
+
+Under a SPLIT (non-unified) KV cache (kv_unified = false, what
+--parallel>1 produces on a hybrid/linear-attention architecture like
+Qwen3.8-27B / qwen3_5), each sequence's backing buffer is allocated
+lazily, only once that sequence is actually used. A sequence that has
+done real target-model prefill but has NEVER been touched by the DRAFT
+model specifically (exactly the mid-prefill-checkpoint case above) has a
+genuinely unallocated draft-context KV buffer for that seq_id. Reading it
+via llama_io_write_host inside state_seq_get_data hits ggml-backend's own
+tensor->data != NULL assert and aborts the whole process -- taking down
+every other slot's in-flight work too, not just the one request that
+triggered it.
+
+Note: this is a distinct bug from the ggml allocator's view-init issue
+(see the following commit) -- this one is a real empty/never-touched
+sequence being read at all; that one is a sequence whose backing view was
+never initialized even though it had been used.
+
+FIX: guard update_dft with llama_memory_seq_pos_max(ctx_dft, seq_id) < 0
+(the documented upstream API for "this sequence is empty in this
+memory") immediately after the existing ctx == nullptr early-return. When
+the draft context genuinely has nothing for this sequence yet, leave
+data_dft empty and return -- exactly the same state already produced
+today when speculative decoding is disabled entirely (ctx_dft ==
+nullptr). common_prompt_checkpoint::load_dft already no-ops on an empty
+data_dft, so restoring a checkpoint created in this state correctly skips
+restoring draft state that never existed, rather than erroring.
+
+No upstream PR tracks this -- original work, not a vendored port. This
+looks like a genuine, previously-unreported bug affecting anyone running
+speculative decoding with --parallel>1 on a split/non-unified KV cache,
+worth filing upstream separately.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+---
+ common/common.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd9a..c7d1295c9 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2305,6 +2305,23 @@ void common_prompt_checkpoint::update_dft(
+         return;
+     }
+ 
++    // a checkpoint can be created while still in the prompt-prefill phase of
++    // a request (see create_checkpoint()'s periodic min-step trigger in
++    // tools/server/server-context.cpp), before the draft/speculative model
++    // has ever run a forward pass for this sequence -- draft-mtp and other
++    // speculative types only decode during token generation, not prefill.
++    // Under a split (non-unified) KV cache -- forced by --parallel>1 on
++    // hybrid/recurrent-layer architectures -- an unused sequence's backing
++    // buffer is not yet allocated, so reading it here would hit an
++    // unallocated tensor and hard-abort the whole process. Treat "nothing
++    // decoded yet" the same as "no draft context at all" (ctx == nullptr
++    // above): data_dft stays empty, and load_dft() already no-ops on an
++    // empty data_dft.
++    if (llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) < 0) {
++        data_dft.clear();
++        return;
++    }
++
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+     data_dft.resize(ckpt_size);
+-- 
+2.43.0
+

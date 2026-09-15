@@ -1,0 +1,47 @@
+From c5f91197b5ab6a93efc2a6e1cd116cdd3e121d65 Mon Sep 17 00:00:00 2001
+From: Doug Gabehart <dgabehar@gmail.com>
+Date: Thu, 10 Sep 2026 16:57:55 -0500
+Subject: [PATCH] server: include id_slot in OAI-compatible chat completion
+ responses
+
+The non-streaming and streaming OAI-compat chat completion builders
+(to_json_oaicompat_chat / to_json_oaicompat_chat_stream) never included
+id_slot, only the legacy non-OAI-compat response did. Our LiteLLM
+integration talks to this server exclusively over /v1/chat/completions,
+so scripts/litellm_custom_callbacks.py's Qwen38SlotPersistenceHook has
+never actually been able to read id_slot from real traffic despite
+being written to depend on it (openai._models.BaseModel's extra="allow"
+lets it pass through when present -- it just was never present).
+
+Adds id_slot as a plain top-level field to both response shapes,
+mirroring the field already emitted by to_json_non_oaicompat(). No
+existing field removed or renamed.
+---
+ tools/server/server-task.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 0d3beb313..5beb79ea0 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -445,7 +445,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion"},
+         {"usage",              usage_json_oaicompat()},
+-        {"id", oaicompat_cmpl_id}
++        {"id", oaicompat_cmpl_id},
++        {"id_slot",            id_slot}
+     };
+ 
+     // extra fields for debugging purposes
+@@ -497,6 +498,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion.chunk"},
++        {"id_slot",            id_slot},
+     });
+ 
+     if (include_usage) {
+-- 
+2.43.0
+
