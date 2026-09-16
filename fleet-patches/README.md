@@ -60,6 +60,17 @@ touched. 0021 is this fork's own fix for API drift in `llama_hparams::n_ff_exp`
 fork point. See `home-infrastructure`'s TODO.md ("K2-Horizon Ascent" entry,
 2026-09-16) for the full port/build/canary writeup.
 
+**No upstream PR exists for this yet.** The model card claims "PR to
+llama.cpp is in progress," but as of this writing nothing has actually been
+filed against `ggml-org/llama.cpp` -- only a tracking bug report exists:
+[ggml-org/llama.cpp#28361](https://github.com/ggml-org/llama.cpp/issues/28361)
+("Eval bug: K2-Horizon models fail to load"), still open, whose own comments
+point back to the same vendor branch these patches are cherry-picked from
+(https://github.com/MBZUAI-IFM/llama.cpp/tree/model/K2Horizon). Re-check that
+issue before this fork's next upstream rebase -- if a real PR lands and
+merges, these patches become redundant and should be dropped rather than
+carried forward as a rebase conflict.
+
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new
 patch vs. amend an existing one, the `sync-with-upstream` CI workflow).
