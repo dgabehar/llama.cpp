@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-09-15)
+## Current patches (regenerated 2026-09-16)
 
 | # | Commit | Summary |
 |---|---|---|
@@ -45,6 +45,20 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0011 | `17ecd9d52` | server: disable speculative decoding for grammar-constrained requests |
 | 0012 | `3c4e5bf4b` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
 | 0014 | `a1b3b4199` | vulkan: occupancy-aware S/M/L tile selector for non-coopmat2 path (AMD/Intel) |
+| 0016 | `2bef5fb62` | model: K2 Horizon gguf conversion code |
+| 0017 | `04dec3511` | model: loading hparams and tensors in k2-horizon.cpp |
+| 0018 | `24b5a208f` | model: K2 Horizon compute graph |
+| 0019 | `d1e6830aa` | model: K2 Horizon compute graph adjustment and registering tokenizers |
+| 0020 | `40fd73c38` | model: K2 Horizon chat template and accomodate safetensors naming |
+| 0021 | `7f9e25ec4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
+
+Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
+branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
+2026-08-28) -- model-definition/conversion/vocab layer only, no backend code
+touched. 0021 is this fork's own fix for API drift in `llama_hparams::n_ff_exp`
+(plain field -> per-layer accessor) that landed upstream after the vendor's
+fork point. See `home-infrastructure`'s TODO.md ("K2-Horizon Ascent" entry,
+2026-09-16) for the full port/build/canary writeup.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new
