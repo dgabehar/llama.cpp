@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-09-16)
+## Current patches (regenerated 2026-09-17)
 
 | # | Commit | Summary |
 |---|---|---|
@@ -51,6 +51,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0019 | `d1e6830aa` | model: K2 Horizon compute graph adjustment and registering tokenizers |
 | 0020 | `40fd73c38` | model: K2 Horizon chat template and accomodate safetensors naming |
 | 0021 | `7f9e25ec4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
+| 0024 | `35e651927` | server: end generation cleanly on a tool-call-diff inconsistency |
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
