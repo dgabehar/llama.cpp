@@ -83,21 +83,32 @@ discipline by standing convention).
   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
   `fleet-patches`.
 
-- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashes
+- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashed
   (uncaught `std::terminate`) on `models/templates/Qwen3-Coder.jinja`'s
   `html` tool.** Found 2026-09-17 while fixing the server-side "now finding
   less tool calls" invariant crash (see `35e651927`, `server: end
-  generation cleanly on a tool-call-diff inconsistency`). Root cause: a
-  partial PEG reparse of that template's output speculatively opens an
-  `html` tool call that a fuller reparse of the same text later retracts --
-  `common_chat_msg_diff::compute_diffs()` throws on the retraction (now
-  `common_chat_msg_diff_invalid_error`), and this test calls `compute_diffs`
-  directly rather than through the server's `update_chat_msg()`, so it
-  isn't caught by that fix at all. Confirmed via `git stash` that this
-  crash pre-dates `35e651927` and is unaffected by it either way. **NOT
-  FIXED** -- this is the qwen3-coder PEG parser's own false-positive
-  tool-call detection, a separate, deeper parsing problem than the server
-  crash above; out of scope for that session's task on purpose. Repro:
-  `./build/bin/test-chat` (default args, no template filter) crashes deep
-  into `test_template_output_peg_parsers`; see the commit message of
-  `35e651927` for the exact backtrace/output.
+  generation cleanly on a tool-call-diff inconsistency`); that fix alone
+  didn't cover this test since it calls `compute_diffs()` directly, not
+  through the server's `update_chat_msg()`. **FIXED** (see the commit
+  titled `peg-parser: don't prematurely close an until_one_of span on an
+  ambiguous partial delimiter match`) -- this genuinely was a fixable
+  PEG-parser bug, not an inherent property of incremental parsing. Root
+  cause, traced with `--template Qwen3-Coder --detailed`: the html markup
+  value's content starts with a literal `<`, which is also the first
+  character of several of `xml-arg-string`'s `until_one_of` terminators
+  (`<tool_call>`, `<function=`, `<parameter=`). At the exact byte-offset
+  where only that lone `<` has streamed in so far, `common_trie::check_at`
+  correctly reports `PARTIAL_MATCH` (ambiguous -- could still complete into
+  a real terminator, or turn out to be ordinary content), but
+  `common_peg_until_parser`'s executor (`common/peg-parser.cpp`) treated
+  `PARTIAL_MATCH` the same as `COMPLETE_MATCH` and returned `SUCCESS` with
+  an empty captured span right there. That made the immediately-following
+  `arg_close` literal (`\n</parameter>\n`) get tested against the real next
+  characters (`html>...`) and fail outright (not "need more input"), which
+  collapsed the whole in-progress tool call from the AST instead of just
+  waiting for one more byte to disambiguate. Fixed by making the
+  `PARTIAL_MATCH` branch return `NEED_MORE_INPUT` (matching the existing
+  ran-off-the-end-of-input fallback a few lines below) whenever
+  `ctx.is_lenient()`, so `SEQUENCE`/`REPEAT` correctly stay pending instead
+  of hard-failing. Confirmed via the same before/after
+  build-and-run-test-chat method as `35e651927`.

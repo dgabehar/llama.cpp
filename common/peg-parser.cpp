@@ -692,7 +692,22 @@ struct parser_executor {
             }
 
             if (match == common_trie::PARTIAL_MATCH) {
-                // Found a partial match extending to end of input, return everything before it
+                // The remaining input is a non-empty prefix of one of the delimiters, and that
+                // prefix runs all the way to the end of the currently available input (see
+                // common_trie::check_at: PARTIAL_MATCH only fires when the scan hits end-of-input
+                // while still mid-trie). This is genuinely ambiguous during incremental parsing --
+                // more input could still complete the delimiter, or could just as easily turn out
+                // to be ordinary content that happens to share a delimiter's prefix (e.g. a lone
+                // '<' that's about to become a literal "<html>" tag inside a string value, not the
+                // start of a structural marker like "<function="). Reporting SUCCESS here would
+                // wrongly commit to "the until-content ends right before this ambiguous suffix",
+                // which then makes a following literal match (e.g. a closing delimiter) fail
+                // outright instead of also waiting for more input -- collapsing an otherwise-valid
+                // in-progress match. Same NEED_MORE_INPUT-when-lenient rule as the no-match-at-all
+                // case below; only a final (non-lenient) parse treats the ambiguous tail as content.
+                if (ctx.is_lenient()) {
+                    return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos);
+                }
                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
             }
 
