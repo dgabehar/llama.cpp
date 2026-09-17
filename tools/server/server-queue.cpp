@@ -566,6 +566,19 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 const size_t idx = result->index;
                 GGML_ASSERT(idx < states.size());
                 result->update(states[idx]);
+
+                if (states[idx].diff_error_stop) {
+                    // a tool-call-diff inconsistency ended this task's generation early
+                    // (see task_result_state::update_chat_msg). cancel any further
+                    // generation for it -- same mechanism as any other early termination --
+                    // and, for a partial (still-streaming) chunk, force it to report a
+                    // normal stop so the client gets a clean finish reason instead of a
+                    // dropped connection.
+                    if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
+                        partial->force_stop = true;
+                    }
+                    stop();
+                }
             }
             if (result->is_stop()) {
                 received_count++;

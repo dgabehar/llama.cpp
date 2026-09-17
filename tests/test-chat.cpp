@@ -7546,6 +7546,41 @@ static void test_msg_diffs_compute() {
 
         assert_equals({ diff1, diff2 }, common_chat_msg_diff::compute_diffs(msg0, msg2));
     }
+    {
+        // A later, fuller reparse can legitimately retract a tool call an earlier partial
+        // reparse speculatively recognized. compute_diffs() can't represent that as a diff,
+        // so it must throw a specific, catchable exception type (not a bare
+        // std::runtime_error) so callers can end generation cleanly instead of treating this
+        // as an unrecoverable server error.
+        common_chat_msg msg_prv;
+        msg_prv.tool_calls = {
+            { "f1", "{\"arg1\": 1}", /* .id = */ "123" },
+            { "f2", "{\"arg2\": 2}", /* .id = */ "222" },
+        };
+
+        common_chat_msg msg_new;
+        msg_new.tool_calls = {
+            { "f1", "{\"arg1\": 1}", /* .id = */ "123" },
+        };
+
+        bool caught_expected_type = false;
+        try {
+            common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
+            throw std::runtime_error("Expected common_chat_msg_diff_invalid_error to be thrown");
+        } catch (const common_chat_msg_diff_invalid_error & e) {
+            caught_expected_type = true;
+            if (std::string(e.what()).find("now finding less tool calls") == std::string::npos) {
+                throw std::runtime_error("Unexpected common_chat_msg_diff_invalid_error message");
+            }
+        } catch (const std::exception & e) {
+            throw std::runtime_error(
+                (std::string("Expected common_chat_msg_diff_invalid_error, got a different exception: ") + e.what())
+                    .c_str());
+        }
+        if (!caught_expected_type) {
+            throw std::runtime_error("Expected common_chat_msg_diff_invalid_error to be thrown");
+        }
+    }
 }
 
 int main(int argc, char ** argv) {

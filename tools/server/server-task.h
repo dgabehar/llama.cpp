@@ -111,6 +111,12 @@ struct task_result_state {
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
+    // set by update_chat_msg() when a later, fuller reparse of the accumulated generation
+    // legitimately finds fewer tool calls than an earlier partial reparse guessed. the caller
+    // (server_response_reader::next()) checks this after update() returns and ends the
+    // generation cleanly instead of letting the inconsistency surface as a server error.
+    bool diff_error_stop = false;
+
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
     bool thinking_block_started = false;
@@ -430,8 +436,15 @@ struct server_task_result_cmpl_partial : server_task_result {
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
 
+    // set by server_response_reader::next() when this chunk's update() hit a tool-call-diff
+    // inconsistency (task_result_state::diff_error_stop) -- ends the stream early with a
+    // normal finish reason instead of letting the inconsistency surface as a server error.
+    bool force_stop = false;
+
     virtual bool is_stop() override {
-        return false; // in stream mode, partial responses are not considered stop
+        // in stream mode, partial responses are not considered stop, except when
+        // force_stop was set to end generation early due to a diff inconsistency.
+        return force_stop;
     }
 
     virtual void update(task_result_state & state) override;

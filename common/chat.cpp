@@ -294,7 +294,7 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
             err += "    - name: '" + tc.name + "', args: '" + tc.arguments + "'\n";
         }
         err += "  Current msg text content:\n" + msg_new.content + "\n";
-        throw std::runtime_error(err);
+        throw common_chat_msg_diff_invalid_error(err);
     }
 
     if (!msg_prv.tool_calls.empty()) {
