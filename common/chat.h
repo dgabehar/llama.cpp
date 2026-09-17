@@ -13,6 +13,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -125,6 +126,16 @@ struct common_chat_msg {
     }
 
     bool operator!=(const common_chat_msg & other) const { return !(*this == other); }
+};
+
+// thrown by common_chat_msg_diff::compute_diffs() when a later, fuller reparse of the
+// accumulated generation legitimately finds fewer tool calls than an earlier partial
+// reparse guessed (the earlier parse speculatively recognized a tool-call shape that more
+// text later retracts). derives from std::runtime_error so existing generic catch sites
+// keep working; callers that need to react specifically (e.g. end generation cleanly
+// instead of treating this as an unrecoverable server error) can catch this type instead.
+struct common_chat_msg_diff_invalid_error : std::runtime_error {
+    explicit common_chat_msg_diff_invalid_error(const std::string & what) : std::runtime_error(what) {}
 };
 
 struct common_chat_msg_diff {

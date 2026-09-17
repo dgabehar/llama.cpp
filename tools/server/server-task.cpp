@@ -174,7 +174,23 @@ common_chat_msg task_result_state::update_chat_msg(
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+
+        std::vector<common_chat_msg_diff> all_diffs;
+        try {
+            all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        } catch (const common_chat_msg_diff_invalid_error & e) {
+            // a fuller reparse of the accumulated generation retracted a tool call an
+            // earlier partial reparse had speculatively recognized. this is a real,
+            // non-buggy outcome of incremental parsing (not fixed here -- the parser's
+            // false-positive tool-call detection is a separate, deeper problem), but the
+            // diff invariant can't reconcile it. end generation cleanly at this point:
+            // keep everything already sent, emit no more diffs, and signal the caller to
+            // stop rather than let the inconsistency surface as a server error.
+            SRV_ERR("generation ended early due to a tool-call-diff inconsistency: %s\n", e.what());
+            chat_msg = msg_prv_copy;
+            diff_error_stop = true;
+            return msg_prv_copy;
+        }
 
         if (!filter_tool_calls) {
             diffs = std::move(all_diffs);
@@ -1142,6 +1158,25 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 
     for (const auto & diff : oaicompat_msg_diffs) {
         add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
+    }
+
+    if (force_stop) {
+        // ended early due to a tool-call-diff inconsistency (see update_chat_msg()) -- close
+        // out the completion with a normal finish reason, same shape as a real stop.
+        deltas.push_back({
+            {"choices", json::array({
+                json {
+                    {"finish_reason", "stop"},
+                    {"index", index},
+                    {"delta", json::object()},
+                },
+            })},
+            {"created", t},
+            {"id", oaicompat_cmpl_id},
+            {"model", oaicompat_model},
+            {"system_fingerprint", std::string(llama_build_info())},
+            {"object", "chat.completion.chunk"},
+        });
     }
 
     if (!deltas.empty()) {
