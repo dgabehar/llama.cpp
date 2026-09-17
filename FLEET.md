@@ -82,3 +82,22 @@ discipline by standing convention).
     behind the primary fix, not a replacement for it.
   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
   `fleet-patches`.
+
+- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashes
+  (uncaught `std::terminate`) on `models/templates/Qwen3-Coder.jinja`'s
+  `html` tool.** Found 2026-09-17 while fixing the server-side "now finding
+  less tool calls" invariant crash (see `35e651927`, `server: end
+  generation cleanly on a tool-call-diff inconsistency`). Root cause: a
+  partial PEG reparse of that template's output speculatively opens an
+  `html` tool call that a fuller reparse of the same text later retracts --
+  `common_chat_msg_diff::compute_diffs()` throws on the retraction (now
+  `common_chat_msg_diff_invalid_error`), and this test calls `compute_diffs`
+  directly rather than through the server's `update_chat_msg()`, so it
+  isn't caught by that fix at all. Confirmed via `git stash` that this
+  crash pre-dates `35e651927` and is unaffected by it either way. **NOT
+  FIXED** -- this is the qwen3-coder PEG parser's own false-positive
+  tool-call detection, a separate, deeper parsing problem than the server
+  crash above; out of scope for that session's task on purpose. Repro:
+  `./build/bin/test-chat` (default args, no template filter) crashes deep
+  into `test_template_output_peg_parsers`; see the commit message of
+  `35e651927` for the exact backtrace/output.
