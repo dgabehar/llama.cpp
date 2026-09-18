@@ -45,6 +45,23 @@ applies to this fork too, not just upstream contributions (`AGENTS.md`'s
 push/PR restriction is written for upstream, but this fork follows the same
 discipline by standing convention).
 
+## QA requirement for every fork-exclusive change (added 2026-09-18)
+
+**With every change to this fork (a new patch, an amend, a `LLAMACPP_REF`
+bump into `home-infrastructure`), Murat (the `bmad-tea` test-architect
+persona) must update the e2e test plan
+(`home-infrastructure/docs/architecture/litellm-fleet-e2e-test-plan.md`)
+and Dawn (the `bmad-dawn-qa-executor` persona) must execute that test plan
+AND perform exploratory/adversarial testing beyond its written coverage.**
+Standing requirement, not a one-off -- this is the loop that caught every
+real regression/gap this fleet found this session (the system-message
+hook's `role=="developer"` gap, the `n_parallel` cross-node replication
+mismatch, the slot-action queue-timeout gap), each time on a change that
+looked complete from build+unit-test success alone. Applies regardless of
+how small the change looks or how confident the build/local-test result
+is -- a green `tests/test-chat.cpp`/`test_slot_save.py` run is necessary,
+not sufficient, evidence for a fleet-facing change.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
