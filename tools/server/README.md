@@ -223,6 +223,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-action-timeout-ms N` | max time in milliseconds a `/slots` save\|restore request may wait in the task queue before its target slot is dispatched, before it is cancelled and an error is returned to the caller; 0 = no bound, wait indefinitely (default: 60000)<br/>does not affect ordinary completion requests, only slot save/restore<br/>(env: LLAMA_ARG_SLOT_ACTION_TIMEOUT_MS) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1151,6 +1152,11 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+Like an ordinary completion, this request enters the server's single task queue and is
+deferred if slot `id_slot` is currently busy -- but unlike a completion, it is bounded by
+`--slot-action-timeout-ms` (default: 60000, 0 = unbounded): if the slot isn't free by then, the
+request is cancelled and the server responds with HTTP 503 instead of continuing to wait.
+
 **Response format**
 
 ```json
@@ -1165,11 +1171,21 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+`note` (optional): only present when `n_saved` is legitimately `0` for a reason the caller
+should know about, rather than a failed/missing capture. Today the only such reason is: the
+slot's last task was a completed *child* of a multi-completion (`n` > 1) request -- by design,
+a child slot's context is wiped the instant it finishes (see `server_slot::release()`), since
+the parent slot already holds the shared context. A save request that instead times out
+waiting for a busy slot (see above) is a different situation and is reported as an HTTP 503
+error, not as an empty save with a note.
+
 ### POST `/slots/{id_slot}?action=restore`: Restore the prompt cache of the specified slot from a file.
 
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+
+Subject to the same `--slot-action-timeout-ms` queue-wait bound as `action=save` above.
 
 **Response format**
 

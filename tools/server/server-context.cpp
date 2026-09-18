@@ -2761,6 +2761,23 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite + nwrite_ckpt;
                     res->t_ms     = t_save_ms;
+
+                    // Make an otherwise-indistinguishable empty save legible: a slot whose
+                    // last task was a completed CHILD of an n_cmpl>1 request had its prompt
+                    // deliberately wiped by release()'s is_child() branch the instant
+                    // is_processing flipped false ("do not keep context of the child slots -
+                    // the parent's context is enough") -- not a failed/missing capture. Only
+                    // set when n_tokens is actually 0, so a slot that happens to have been a
+                    // child task in the past but was reused since (task_prev overwritten by a
+                    // later, real task) never gets a stale note attached.
+                    if (res->n_tokens == 0 && slot->task_prev && slot->task_prev->is_child()) {
+                        res->note =
+                            "this slot's last task was a completed child of a multi-completion "
+                            "(n>1) request; its prompt/KV content is intentionally not retained "
+                            "(see server_slot::release()), so n_saved=0 here reflects that "
+                            "by-design empty state, not a failed or missed capture";
+                    }
+
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -5507,8 +5524,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         rd.post_task(std::move(task));
     }
 
-    auto result = rd.next(req.should_stop);
+    // SLOT_SAVE enters the same FIFO queue as ordinary completions and can be deferred
+    // indefinitely if id_slot stays busy (see server-queue.cpp) -- bound the wait here so a
+    // maintenance call against a busy node fails fast with a clear error instead of blocking
+    // forever with no feedback to the caller. Does not affect ordinary completion requests.
+    const int64_t t_start_ms = ggml_time_ms();
+    bool timed_out = false;
+    auto result = rd.next([&]() {
+        if (req.should_stop()) {
+            return true;
+        }
+        if (params.slot_action_timeout_ms > 0 &&
+                ggml_time_ms() - t_start_ms >= params.slot_action_timeout_ms) {
+            timed_out = true;
+            return true;
+        }
+        return false;
+    });
     if (!result) {
+        if (timed_out) {
+            // task never reached the front of the queue in time -- cancel it so it doesn't
+            // sit in queue_tasks_deferred forever (same cleanup path as a client disconnect)
+            rd.stop();
+            res->error(format_error_response(
+                string_format(
+                    "Slot save timed out after %d ms waiting for slot %d (still queued/deferred "
+                    "behind other traffic); cancelled -- retry once the node is less busy",
+                    params.slot_action_timeout_ms, id_slot),
+                ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
         // connection was closed
         GGML_ASSERT(req.should_stop());
         return res;
@@ -5543,8 +5588,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         rd.post_task(std::move(task));
     }
 
-    auto result = rd.next(req.should_stop);
+    // SLOT_RESTORE enters the same FIFO queue as ordinary completions and can be deferred
+    // indefinitely if id_slot stays busy (see server-queue.cpp) -- bound the wait here so a
+    // maintenance call against a busy node fails fast with a clear error instead of blocking
+    // forever with no feedback to the caller. Does not affect ordinary completion requests.
+    const int64_t t_start_ms = ggml_time_ms();
+    bool timed_out = false;
+    auto result = rd.next([&]() {
+        if (req.should_stop()) {
+            return true;
+        }
+        if (params.slot_action_timeout_ms > 0 &&
+                ggml_time_ms() - t_start_ms >= params.slot_action_timeout_ms) {
+            timed_out = true;
+            return true;
+        }
+        return false;
+    });
     if (!result) {
+        if (timed_out) {
+            // task never reached the front of the queue in time -- cancel it so it doesn't
+            // sit in queue_tasks_deferred forever (same cleanup path as a client disconnect)
+            rd.stop();
+            res->error(format_error_response(
+                string_format(
+                    "Slot restore timed out after %d ms waiting for slot %d (still queued/deferred "
+                    "behind other traffic); cancelled -- retry once the node is less busy",
+                    params.slot_action_timeout_ms, id_slot),
+                ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
         // connection was closed
         GGML_ASSERT(req.should_stop());
         return res;

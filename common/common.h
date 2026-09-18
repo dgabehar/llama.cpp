@@ -692,6 +692,10 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
+    // max time a /slots save|restore request may wait in queue before its target slot is
+    // dispatched; 0 = no bound (blocks indefinitely, same as before this option existed)
+    int32_t slot_action_timeout_ms = 60000;
+
     float slot_prompt_similarity = 0.1f;
 
     // batched-bench params
