@@ -539,6 +539,13 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_bytes;
     double t_ms;
 
+    // set only when n_tokens/n_bytes is legitimately near-empty for a reason the caller
+    // should know about, e.g. the slot was released as a completed child task of an
+    // n_cmpl>1 request (see server_slot::release()'s is_child() branch) -- distinguishes
+    // that intentional, by-design empty state from a genuinely failed/missing capture.
+    // empty string = no note, omitted from the response.
+    std::string note;
+
     virtual json to_json() override;
 };
 

@@ -3612,6 +3612,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-action-timeout-ms"}, "N",
+        string_format(
+            "max time in milliseconds a /slots save|restore request may wait in the task "
+            "queue before its target slot is dispatched, before it is cancelled and an error "
+            "is returned to the caller; 0 = no bound, wait indefinitely (default: %d)\n"
+            "does not affect ordinary completion requests, only slot save/restore",
+            params.slot_action_timeout_ms
+        ),
+        [](common_params & params, int value) {
+            params.slot_action_timeout_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_ACTION_TIMEOUT_MS"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

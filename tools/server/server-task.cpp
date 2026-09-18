@@ -1658,7 +1658,7 @@ std::string server_task_result_metrics::to_metrics() {
 //
 json server_task_result_slot_save_load::to_json() {
     if (is_save) {
-        return json {
+        json out = json {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   n_tokens },
@@ -1667,6 +1667,10 @@ json server_task_result_slot_save_load::to_json() {
                 { "save_ms", t_ms }
             }},
         };
+        if (!note.empty()) {
+            out["note"] = note;
+        }
+        return out;
     }
 
     return json {
