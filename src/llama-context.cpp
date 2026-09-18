@@ -369,6 +369,65 @@ llama_context::llama_context(
             }
         }
 
+        // Extra CPU locality domains (see ggml_backend_cpu_locality_domains()): device index 0 is
+        // already the backend_cpu constructed above. Domains beyond that only exist when
+        // --cpu-split auto detected >1 (a monolithic-die host always yields exactly one CPU
+        // device, so this block is a no-op there). Each extra domain gets its own backend
+        // instance plus a permanently-owned threadpool pinned to that domain's cores -- without
+        // an explicitly attached threadpool, ggml runs an unpinned disposable one, which would
+        // silently defeat the whole point of the split. These are deliberately NOT registered in
+        // set_n_threads_fns above: the public n_threads/n_threads_batch knobs govern only the
+        // primary (domain 0) backend, matching the plan's "no finer config knob" decision.
+        if (params.cpu_split) {
+            ggml_backend_dev_t backend_cpu_dev = ggml_backend_get_device(backend_cpu);
+
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU || dev == backend_cpu_dev) {
+                    continue;
+                }
+
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                }
+
+                bool cpumask[GGML_MAX_N_THREADS];
+                int  n_threads = 0;
+                if (ggml_backend_cpu_device_get_locality_mask(dev, cpumask)) {
+                    for (int t = 0; t < GGML_MAX_N_THREADS; ++t) {
+                        if (cpumask[t]) {
+                            n_threads++;
+                        }
+                    }
+                }
+                if (n_threads <= 0) {
+                    n_threads = GGML_DEFAULT_N_THREADS;
+                }
+
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto * threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+                auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+                auto * set_n_threads_fn  = (decltype(ggml_backend_cpu_set_n_threads)  *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+
+                if (threadpool_new_fn && set_threadpool_fn) {
+                    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+                    memcpy(tpp.cpumask, cpumask, sizeof(cpumask));
+
+                    ggml_threadpool_t tp = threadpool_new_fn(&tpp);
+                    if (tp) {
+                        set_threadpool_fn(backend, tp);
+                        cpu_split_threadpools.push_back(tp);
+                    }
+                }
+                if (set_n_threads_fn) {
+                    set_n_threads_fn(backend, n_threads);
+                }
+
+                backends.emplace_back(backend);
+            }
+        }
+
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
         // graph outputs buffer
@@ -482,6 +541,16 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (!cpu_split_threadpools.empty()) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        if (threadpool_free_fn) {
+            for (ggml_threadpool_t tp : cpu_split_threadpools) {
+                threadpool_free_fn(tp);
+            }
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -3728,6 +3797,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.cpu_split                   =*/ true,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
