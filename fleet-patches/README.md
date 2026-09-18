@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-09-17)
+## Current patches (regenerated 2026-09-18)
 
 | # | Commit | Summary |
 |---|---|---|
@@ -54,6 +54,13 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0024 | `35e651927` | server: end generation cleanly on a tool-call-diff inconsistency |
 | 0027 | `9e917cddf` | peg-parser: don't prematurely close an until_one_of span on an ambiguous partial delimiter match |
 | 0028 | `72a88ea77` | server: bound slot-action queue wait, and explain empty child-slot saves |
+| 0030 | `faee26a4c` | FLEET.md: require Murat/Dawn QA loop for every fork-exclusive change |
+| 0031 | `84b660c0d` | ggml-cpu: extend CPU backend device registry to N locality domains |
+| 0032 | `6fe8f7c86` | common: new `--cpu-split auto|off` flag with startup throughput calibration |
+| 0033 | `1d8ec4bc5` | llama-model: weighted per-layer CPU split across locality domains |
+| 0034 | `849dacc67` | llama-context: make backend_cpu locality-domain aware |
+| 0035 | `7e43e4a6d` | tests: cover the CPU locality-domain split |
+| 0036 | `1335f74e1` | docs: document `--cpu-split` and the CPU locality-domain split feature |
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
