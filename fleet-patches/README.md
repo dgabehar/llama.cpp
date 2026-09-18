@@ -63,6 +63,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0036 | `1335f74e1` | docs: document `--cpu-split` and the CPU locality-domain split feature |
 | 0039 | `33581fbd8` | fix: route `ggml_backend_cpu_device_get_locality_mask` through the DL proc-address table |
 | 0041 | `5f25d2b3e` | fix: don't reject a GPU's host buffer type in `ggml_backend_cpu_device_supports_buft` |
+| 0043 | `b0530e2bc` | FLEET.md: document the 2026-09-18 CPU-split rollout outage and its fix |
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
