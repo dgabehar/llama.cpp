@@ -1819,9 +1819,13 @@ std::vector<float> common_cpu_split_calibrate() {
             continue;
         }
 
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
         bool cpumask[GGML_MAX_N_THREADS];
         int  n_threads = 0;
-        if (ggml_backend_cpu_device_get_locality_mask(dev, cpumask)) {
+        auto * get_locality_mask_fn = (decltype(ggml_backend_cpu_device_get_locality_mask) *)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_device_get_locality_mask");
+        if (get_locality_mask_fn && get_locality_mask_fn(dev, cpumask)) {
             for (int t = 0; t < GGML_MAX_N_THREADS; ++t) {
                 if (cpumask[t]) {
                     n_threads++;
@@ -1832,7 +1836,6 @@ std::vector<float> common_cpu_split_calibrate() {
             n_threads = (int) std::thread::hardware_concurrency();
         }
 
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto * threadpool_new_fn  = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
         auto * threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
         auto * set_threadpool_fn  = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
