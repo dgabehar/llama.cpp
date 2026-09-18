@@ -61,6 +61,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0034 | `849dacc67` | llama-context: make backend_cpu locality-domain aware |
 | 0035 | `7e43e4a6d` | tests: cover the CPU locality-domain split |
 | 0036 | `1335f74e1` | docs: document `--cpu-split` and the CPU locality-domain split feature |
+| 0039 | `33581fbd8` | fix: route `ggml_backend_cpu_device_get_locality_mask` through the DL proc-address table |
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
