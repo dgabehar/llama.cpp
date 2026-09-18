@@ -354,6 +354,10 @@ private:
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 
+    // threadpools owned by this context for CPU locality domains beyond the primary one
+    // (see llama_context_params::cpu_split); freed in the destructor.
+    std::vector<ggml_threadpool_t> cpu_split_threadpools;
+
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
 
