@@ -3,6 +3,7 @@ from utils import *
 import base64
 import requests
 import struct
+import threading
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -156,6 +157,123 @@ def test_slot_erase():
     assert res.status_code == 200
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
+
+
+#
+# Dawn's second QA execution pass (PR #88, TODO.md Findings 6 and 8 in
+# home-infrastructure) flagged two real slot-save/restore gaps in production. The
+# tests below reproduce each mechanism directly against this test harness and lock
+# in the fix, so a recurrence is caught by CI instead of live QA again.
+#
+
+def test_slot_save_child_task_of_multi_completion_is_legible():
+    # Finding 6: a save immediately after a real generation reported n_saved: 0 with
+    # only a tiny, fixed-size (structurally-valid, no real KV payload) n_written --
+    # indistinguishable from a genuinely empty/failed capture. Root-caused to
+    # server_slot::release()'s is_child() branch, which deliberately wipes a CHILD
+    # slot's prompt the instant it finishes on any n_cmpl > 1 ("n" in the OpenAI-compat
+    # API) request -- "do not keep context of the child slots - the parent's context
+    # is enough". This is correct, by-design behavior, not a bug to fix by changing
+    # the cleanup -- the fix is making the outcome legible via the new `note` field.
+    global server
+    server.n_slots = 2
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "n_cmpl": 2,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert isinstance(res.body, list)
+    assert len(res.body) == 2
+
+    saw_parent = False
+    saw_child = False
+    for id_slot in range(2):
+        save_res = server.make_request("POST", f"/slots/{id_slot}?action=save", data={
+            "filename": f"cmpl_slot{id_slot}.bin",
+        })
+        assert save_res.status_code == 200
+        if save_res.body["n_saved"] == 0:
+            # the child slot: empty by design, and now explained
+            assert "note" in save_res.body
+            assert "child" in save_res.body["note"]
+            saw_child = True
+        else:
+            # the parent slot: real content, no note needed
+            assert save_res.body["n_saved"] > 0
+            assert "note" not in save_res.body
+            saw_parent = True
+    assert saw_parent and saw_child
+
+
+def test_slot_save_after_normal_completion_under_real_parallel():
+    # Finding 6, test coverage item (b): a save immediately after a NORMAL (n_cmpl=1)
+    # completion, under real --parallel > 1 concurrency, must still capture the
+    # request's own real content -- guards against the (investigated and not
+    # reproduced) hypothesis that a save could race a fresh request reusing the
+    # just-freed slot on a multi-slot node.
+    global server
+    server.n_slots = 3
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # /completion already returns only after the slot's own generation finished and
+    # release() ran, so the slot is idle by the time we get here -- no polling needed.
+    save_res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "normal_under_parallel.bin",
+    })
+    assert save_res.status_code == 200
+    assert save_res.body["n_saved"] > 0  # must reflect the real request, not an empty slot
+    assert "note" not in save_res.body
+
+
+def test_slot_action_timeout_returns_error_instead_of_hanging():
+    # Finding 8: a /slots save|restore request enters the same FIFO queue as ordinary
+    # completions and, if deferred because its target slot is busy, has no bound on
+    # how long it waits -- confirmed live to queue for 15+ minutes with no timeout, no
+    # cancellation, and no feedback to the caller. --slot-action-timeout-ms bounds
+    # this: once exceeded, the still-queued task is cancelled and the caller gets a
+    # clear, distinct error instead of an indefinite hang.
+    global server
+    server.n_slots = 1  # single slot, easy to keep permanently busy
+    server.n_ctx = 8192  # large enough that a real generation clearly outlasts the timeout below
+    server.slot_action_timeout_ms = 500
+    server.start()
+
+    busy = {}
+    def keep_slot_busy():
+        r = server.make_request("POST", "/completion", data={
+            "prompt": "Tell me a very long, very detailed story about dragons:",
+            "n_predict": 8000,
+            "id_slot": 0,
+        }, timeout=60)
+        busy["status_code"] = r.status_code
+    t = threading.Thread(target=keep_slot_busy)
+    t.start()
+    time.sleep(0.3)  # let the busy request actually start processing
+
+    t_start = time.time()
+    save_res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "should_time_out.bin",
+    }, timeout=30)
+    elapsed = time.time() - t_start
+
+    assert save_res.status_code == 503
+    assert "timed out" in save_res.body["error"]["message"].lower()
+    assert elapsed < 10  # must fail fast (bounded by slot_action_timeout_ms), not hang
+
+    # the cancelled save must not have disturbed the real, unrelated busy completion
+    t.join(timeout=30)
+    assert not t.is_alive()
+    assert busy.get("status_code") == 200
 
 
 #
