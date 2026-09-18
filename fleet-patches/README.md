@@ -52,6 +52,8 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0020 | `40fd73c38` | model: K2 Horizon chat template and accomodate safetensors naming |
 | 0021 | `7f9e25ec4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
 | 0024 | `35e651927` | server: end generation cleanly on a tool-call-diff inconsistency |
+| 0027 | `9e917cddf` | peg-parser: don't prematurely close an until_one_of span on an ambiguous partial delimiter match |
+| 0028 | `72a88ea77` | server: bound slot-action queue wait, and explain empty child-slot saves |
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream

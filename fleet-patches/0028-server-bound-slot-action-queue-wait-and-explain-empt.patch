@@ -1,0 +1,495 @@
+From 72a88ea77c6187ae1a5e199265249365feea8e54 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 18 Sep 2026 08:33:21 -0500
+Subject: [PATCH] server: bound slot-action queue wait, and explain empty
+ child-slot saves
+
+Two fixes from Dawn's second QA execution pass against the cross-node
+KV-cache replication feature (home-infrastructure PR #88, TODO.md
+Findings 6 and 8), both root-caused against this fork's own source
+before being addressed here.
+
+Finding 6 -- a /slots/N?action=save called immediately after a real
+generation sometimes reported n_saved: 0 with only a tiny, fixed-size
+n_written (a structurally-valid header, no real KV payload),
+indistinguishable at the API level from a genuinely failed or missing
+capture.
+
+Root cause, confirmed by direct reproduction against this build: any
+slot whose last task was a completed CHILD of an n_cmpl > 1 ("n" in
+the OpenAI-compat API) request has its prompt wiped the instant
+is_processing flips false, by server_slot::release()'s existing
+is_child() branch ("do not keep context of the child slots - the
+parent's context is enough"). This is correct, by-design behavior for
+that case, not a bug to fix by changing the cleanup -- reproduced live
+with n_cmpl=2 against tinyllama2: the parent slot's save reports real
+content, the child slot's save reports n_saved: 0 with the same tiny
+n_written signature Dawn observed. try_clear_idle_slots(), the other
+candidate mechanism identified during research, is ruled out on this
+fleet: it is gated on kv_unified, which both of this fleet's production
+nodes run with false.
+
+Whether Dawn's own specific repro request used n_cmpl > 1 could not be
+confirmed from her recorded evidence (no "n" field mentioned) or from
+this fleet's real traffic (no n/n_cmpl handling anywhere in the
+LiteLLM integration layer, zero log matches for a literal "n": field
+across 7 days / 3M+ lines in both the llamacpp-rpc and litellm log
+namespaces). A normal (n_cmpl=1) completion's own save was directly
+tested under real --parallel concurrency and a racing unrelated
+request and did not reproduce the anomaly. Since the is_child()
+mechanism is the only one in the current source capable of producing
+Dawn's exact signature, and it is real and live-reproducible, the fix
+below is applied regardless of whether it was what she specifically
+hit.
+
+Fix: server_task_result_slot_save_load gets a new optional `note`
+field, set only when a save's n_saved is legitimately 0 because the
+slot's task_prev->is_child() -- explaining the by-design empty state
+instead of leaving it silently indistinguishable from a failure.
+
+Finding 8 -- a manual /slots restore against gabesrv10 queued for over
+15 minutes behind real concurrent production traffic, with no timeout,
+no cancellation path, and no feedback to the caller. Confirmed via
+source: SERVER_TASK_TYPE_SLOT_SAVE/RESTORE enter the same FIFO
+queue_tasks as ordinary completions with no priority lane, get
+deferred if the target slot is busy at dispatch time, and are only
+reconsidered on a slot state change -- no existing timeout applies to
+a task waiting in that state (-to/--timeout is a socket idle timeout,
+inactive while the HTTP handler thread blocks on a condition
+variable).
+
+Fix: new `--slot-action-timeout-ms` flag (default 60000; 0 = unbounded,
+the prior behavior). handle_slots_save/handle_slots_restore's wait on
+the queued task is now bounded by it; on expiry the still-pending task
+is cancelled via the existing server_response_reader::stop() path (the
+same SERVER_TASK_TYPE_CANCEL / cleanup_pending_task() mechanism already
+used on client disconnect) and the caller gets a clear HTTP 503 instead
+of an indefinite hang. Does not touch ordinary completion
+queueing/dispatch at all. Live-verified: a save against a slot kept
+busy by a real generation times out at the configured bound (HTTP 503,
+distinct message) while the busy generation itself completes
+unaffected.
+
+Out of scope, disclosed rather than silently dropped: queue-position/
+ETA visibility for the caller, and a general client-facing
+cancel-by-task-ID endpoint for arbitrary tasks. Both are larger
+API-surface changes than "don't starve silently forever."
+
+Test coverage added to tools/server/tests/unit/test_slot_save.py:
+- a save on the child slot of an n_cmpl=2 request reports n_saved: 0
+  with the new note; the parent slot's save is unaffected
+- a save immediately after a normal (n_cmpl=1) completion under real
+  --parallel 3 concurrency still captures real content (guards against
+  the investigated-and-not-reproduced slot-reuse-race hypothesis)
+- a save against a slot kept busy past --slot-action-timeout-ms
+  returns HTTP 503 promptly instead of hanging, and the unrelated busy
+  completion itself is unaffected
+
+tools/server/tests/utils.py gained a slot_action_timeout_ms field to
+drive the new flag from the test harness. README.md documents the new
+flag and the new `note` response field.
+
+Assisted-by: Claude Sonnet 5
+---
+ common/arg.cpp                            |  13 +++
+ common/common.h                           |   4 +
+ tools/server/README.md                    |  16 +++
+ tools/server/server-context.cpp           |  77 +++++++++++++-
+ tools/server/server-task.cpp              |   6 +-
+ tools/server/server-task.h                |   7 ++
+ tools/server/tests/unit/test_slot_save.py | 118 ++++++++++++++++++++++
+ tools/server/tests/utils.py               |   3 +
+ 8 files changed, 241 insertions(+), 3 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 4a003ece4..ed3d37de5 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3611,6 +3611,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--slot-action-timeout-ms"}, "N",
++        string_format(
++            "max time in milliseconds a /slots save|restore request may wait in the task "
++            "queue before its target slot is dispatched, before it is cancelled and an error "
++            "is returned to the caller; 0 = no bound, wait indefinitely (default: %d)\n"
++            "does not affect ordinary completion requests, only slot save/restore",
++            params.slot_action_timeout_ms
++        ),
++        [](common_params & params, int value) {
++            params.slot_action_timeout_ms = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_ACTION_TIMEOUT_MS"));
+     add_opt(common_arg(
+         {"--media-path"}, "PATH",
+         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
+diff --git a/common/common.h b/common/common.h
+index 63d0badd0..c533f6a6e 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -692,6 +692,10 @@ struct common_params {
+     std::string slot_save_path;
+     std::string media_path; // path to directory for loading media files
+ 
++    // max time a /slots save|restore request may wait in queue before its target slot is
++    // dispatched; 0 = no bound (blocks indefinitely, same as before this option existed)
++    int32_t slot_action_timeout_ms = 60000;
++
+     float slot_prompt_similarity = 0.1f;
+ 
+     // batched-bench params
+diff --git a/tools/server/README.md b/tools/server/README.md
+index 190907632..3e7908956 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -223,6 +223,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
+ | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
+ | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
++| `--slot-action-timeout-ms N` | max time in milliseconds a `/slots` save\|restore request may wait in the task queue before its target slot is dispatched, before it is cancelled and an error is returned to the caller; 0 = no bound, wait indefinitely (default: 60000)<br/>does not affect ordinary completion requests, only slot save/restore<br/>(env: LLAMA_ARG_SLOT_ACTION_TIMEOUT_MS) |
+ | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
+ | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
+ | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
+@@ -1151,6 +1152,11 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
+ 
+ `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
+ 
++Like an ordinary completion, this request enters the server's single task queue and is
++deferred if slot `id_slot` is currently busy -- but unlike a completion, it is bounded by
++`--slot-action-timeout-ms` (default: 60000, 0 = unbounded): if the slot isn't free by then, the
++request is cancelled and the server responds with HTTP 503 instead of continuing to wait.
++
+ **Response format**
+ 
+ ```json
+@@ -1165,12 +1171,22 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
+ }
+ ```
+ 
++`note` (optional): only present when `n_saved` is legitimately `0` for a reason the caller
++should know about, rather than a failed/missing capture. Today the only such reason is: the
++slot's last task was a completed *child* of a multi-completion (`n` > 1) request -- by design,
++a child slot's context is wiped the instant it finishes (see `server_slot::release()`), since
++the parent slot already holds the shared context. A save request that instead times out
++waiting for a busy slot (see above) is a different situation and is reported as an HTTP 503
++error, not as an empty save with a note.
++
+ ### POST `/slots/{id_slot}?action=restore`: Restore the prompt cache of the specified slot from a file.
+ 
+ *Options:*
+ 
+ `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+ 
++Subject to the same `--slot-action-timeout-ms` queue-wait bound as `action=save` above.
++
+ **Response format**
+ 
+ ```json
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c859a7176..8efeb6e66 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2761,6 +2761,23 @@ private:
+                     res->n_tokens = slot->prompt.tokens.size();
+                     res->n_bytes  = nwrite + nwrite_ckpt;
+                     res->t_ms     = t_save_ms;
++
++                    // Make an otherwise-indistinguishable empty save legible: a slot whose
++                    // last task was a completed CHILD of an n_cmpl>1 request had its prompt
++                    // deliberately wiped by release()'s is_child() branch the instant
++                    // is_processing flipped false ("do not keep context of the child slots -
++                    // the parent's context is enough") -- not a failed/missing capture. Only
++                    // set when n_tokens is actually 0, so a slot that happens to have been a
++                    // child task in the past but was reused since (task_prev overwritten by a
++                    // later, real task) never gets a stale note attached.
++                    if (res->n_tokens == 0 && slot->task_prev && slot->task_prev->is_child()) {
++                        res->note =
++                            "this slot's last task was a completed child of a multi-completion "
++                            "(n>1) request; its prompt/KV content is intentionally not retained "
++                            "(see server_slot::release()), so n_saved=0 here reflects that "
++                            "by-design empty state, not a failed or missed capture";
++                    }
++
+                     queue_results.send(std::move(res));
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_RESTORE:
+@@ -5507,8 +5524,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
+         rd.post_task(std::move(task));
+     }
+ 
+-    auto result = rd.next(req.should_stop);
++    // SLOT_SAVE enters the same FIFO queue as ordinary completions and can be deferred
++    // indefinitely if id_slot stays busy (see server-queue.cpp) -- bound the wait here so a
++    // maintenance call against a busy node fails fast with a clear error instead of blocking
++    // forever with no feedback to the caller. Does not affect ordinary completion requests.
++    const int64_t t_start_ms = ggml_time_ms();
++    bool timed_out = false;
++    auto result = rd.next([&]() {
++        if (req.should_stop()) {
++            return true;
++        }
++        if (params.slot_action_timeout_ms > 0 &&
++                ggml_time_ms() - t_start_ms >= params.slot_action_timeout_ms) {
++            timed_out = true;
++            return true;
++        }
++        return false;
++    });
+     if (!result) {
++        if (timed_out) {
++            // task never reached the front of the queue in time -- cancel it so it doesn't
++            // sit in queue_tasks_deferred forever (same cleanup path as a client disconnect)
++            rd.stop();
++            res->error(format_error_response(
++                string_format(
++                    "Slot save timed out after %d ms waiting for slot %d (still queued/deferred "
++                    "behind other traffic); cancelled -- retry once the node is less busy",
++                    params.slot_action_timeout_ms, id_slot),
++                ERROR_TYPE_UNAVAILABLE));
++            return res;
++        }
+         // connection was closed
+         GGML_ASSERT(req.should_stop());
+         return res;
+@@ -5543,8 +5588,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const
+         rd.post_task(std::move(task));
+     }
+ 
+-    auto result = rd.next(req.should_stop);
++    // SLOT_RESTORE enters the same FIFO queue as ordinary completions and can be deferred
++    // indefinitely if id_slot stays busy (see server-queue.cpp) -- bound the wait here so a
++    // maintenance call against a busy node fails fast with a clear error instead of blocking
++    // forever with no feedback to the caller. Does not affect ordinary completion requests.
++    const int64_t t_start_ms = ggml_time_ms();
++    bool timed_out = false;
++    auto result = rd.next([&]() {
++        if (req.should_stop()) {
++            return true;
++        }
++        if (params.slot_action_timeout_ms > 0 &&
++                ggml_time_ms() - t_start_ms >= params.slot_action_timeout_ms) {
++            timed_out = true;
++            return true;
++        }
++        return false;
++    });
+     if (!result) {
++        if (timed_out) {
++            // task never reached the front of the queue in time -- cancel it so it doesn't
++            // sit in queue_tasks_deferred forever (same cleanup path as a client disconnect)
++            rd.stop();
++            res->error(format_error_response(
++                string_format(
++                    "Slot restore timed out after %d ms waiting for slot %d (still queued/deferred "
++                    "behind other traffic); cancelled -- retry once the node is less busy",
++                    params.slot_action_timeout_ms, id_slot),
++                ERROR_TYPE_UNAVAILABLE));
++            return res;
++        }
+         // connection was closed
+         GGML_ASSERT(req.should_stop());
+         return res;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index f81dab42b..4c7e5c256 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1658,7 +1658,7 @@ std::string server_task_result_metrics::to_metrics() {
+ //
+ json server_task_result_slot_save_load::to_json() {
+     if (is_save) {
+-        return json {
++        json out = json {
+             { "id_slot",   id_slot },
+             { "filename",  filename },
+             { "n_saved",   n_tokens },
+@@ -1667,6 +1667,10 @@ json server_task_result_slot_save_load::to_json() {
+                 { "save_ms", t_ms }
+             }},
+         };
++        if (!note.empty()) {
++            out["note"] = note;
++        }
++        return out;
+     }
+ 
+     return json {
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 6a8f616f9..715aafef7 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -539,6 +539,13 @@ struct server_task_result_slot_save_load : server_task_result {
+     size_t n_bytes;
+     double t_ms;
+ 
++    // set only when n_tokens/n_bytes is legitimately near-empty for a reason the caller
++    // should know about, e.g. the slot was released as a completed child task of an
++    // n_cmpl>1 request (see server_slot::release()'s is_child() branch) -- distinguishes
++    // that intentional, by-design empty state from a genuinely failed/missing capture.
++    // empty string = no note, omitted from the response.
++    std::string note;
++
+     virtual json to_json() override;
+ };
+ 
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 5eca46cb2..9b39acb6b 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -3,6 +3,7 @@ from utils import *
+ import base64
+ import requests
+ import struct
++import threading
+ 
+ # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
+ STATE_FILE_HEADER_SIZE = 12
+@@ -158,6 +159,123 @@ def test_slot_erase():
+     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
+ 
+ 
++#
++# Dawn's second QA execution pass (PR #88, TODO.md Findings 6 and 8 in
++# home-infrastructure) flagged two real slot-save/restore gaps in production. The
++# tests below reproduce each mechanism directly against this test harness and lock
++# in the fix, so a recurrence is caught by CI instead of live QA again.
++#
++
++def test_slot_save_child_task_of_multi_completion_is_legible():
++    # Finding 6: a save immediately after a real generation reported n_saved: 0 with
++    # only a tiny, fixed-size (structurally-valid, no real KV payload) n_written --
++    # indistinguishable from a genuinely empty/failed capture. Root-caused to
++    # server_slot::release()'s is_child() branch, which deliberately wipes a CHILD
++    # slot's prompt the instant it finishes on any n_cmpl > 1 ("n" in the OpenAI-compat
++    # API) request -- "do not keep context of the child slots - the parent's context
++    # is enough". This is correct, by-design behavior, not a bug to fix by changing
++    # the cleanup -- the fix is making the outcome legible via the new `note` field.
++    global server
++    server.n_slots = 2
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of France?",
++        "n_cmpl": 2,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    assert isinstance(res.body, list)
++    assert len(res.body) == 2
++
++    saw_parent = False
++    saw_child = False
++    for id_slot in range(2):
++        save_res = server.make_request("POST", f"/slots/{id_slot}?action=save", data={
++            "filename": f"cmpl_slot{id_slot}.bin",
++        })
++        assert save_res.status_code == 200
++        if save_res.body["n_saved"] == 0:
++            # the child slot: empty by design, and now explained
++            assert "note" in save_res.body
++            assert "child" in save_res.body["note"]
++            saw_child = True
++        else:
++            # the parent slot: real content, no note needed
++            assert save_res.body["n_saved"] > 0
++            assert "note" not in save_res.body
++            saw_parent = True
++    assert saw_parent and saw_child
++
++
++def test_slot_save_after_normal_completion_under_real_parallel():
++    # Finding 6, test coverage item (b): a save immediately after a NORMAL (n_cmpl=1)
++    # completion, under real --parallel > 1 concurrency, must still capture the
++    # request's own real content -- guards against the (investigated and not
++    # reproduced) hypothesis that a save could race a fresh request reusing the
++    # just-freed slot on a multi-slot node.
++    global server
++    server.n_slots = 3
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of France?",
++        "id_slot": 0,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    # /completion already returns only after the slot's own generation finished and
++    # release() ran, so the slot is idle by the time we get here -- no polling needed.
++    save_res = server.make_request("POST", "/slots/0?action=save", data={
++        "filename": "normal_under_parallel.bin",
++    })
++    assert save_res.status_code == 200
++    assert save_res.body["n_saved"] > 0  # must reflect the real request, not an empty slot
++    assert "note" not in save_res.body
++
++
++def test_slot_action_timeout_returns_error_instead_of_hanging():
++    # Finding 8: a /slots save|restore request enters the same FIFO queue as ordinary
++    # completions and, if deferred because its target slot is busy, has no bound on
++    # how long it waits -- confirmed live to queue for 15+ minutes with no timeout, no
++    # cancellation, and no feedback to the caller. --slot-action-timeout-ms bounds
++    # this: once exceeded, the still-queued task is cancelled and the caller gets a
++    # clear, distinct error instead of an indefinite hang.
++    global server
++    server.n_slots = 1  # single slot, easy to keep permanently busy
++    server.n_ctx = 8192  # large enough that a real generation clearly outlasts the timeout below
++    server.slot_action_timeout_ms = 500
++    server.start()
++
++    busy = {}
++    def keep_slot_busy():
++        r = server.make_request("POST", "/completion", data={
++            "prompt": "Tell me a very long, very detailed story about dragons:",
++            "n_predict": 8000,
++            "id_slot": 0,
++        }, timeout=60)
++        busy["status_code"] = r.status_code
++    t = threading.Thread(target=keep_slot_busy)
++    t.start()
++    time.sleep(0.3)  # let the busy request actually start processing
++
++    t_start = time.time()
++    save_res = server.make_request("POST", "/slots/0?action=save", data={
++        "filename": "should_time_out.bin",
++    }, timeout=30)
++    elapsed = time.time() - t_start
++
++    assert save_res.status_code == 503
++    assert "timed out" in save_res.body["error"]["message"].lower()
++    assert elapsed < 10  # must fail fast (bounded by slot_action_timeout_ms), not hang
++
++    # the cancelled save must not have disturbed the real, unrelated busy completion
++    t.join(timeout=30)
++    assert not t.is_alive()
++    assert busy.get("status_code") == 200
++
++
+ #
+ # Multimodal server (mmproj loaded) slot save/restore.
+ #
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index 826aef2d5..5de966868 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -75,6 +75,7 @@ class ServerProcess:
+     n_predict: int | None = None
+     n_prompts: int | None = 0
+     slot_save_path: str | None = None
++    slot_action_timeout_ms: int | None = None
+     id_slot: int | None = None
+     cache_prompt: bool | None = None
+     n_slots: int | None = None
+@@ -228,6 +229,8 @@ class ServerProcess:
+             server_args.extend(["--n-predict", self.n_predict])
+         if self.slot_save_path:
+             server_args.extend(["--slot-save-path", self.slot_save_path])
++        if self.slot_action_timeout_ms is not None:
++            server_args.extend(["--slot-action-timeout-ms", self.slot_action_timeout_ms])
+         if self.n_ga:
+             server_args.extend(["--grp-attn-n", self.n_ga])
+         if self.n_ga_w:
+-- 
+2.43.0
+
