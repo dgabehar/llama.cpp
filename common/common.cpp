@@ -1860,8 +1860,13 @@ std::vector<float> common_cpu_split_calibrate() {
             const double t = time_cell_median(backend, cell, /* reps = */ 5);
             if (t > 0.0) {
                 weight = (float) (1.0 / t); // relative throughput; llama-model.cpp normalizes this
+                // time_cell_median() (tools/tuning/bench.cpp) returns microseconds (ggml_time_us()
+                // based), not seconds -- divide, don't multiply, to log a correct ms figure. This
+                // was previously wrong (inflated the logged value by ~1e6x); it never affected the
+                // actual weighting since a systematic unit-scaling error cancels out in the ratio
+                // between domains, only the human-readable log line was nonsensical.
                 COM_INF("CPU split calibration: device '%s' (%d threads): %.4f ms/iter, weight = %.4f\n",
-                        ggml_backend_dev_name(dev), n_threads, t * 1000.0, weight);
+                        ggml_backend_dev_name(dev), n_threads, t / 1000.0, weight);
             } else {
                 COM_WRN("CPU split calibration: device '%s' produced a non-positive timing, using equal weight\n",
                         ggml_backend_dev_name(dev));
