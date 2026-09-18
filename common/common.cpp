@@ -1,6 +1,8 @@
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
+#include "bench.h"
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -1289,6 +1291,10 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    if (params.cpu_split && params.cpu_split_weights.empty()) {
+        params.cpu_split_weights = common_cpu_split_calibrate();
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1692,6 +1698,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.cpu_split       = params.cpu_split;
+    if (!params.cpu_split_weights.empty()) {
+        mparams.cpu_split_weights = params.cpu_split_weights.data();
+    }
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1747,11 +1757,126 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.cpu_split         = params.cpu_split;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
     return cparams;
+}
+
+//
+// CPU locality domain calibration
+//
+
+std::vector<float> common_cpu_split_calibrate() {
+    std::vector<ggml_backend_dev_t> cpu_devs;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            cpu_devs.push_back(dev);
+        }
+    }
+
+    if (cpu_devs.size() < 2) {
+        return {};
+    }
+
+    // A representative transformer FFN matmul: [n_embd x n_ff] * [n_embd]:many rows, using
+    // sizes typical of a mid-size dense FFN. The actual model's real shapes don't matter here --
+    // only the *relative* throughput between domains does.
+    const int64_t n_embd = 4096;
+    const int64_t n_ff   = 14336;
+    const int64_t n_rows = 32;
+
+    auto build_graph = [&](ggml_context * ctx) -> ggml_tensor * {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        return ggml_mul_mat(ctx, a, b);
+    };
+    auto init_tensors = [](ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const size_t n = ggml_nelements(t);
+            std::vector<float> data(n);
+            for (size_t i = 0; i < n; ++i) {
+                data[i] = (float) (i % 13) * 0.1f - 0.6f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, n * sizeof(float));
+        }
+    };
+    auto op_flops = [](ggml_tensor * t) -> uint64_t {
+        return 2ULL * (uint64_t) n_embd * (uint64_t) n_ff * (uint64_t) n_rows;
+        GGML_UNUSED(t);
+    };
+
+    std::vector<float> weights;
+    weights.reserve(cpu_devs.size());
+
+    for (ggml_backend_dev_t dev : cpu_devs) {
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (!backend) {
+            weights.push_back(1.0f); // can't calibrate this domain; fall back to equal weight
+            continue;
+        }
+
+        bool cpumask[GGML_MAX_N_THREADS];
+        int  n_threads = 0;
+        if (ggml_backend_cpu_device_get_locality_mask(dev, cpumask)) {
+            for (int t = 0; t < GGML_MAX_N_THREADS; ++t) {
+                if (cpumask[t]) {
+                    n_threads++;
+                }
+            }
+        }
+        if (n_threads <= 0) {
+            n_threads = (int) std::thread::hardware_concurrency();
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto * threadpool_new_fn  = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+        auto * threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        auto * set_threadpool_fn  = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        auto * set_n_threads_fn   = (decltype(ggml_backend_cpu_set_n_threads)  *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+
+        ggml_threadpool_t tp = nullptr;
+        if (threadpool_new_fn && set_threadpool_fn) {
+            struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+            memcpy(tpp.cpumask, cpumask, sizeof(cpumask));
+            tp = threadpool_new_fn(&tpp);
+            if (tp) {
+                set_threadpool_fn(backend, tp);
+            }
+        }
+        if (set_n_threads_fn) {
+            set_n_threads_fn(backend, n_threads);
+        }
+
+        perf_cell cell = build_perf_cell(backend, build_graph, init_tensors, op_flops);
+        float weight = 1.0f;
+        if (cell.gf != nullptr) {
+            const double t = time_cell_median(backend, cell, /* reps = */ 5);
+            if (t > 0.0) {
+                weight = (float) (1.0 / t); // relative throughput; llama-model.cpp normalizes this
+                COM_INF("CPU split calibration: device '%s' (%d threads): %.4f ms/iter, weight = %.4f\n",
+                        ggml_backend_dev_name(dev), n_threads, t * 1000.0, weight);
+            } else {
+                COM_WRN("CPU split calibration: device '%s' produced a non-positive timing, using equal weight\n",
+                        ggml_backend_dev_name(dev));
+            }
+        } else {
+            COM_WRN("%s", "CPU split calibration: failed to build benchmark graph, using equal weight for this domain\n");
+        }
+        weights.push_back(weight);
+
+        cell.buf.reset();
+        cell.ctx.reset();
+        if (tp && threadpool_free_fn) {
+            threadpool_free_fn(tp);
+        }
+        ggml_backend_free(backend);
+    }
+
+    return weights;
 }
 
 //
