@@ -157,6 +157,37 @@ whether the TODO is needed at all.
   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
   `fleet-patches`.
 
+- **CPU locality-domain split ("Track A") caused a real production outage
+  on first rollout (2026-09-18) -- crash-looped BOTH gabesrv06 and
+  gabesrv10 on model load, `GGML_ASSERT(ggml_backend_supports_buft(
+  backends[b], sched->bufts[b]))` in `ggml_backend_sched_new`, even though
+  gabesrv06 is a monolithic-die node where the feature should have been a
+  complete no-op (1 detected domain, identical to pre-feature behavior).
+  Root cause, FIXED (`5f25d2b3e`, `fix: don't reject a GPU's host buffer
+  type in ggml_backend_cpu_device_supports_buft`): a device-identity guard
+  added for this feature (`buft->device != nullptr && buft->device != dev`
+  -> reject) was meant to stop domain N's private `layer_buft` from being
+  accepted by domain M's CPU backend, but `llama-context.cpp`'s
+  pre-existing, unrelated optimization -- substituting a GPU's own host
+  buffer type for the CPU backend's buft whenever `model.devices` is
+  non-empty, for fast CPU<->GPU transfer -- also produces a buft with a
+  non-null `->device` (the GPU itself). The guard rejected that too, on
+  every GPU-offload node regardless of CPU domain count. Fix narrows the
+  rejection to only a buft whose device is itself a *CPU*-type device
+  different from `dev`. **Process gap that let this reach production**: a
+  first fix attempt (the `GGML_BACKEND_DL` link error, `33581fbd8`) was
+  verified with a full CI-flag build + `--help` + a mocked CTest, but never
+  a real model load -- rolled straight to gabesrv06/gabesrv10 and crashed
+  both immediately. Rolled back via `helm rollback` within minutes (no
+  extended outage), fixed, and re-verified with a real GGUF, `-ngl 999`
+  GPU offload, `--cpu-split auto` explicitly enabled, and a real
+  `/v1/chat/completions` round-trip before the next deploy attempt. **Any
+  future change to this feature's `ggml_backend_cpu_device_supports_buft`/
+  `ggml_backend_cpu_device_get_buffer_type` logic needs a real model-load
+  smoke test with GPU offload before being considered verified** -- a
+  passing build or a synthetic unit test does not exercise the real
+  `llama_context::sched_reserve()` path this bug lived in.
+
 - **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashed
   (uncaught `std::terminate`) on `models/templates/Qwen3-Coder.jinja`'s
   `html` tool.** Found 2026-09-17 while fixing the server-side "now finding
