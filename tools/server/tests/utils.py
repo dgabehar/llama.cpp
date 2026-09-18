@@ -124,6 +124,8 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    cpu_split: Literal['auto', 'off'] | None = None
+    cpu_locality_sysfs_root: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -298,6 +300,10 @@ class ServerProcess:
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
+        if self.cpu_split is not None:
+            server_args.extend(["--cpu-split", self.cpu_split])
+        if self.cpu_locality_sysfs_root is not None:
+            env["GGML_CPU_LOCALITY_SYSFS_ROOT"] = self.cpu_locality_sysfs_root
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
