@@ -2731,6 +2731,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(
+        {"--cpu-split"}, "auto|off",
+        "split CPU-resident layers across auto-detected CPU locality domains (multiple L3-cache\n"
+        "sharing groups / dies), weighted by a startup throughput calibration (default: auto)\n"
+        "- auto: use every detected CPU locality domain (a no-op on single-domain hardware)\n"
+        "- off: always use a single CPU device, regardless of detected domains",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto" || value == "") { params.cpu_split = true; }
+            else if (value == "off") { params.cpu_split = false; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_CPU_SPLIT"));
+    add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

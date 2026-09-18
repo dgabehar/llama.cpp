@@ -330,6 +330,13 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // per-CPU-locality-domain weight for splitting CPU-resident layers across multiple CPU
+        // devices (see ggml_backend_cpu_device_get_locality_mask()), same convention as
+        // tensor_split. NULL means equal weighting across all detected CPU domains.
+        // size: number of CPU devices in the backend registry (ggml_backend_dev_count()).
+        // Ignored (single CPU device used) unless cpu_split is true.
+        const float * cpu_split_weights;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
@@ -348,6 +355,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool cpu_split;       // split CPU-resident layers across auto-detected CPU locality domains (see cpu_split_weights); false = today's single-CPU-device behavior
     };
 
     struct llama_sampler_seq_config {
@@ -407,6 +415,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool cpu_split;   // instantiate a backend (with its own pinned threadpool) per auto-detected CPU locality domain; false = today's single-CPU-backend behavior
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

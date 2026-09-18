@@ -582,6 +582,9 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    bool cpu_split         = true;  // --cpu-split auto|off: split CPU-resident layers across auto-detected CPU locality domains
+    std::vector<float> cpu_split_weights; // calibrated per-CPU-domain throughput weights; empty = equal weighting
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -968,6 +971,13 @@ char * common_get_model_or_exit(int, char*[]);
 //
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// Measures each detected CPU locality domain's real matmul throughput (reusing
+// tools/tuning/bench.h's synthetic-op benchmarking, same as the Metal fa-vec tuner) and returns
+// one normalized weight per domain, in device-index order. Returns an empty vector if fewer than
+// 2 CPU devices are present (nothing to calibrate) so callers can treat that as "use equal
+// weighting" without a separate check.
+std::vector<float> common_cpu_split_calibrate();
 
 struct common_threadpools {
     common_threadpools() = default;
