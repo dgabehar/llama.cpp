@@ -101,13 +101,23 @@ fixture: `resolve_fused_ops: layer 3 is assigned to device CPU1 but Flash
 Attention is assigned to device CPU`). This is a real, if silent,
 performance regression (FA off) on any node where this feature is both
 enabled (`auto`) and actually engages a >1-domain split, not a correctness
-bug -- the existing fallback is doing exactly what it's designed to do. Not
-fixed here: whether the right fix is keeping a layer's fused ops
-deterministically co-located with its other CPU tensors (a `dev_layer`-level
-change) or something else is a real design decision, not obvious from the
-code alone -- needs Doug's input before changing `resolve_fused_ops` or the
-per-layer split logic further. Flag to Murat/Dawn explicitly when testing
-this on gabesrv10.
+bug -- the existing fallback is doing exactly what it's designed to do.
+
+**Decision (2026-09-18, Doug): ship as-is.** Don't block the gabesrv10
+rollout fixing this preemptively -- the whole point of Track A is measuring
+instead of assuming, so let the real gabesrv10 A/B (`--cpu-split auto` vs
+`off`, per the plan's verification section) show whether the split's net
+gain still wins with FA off on cross-domain layers, before spending effort
+on a fix that might not be needed.
+
+**TODO: investigate co-locating a layer's fused ops with its own CPU
+tensors (a `dev_layer`-level change to `resolve_fused_ops` or the per-layer
+split logic) if we run into issues** -- i.e. if the gabesrv10 benchmark
+shows the FA-off cost is eating into or exceeding the split's own gain.
+Don't implement this speculatively; it's a real design decision, not
+obvious from the code alone. Flag this caveat to Murat/Dawn explicitly when
+testing this on gabesrv10 -- the A/B tok/s comparison is what determines
+whether the TODO is needed at all.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
