@@ -1060,7 +1060,7 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
-static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
+static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, ggml_backend_dev_t cpu_dev) {
     buft_list_t buft_list;
 
     // add ACCEL buffer types
@@ -1093,11 +1093,6 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 
     // add extra buffer types
     if (use_extra_bufts) {
-        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev == nullptr) {
-            throw std::runtime_error(format("%s: no CPU backend found", __func__));
-        }
-
         auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
             ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
@@ -1110,13 +1105,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         }
     }
 
-    // add the CPU buffer type
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-        }
-    }
+    // add the CPU buffer type for this specific domain (see ggml_backend_cpu_locality_domains():
+    // each CPU device beyond index 0 reports its own distinct buffer type, so the scheduler
+    // routes tensors allocated here to this domain's backend instead of always domain 0's)
+    buft_list.emplace_back(cpu_dev, ggml_backend_dev_buffer_type(cpu_dev));
 
     return buft_list;
 }
@@ -1192,8 +1184,13 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
-    buft_list_t cpu_buft_list;
+    buft_list_t cpu_buft_list; // domain 0's list (used for the input layer and as a GPU fallback, same as before this feature existed)
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+
+    // one buft_list per detected CPU locality domain, in device-index order; entry [0] is the
+    // same as cpu_buft_list above. Only has more than one entry when params.cpu_split is true
+    // and more than one CPU device was detected (see ggml_backend_cpu_locality_domains()).
+    std::vector<std::pair<ggml_backend_dev_t, buft_list_t>> cpu_domain_buft_lists;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1474,17 +1471,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, load_mode_name);
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+
+    // One buft_list per detected CPU locality domain (device index order). --cpu-split off
+    // (params.cpu_split == false) keeps only domain 0, i.e. today's exact single-CPU-device
+    // behavior; a monolithic-die host detects exactly one domain regardless, so this is a
+    // no-op there too.
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        if (!params.cpu_split && dev != cpu_dev) {
+            continue;
+        }
+        pimpl->cpu_domain_buft_lists.emplace_back(dev, make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host, dev));
+    }
+    pimpl->cpu_buft_list = pimpl->cpu_domain_buft_lists.front().second;
+
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
-    }
-
-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (cpu_dev == nullptr) {
-        throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
     // calculate the split points
@@ -1520,13 +1532,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
+    // split points for CPU-resident layers across the detected CPU locality domains, same
+    // splits[]/upper_bound convention as the GPU splits above. cpu_split_weights (set from a
+    // startup throughput calibration) is normalized/prefix-summed the same way tensor_split is;
+    // absent that, domains are weighted equally rather than left unsplit.
+    const size_t n_cpu_domains = pimpl->cpu_domain_buft_lists.size();
+    std::vector<float> cpu_splits(n_cpu_domains, 1.0f);
+    if (n_cpu_domains > 1) {
+        if (params.cpu_split_weights != nullptr) {
+            std::copy(params.cpu_split_weights, params.cpu_split_weights + n_cpu_domains, cpu_splits.begin());
+        }
+        float cpu_split_sum = 0.0f;
+        for (size_t i = 0; i < n_cpu_domains; ++i) {
+            cpu_split_sum += cpu_splits[i];
+            cpu_splits[i] = cpu_split_sum;
+        }
+        for (size_t i = 0; i < n_cpu_domains; ++i) {
+            cpu_splits[i] /= cpu_split_sum;
+        }
+    }
+
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // number of CPU-resident repeating layers, known ahead of time so CPU-domain layer index can
+    // be turned into a fraction in [0,1) the same way the GPU branch does with act_gpu_layers
+    const int act_cpu_layers = n_layer_all + 1 - act_gpu_layers;
+    int cpu_layer_idx = 0;
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
-            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
-            return {cpu_dev, &pimpl->cpu_buft_list};
+            ggml_backend_dev_t layer_cpu_dev = cpu_dev;
+            buft_list_t * layer_cpu_buft_list = &pimpl->cpu_buft_list;
+            if (n_cpu_domains > 1) {
+                const int domain = std::upper_bound(cpu_splits.begin(), cpu_splits.end(), float(cpu_layer_idx) / act_cpu_layers) - cpu_splits.begin();
+                layer_cpu_dev       = pimpl->cpu_domain_buft_lists.at(domain).first;
+                layer_cpu_buft_list = &pimpl->cpu_domain_buft_lists.at(domain).second;
+            }
+            cpu_layer_idx++;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(layer_cpu_dev), is_swa);
+            return {layer_cpu_dev, layer_cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
@@ -2796,6 +2840,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.cpu_split_weights           =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -2805,6 +2850,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.cpu_split                   =*/ true,
     };
 
     return result;
