@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -214,7 +215,7 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
     return &guid;
 }
 
-ggml_backend_t ggml_backend_cpu_init(void) {
+static ggml_backend_t ggml_backend_cpu_init_for_device(ggml_backend_dev_t dev) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
 
@@ -234,7 +235,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
         /* .iface   = */ ggml_backend_cpu_i,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
+        /* .device  = */ dev,
         /* .context = */ ctx,
     };
 
@@ -244,6 +245,10 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     }
 
     return cpu_backend;
+}
+
+ggml_backend_t ggml_backend_cpu_init(void) {
+    return ggml_backend_cpu_init_for_device(ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0));
 }
 
 bool ggml_backend_is_cpu(ggml_backend_t backend) {
@@ -286,8 +291,125 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
 // CPU backend - device
 
+// A "locality domain" is a group of cores that share an L3 cache slice (e.g. one CCD/die
+// on a multi-chiplet CPU). cpumask follows the ggml_threadpool_params convention: all-false
+// means "no restriction / use default affinity", which is also the neutral single-domain case.
+struct ggml_backend_cpu_locality_domain {
+    bool cpumask[GGML_MAX_N_THREADS] = { false };
+};
+
+// Groups cores by shared L3 cache (<sysfs_root>/cpu*/cache/index3/shared_cpu_list).
+// Any read failure, missing path, or a single shared list covering all cores collapses to one
+// neutral domain (all-false mask) so non-Linux hosts and monolithic dies are unaffected.
+// sysfs_root defaults to "/sys/devices/system/cpu"; overridable via GGML_CPU_LOCALITY_SYSFS_ROOT
+// so tests/test-cpu-device-split.cpp can point at a fixture directory instead of live hardware.
+static std::vector<ggml_backend_cpu_locality_domain> ggml_backend_cpu_detect_locality_domains() {
+    std::vector<ggml_backend_cpu_locality_domain> domains;
+
+#ifdef __linux__
+    const char * sysfs_root = getenv("GGML_CPU_LOCALITY_SYSFS_ROOT");
+    if (!sysfs_root) {
+        sysfs_root = "/sys/devices/system/cpu";
+    }
+
+    std::vector<std::string> shared_lists;
+
+    for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/cpu%d/cache/index3/shared_cpu_list", sysfs_root, cpu);
+
+        FILE * f = fopen(path, "r");
+        if (!f) {
+            // cpu0 missing means /sys isn't usable here at all; a gap after cpu0 just means
+            // we've walked past the last online CPU.
+            break;
+        }
+
+        char buf[256] = {0};
+        char * res = fgets(buf, sizeof(buf), f);
+        fclose(f);
+        if (!res) {
+            domains.clear();
+            break;
+        }
+
+        size_t len = strlen(buf);
+        while (len > 0 && std::isspace((unsigned char)buf[len - 1])) {
+            buf[--len] = '\0';
+        }
+
+        std::string list(buf);
+        if (list.empty()) {
+            domains.clear();
+            break;
+        }
+
+        size_t domain_idx = std::string::npos;
+        for (size_t i = 0; i < shared_lists.size(); i++) {
+            if (shared_lists[i] == list) {
+                domain_idx = i;
+                break;
+            }
+        }
+
+        if (domain_idx == std::string::npos) {
+            domain_idx = shared_lists.size();
+            shared_lists.push_back(list);
+            domains.emplace_back();
+        }
+
+        if (cpu < GGML_MAX_N_THREADS) {
+            domains[domain_idx].cpumask[cpu] = true;
+        }
+    }
+
+    // A single shared_cpu_list covering everything is the same as no split at all -- collapse
+    // to the neutral N=1 case rather than reporting one "domain" with every bit set.
+    if (domains.size() <= 1) {
+        domains.clear();
+    }
+#endif
+
+    if (domains.empty()) {
+        domains.emplace_back(); // neutral: all-false mask, N=1
+    }
+
+    if (domains.size() > 1) {
+        GGML_LOG_INFO("%s: detected %zu CPU locality domains\n", __func__, domains.size());
+        for (size_t i = 0; i < domains.size(); i++) {
+            std::string cores;
+            for (int c = 0; c < GGML_MAX_N_THREADS; c++) {
+                if (domains[i].cpumask[c]) {
+                    if (!cores.empty()) {
+                        cores += ",";
+                    }
+                    cores += std::to_string(c);
+                }
+            }
+            GGML_LOG_INFO("%s:   domain %zu: cores [%s]\n", __func__, i, cores.c_str());
+        }
+    }
+
+    return domains;
+}
+
+static const std::vector<ggml_backend_cpu_locality_domain> & ggml_backend_cpu_locality_domains() {
+    static std::vector<ggml_backend_cpu_locality_domain> domains = ggml_backend_cpu_detect_locality_domains();
+    return domains;
+}
+
 struct ggml_backend_cpu_device_context {
     std::string description = "CPU";
+    std::string name = "CPU";
+    ggml_backend_cpu_locality_domain domain;
+    size_t domain_index = 0;
+
+    // Only populated (via ggml_backend_cpu_reg_get_device()) for domain_index > 0: a buffer type
+    // distinct from the shared ggml_backend_cpu_buffer_type() singleton so ggml_backend_sched
+    // routes tensors allocated on this domain to this domain's own backend instance instead of
+    // always domain 0's (which is what every CPU device would otherwise report support for).
+    // Domain 0 keeps returning the plain singleton -- see ggml_backend_cpu_device_get_buffer_type.
+    ggml_backend_buffer_type layer_buft = {};
 
     ggml_backend_cpu_device_context() {
 #ifdef __APPLE__
@@ -351,9 +473,21 @@ struct ggml_backend_cpu_device_context {
 };
 
 static const char * ggml_backend_cpu_device_get_name(ggml_backend_dev_t dev) {
-    return "CPU";
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
 
-    GGML_UNUSED(dev);
+    return ctx->name.c_str();
+}
+
+// Public so common/common.cpp and src/llama-model.cpp can read a CPU device's locality mask
+// without depending on the TU-local ggml_backend_cpu_device_context layout.
+bool ggml_backend_cpu_device_get_locality_mask(ggml_backend_dev_t dev, bool cpumask[GGML_MAX_N_THREADS]) {
+    if (dev->reg != ggml_backend_cpu_reg()) {
+        return false;
+    }
+
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+    memcpy(cpumask, ctx->domain.cpumask, sizeof(ctx->domain.cpumask));
+    return true;
 }
 
 static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t dev) {
@@ -402,16 +536,17 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
 }
 
 static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    return ggml_backend_cpu_init();
+    return ggml_backend_cpu_init_for_device(dev);
 
-    GGML_UNUSED(dev);
     GGML_UNUSED(params);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cpu_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();
-
-    GGML_UNUSED(dev);
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+    if (ctx->domain_index == 0) {
+        return ggml_backend_cpu_buffer_type();
+    }
+    return &ctx->layer_buft;
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -480,6 +615,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // A buft tagged for a specific device (a GPU's own buffer type, or another CPU locality
+    // domain's per-domain layer_buft) is only supported by that exact device; buft->device ==
+    // NULL is the shared/generic case (the plain CPU singleton, extra bufts), supported by every
+    // CPU device, same as before this feature existed.
+    if (buft->device != nullptr && buft->device != dev) {
+        return false;
+    }
     return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
     GGML_UNUSED(dev);
 }
@@ -511,22 +653,65 @@ static const char * ggml_backend_cpu_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_cpu_reg_get_device_count(ggml_backend_reg_t reg) {
-    return 1;
+    return ggml_backend_cpu_locality_domains().size();
 
     GGML_UNUSED(reg);
 }
 
 static ggml_backend_dev_t ggml_backend_cpu_reg_get_device(ggml_backend_reg_t reg, size_t index) {
-    GGML_ASSERT(index == 0);
+    const auto & domains = ggml_backend_cpu_locality_domains();
+    GGML_ASSERT(index < domains.size());
 
-    static ggml_backend_cpu_device_context ctx;
-    static ggml_backend_device ggml_backend_cpu_device = {
-        /* .iface   = */ ggml_backend_cpu_device_i,
-        /* .reg     = */ reg,
-        /* .context = */ &ctx,
-    };
+    // Built once, lazily, on first call -- reserve() up front so no element's address can be
+    // invalidated by a later push_back once it has been handed out to a caller.
+    static std::vector<ggml_backend_cpu_device_context> ctxs;
+    static std::vector<ggml_backend_device> devs;
+    static bool built = false;
 
-    return &ggml_backend_cpu_device;
+    if (!built) {
+        ctxs.reserve(domains.size());
+        devs.reserve(domains.size());
+
+        for (size_t i = 0; i < domains.size(); i++) {
+            ctxs.emplace_back();
+            ctxs[i].domain = domains[i];
+            ctxs[i].domain_index = i;
+            // Device 0 always keeps the literal name "CPU" (relied on by exact-string lookups
+            // elsewhere, e.g. tests/test-fusion.cpp, llama-bench); only extra domains beyond
+            // the first (which only exist when N>1) get a distinguishing "CPU1", "CPU2", ...
+            if (i > 0) {
+                ctxs[i].name = "CPU" + std::to_string(i);
+            }
+
+            devs.push_back({
+                /* .iface   = */ ggml_backend_cpu_device_i,
+                /* .reg     = */ reg,
+                /* .context = */ &ctxs[i],
+            });
+
+            // Give domains beyond the first their own distinct buffer type (see
+            // ggml_backend_cpu_device_get_buffer_type/ggml_backend_cpu_device_supports_buft);
+            // domain 0 keeps using the plain ggml_backend_cpu_buffer_type() singleton.
+            if (i > 0) {
+                ctxs[i].layer_buft = {
+                    /* .iface   = */ {
+                        /* .get_name         = */ ggml_backend_cpu_buffer_type_get_name,
+                        /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+                        /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
+                        /* .get_max_size     = */ NULL,
+                        /* .get_alloc_size   = */ NULL,
+                        /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+                    },
+                    /* .device  = */ &devs[i],
+                    /* .context = */ NULL,
+                };
+            }
+        }
+
+        built = true;
+    }
+
+    return &devs[index];
 }
 
 // This is intended to replace the the ggml_cpu_has_* functions when loading the CPU backend dynamically,

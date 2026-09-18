@@ -2435,13 +2435,13 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
 
 // this buffer type is defined here to make it available to all backends
 
-static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU";
 
     GGML_UNUSED(buft);
 }
 
-static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
@@ -2452,13 +2452,13 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
     return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
 }
 
-static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return TENSOR_ALIGNMENT;
 
     GGML_UNUSED(buft);
 }
 
-static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     return true;
 
     GGML_UNUSED(buft);

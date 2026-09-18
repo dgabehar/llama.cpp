@@ -138,6 +138,10 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
 
+    // Fills cpumask with the core mask of dev's detected locality domain (all-false means
+    // "no restriction", the neutral single-domain case). Returns false if dev is not a CPU device.
+    GGML_BACKEND_API bool ggml_backend_cpu_device_get_locality_mask(ggml_backend_dev_t dev, bool cpumask[GGML_MAX_N_THREADS]);
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);

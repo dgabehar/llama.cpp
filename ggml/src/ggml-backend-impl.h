@@ -34,6 +34,16 @@ extern "C" {
         void * context;
     };
 
+    // Generic CPU (host-memory) buffer type iface functions, defined in ggml-backend.cpp.
+    // Exposed here (rather than kept static) so ggml-cpu.cpp can build its own additional
+    // per-CPU-locality-domain buffer type instances that reuse this exact same behavior, just
+    // tagged with a distinct .device so ggml_backend_sched can tell them apart. See
+    // ggml_backend_cpu_reg_get_device() in ggml-cpu.cpp.
+    GGML_API const char *          ggml_backend_cpu_buffer_type_get_name     (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API size_t                ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft);
+    GGML_API bool                  ggml_backend_cpu_buffer_type_is_host     (ggml_backend_buffer_type_t buft);
+
     // [TAG_ALLOC_SIZE_EXPAND]
     // returns true for ops that may require additional memory for fleeting data on some backends,
     // i.e. the backend buffer type's get_alloc_size may return more than ggml_nbytes for the output tensor
