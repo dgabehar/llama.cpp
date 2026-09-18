@@ -62,6 +62,53 @@ how small the change looks or how confident the build/local-test result
 is -- a green `tests/test-chat.cpp`/`test_slot_save.py` run is necessary,
 not sufficient, evidence for a fleet-facing change.
 
+## CPU locality-domain split ("Track A", added 2026-09-18)
+
+New `--cpu-split auto|off` flag (default `auto`). Extends the CPU backend
+device registry from a hardcoded 1 device to N, one per detected "locality
+domain" -- a group of cores sharing an L3 cache slice (proxy for a CCD/die
+boundary on multi-chiplet CPUs like AMD Strix Halo/gabesrv10's two CCDs).
+Detection parses `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`
+(`GGML_CPU_LOCALITY_SYSFS_ROOT` overrides the root for testing) and collapses
+to the existing single-device behavior on any monolithic die (every other
+current fleet node) or any `/sys` read failure -- `auto` is a verified no-op
+there, safe as the fleet-wide default. On a real multi-domain box, startup
+calibration (`common_cpu_split_calibrate()`, reusing
+`tools/tuning/bench.h`'s benchmark primitives) times a representative FFN
+matmul per domain and weights each domain's share of CPU-resident layers
+(`src/llama-model.cpp`'s `get_layer_buft_list`/`dev_layer`) proportionally,
+the same `splits[]`/`upper_bound` mechanism already used for multi-GPU
+`--tensor-split`. Device count is locked to real detected domains only --
+no override to split finer than that (a single sequential generation's
+per-token layer dependency means there's no known benefit to splitting a
+shared-L3 domain further). See
+`~/.claude/plans/create-a-plan-to-abundant-whistle.md` for the full design
+and the "Strix Split" research artifact
+(https://claude.ai/artifact/Mht44KMMnoWH8DbnVvUUYk) for the prior-art
+investigation (RPC-over-loopback already works but is the wrong tool; this
+is the maintainers' own previously-proposed real fix, upstream discussions
+#12303 and #19102).
+
+**Known caveat, not yet resolved**: on a real multi-domain box, a layer
+whose CPU-resident tensors land on a non-domain-0 device
+(e.g. `CPU1`) can trigger the existing `resolve_fused_ops`
+(`src/llama-context.cpp`) device-mismatch fallback for Flash Attention --
+`ggml_backend_sched_get_tensor_backend()` resolves that layer's FA fused-op
+tensor to a different device than `model.dev_layer(il)` reports for the
+layer as a whole, and the existing safety net gracefully disables FA for
+that context rather than crashing (confirmed live on a mocked 2-domain
+fixture: `resolve_fused_ops: layer 3 is assigned to device CPU1 but Flash
+Attention is assigned to device CPU`). This is a real, if silent,
+performance regression (FA off) on any node where this feature is both
+enabled (`auto`) and actually engages a >1-domain split, not a correctness
+bug -- the existing fallback is doing exactly what it's designed to do. Not
+fixed here: whether the right fix is keeping a layer's fused ops
+deterministically co-located with its other CPU tensors (a `dev_layer`-level
+change) or something else is a real design decision, not obvious from the
+code alone -- needs Doug's input before changing `resolve_fused_ops` or the
+per-layer split logic further. Flag to Murat/Dawn explicitly when testing
+this on gabesrv10.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
