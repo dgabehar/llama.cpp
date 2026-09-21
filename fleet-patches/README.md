@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-09-18)
+## Current patches (regenerated 2026-09-21)
 
 | # | Commit | Summary |
 |---|---|---|
@@ -65,6 +65,19 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0041 | `5f25d2b3e` | fix: don't reject a GPU's host buffer type in `ggml_backend_cpu_device_supports_buft` |
 | 0043 | `b0530e2bc` | FLEET.md: document the 2026-09-18 CPU-split rollout outage and its fix |
 | 0045 | `9530d2baa` | fix: correct units in CPU split calibration log line (µs, not seconds) |
+| 0047 | `9eccefb98` | unicode: add the K2-Horizon pre-tokenizer splitter |
+| 0048 | `a54948f2e` | tests: expand K2 Horizon unicode splitter coverage |
+| 0049 | `8c4f7f7f7` | unicode: handle K2 Horizon case folding and empty input |
+
+0047-0049 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
+(commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
+of this fork's original 0016-0020 fork point. Fixes an MSVC `std::regex`
+crash that blocked K2-Horizon GGUFs from loading on Windows, plus
+ZWNJ/ZWJ/case-folding/empty-input edge cases in the pre-tokenizer word
+splitter. Does **not** touch BPE merge-table granularity -- unrelated to the
+"hostname splits into odd subword pieces" tokenization behavior observed
+live on gabesrv06 2026-09-21 (that's normal BPE-vocab behavior, shared with
+gpt-oss-20b's tokenizer on the same string, not a bug this fixes).
 
 Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
