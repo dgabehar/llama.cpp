@@ -28,12 +28,22 @@ name: Sync fleet-patches with upstream
 # that repo (same re-verification discipline as any other pin bump) -- this
 # workflow never touches anything outside this repo.
 
+# DISABLED 2026-09-21 (session 7b8728c8), per Doug: an unattended weekly
+# rebase onto a fast-moving upstream, with no automated test coverage behind
+# it, isn't safe to run on a schedule -- a clean rebase (conclusion:
+# "success") is not proof the result still boots/serves correctly, only that
+# it applied without a textual conflict. This surfaced concretely: the most
+# recent scheduled run *did* hit a real conflict (see
+# https://github.com/dgabehar/llama.cpp/issues/1, still open as of this
+# change) and the job still reported "success" because the rebase step's
+# `set +e` swallows the failure -- a second, independent reason not to trust
+# this running unattended today.
+#
+# Re-enable the `schedule:` trigger below only once there's real automated
+# test coverage gating the sync (build + the chart's own live-model smoke
+# checks, not just "rebase applied cleanly") -- until then, run it manually
+# via workflow_dispatch when someone is actually going to review the result.
 on:
-  schedule:
-    # Weekly, Monday 06:00 UTC. Scheduled workflows are disabled by default
-    # on GitHub for a repo with no recent activity -- re-enable under this
-    # repo's Actions tab if it ever goes quiet and this stops firing.
-    - cron: "0 6 * * 1"
   workflow_dispatch: {}
 
 permissions:
