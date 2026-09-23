@@ -1460,13 +1460,19 @@ static void test_all(const std::string & title, std::function<void(const TestCas
         )"""
     });
 
-    // the rules of the partial conversion (here "root-0") must not leak into the grammar
+    // \w/\d/\s (and their negations) are now fully supported shorthand classes (see
+    // get_shorthand_class() in json-schema-to-grammar.cpp) -- \b (word-boundary
+    // assertion, a zero-width construct with no GBNF equivalent) is not, so it's
+    // used here instead to keep exercising this case: the rules of the partial
+    // conversion (here "root-0"/"root-1") must not leak into the grammar when the
+    // pattern is abandoned partway through and the whole thing falls back to the
+    // generic string acceptor.
     test({
         SUCCESS,
         "regexp with unsupported shorthand",
         R"""({
             "type": "string",
-            "pattern": "^[0-9]{3}\\w$"
+            "pattern": "^[0-9]{3}\\b$"
         })""",
         R"""(
             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
