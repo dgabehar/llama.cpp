@@ -1,4 +1,4 @@
-From 5078faa5e80b839332e6ce3e4729bcf75b3e4a77 Mon Sep 17 00:00:00 2001
+From 20ac9695da895d7a95c46d8a2ff3dd6f5ea74815 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:54:43 -0500
 Subject: [PATCH] ggml-alloc: finalize view init in a pass after all buft

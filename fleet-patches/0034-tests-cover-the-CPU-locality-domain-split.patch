@@ -1,0 +1,302 @@
+From 96c9bf74bf3d8875e568ee531a242f71f78a2e59 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 18 Sep 2026 12:17:41 -0500
+Subject: [PATCH] tests: cover the CPU locality-domain split
+
+tests/test-cpu-device-split.cpp (new CTest binary, registered alongside
+test-barrier.cpp in the "cannot be built with dynamic loading" block):
+builds a synthetic 2-domain sysfs fixture via GGML_CPU_LOCALITY_SYSFS_ROOT,
+then asserts ggml_backend_dev_count()/get() report exactly 2 disjoint,
+non-overlapping 4-core CPU devices and that both are independently
+constructible via ggml_backend_dev_init(). Runs in its own process
+(CTest gives every binary a fresh process) since locality-domain
+detection is memoized once per process -- deliberately does not also
+assert the real-hardware N=1 case in the same binary; that path is
+covered by the live single-domain server smoke test noted in the
+commit history and FLEET.md instead.
+
+tools/server/tests/unit/test_cpu_split.py (new, modeled on
+test_slot_save.py's ServerPreset/fixture pattern): three cases against
+a real started llama-server -- --cpu-split off, --cpu-split auto
+against the real (single-domain) host, and --cpu-split auto against a
+mocked 2-domain GGML_CPU_LOCALITY_SYSFS_ROOT fixture -- each asserts a
+normal /completion request still succeeds. tools/server/tests/utils.py
+gained cpu_split and cpu_locality_sysfs_root fields on ServerProcess to
+drive both from the test harness, following the existing per-flag
+field convention (no_mmproj, sleep_idle_seconds, etc.).
+
+All three pytest cases and the new CTest binary pass locally; existing
+test-barrier and the full test-backend-ops -b CPU suite (op-correctness
+regression, unaffected by this change's device-registry additions)
+both still pass.
+
+Assisted-by: Claude Sonnet
+---
+ tests/CMakeLists.txt                      |   1 +
+ tests/test-cpu-device-split.cpp           | 140 ++++++++++++++++++++++
+ tools/server/tests/unit/test_cpu_split.py |  69 +++++++++++
+ tools/server/tests/utils.py               |   6 +
+ 4 files changed, 216 insertions(+)
+ create mode 100644 tests/test-cpu-device-split.cpp
+ create mode 100644 tools/server/tests/unit/test_cpu_split.py
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9b3a4fcc4..01fcf97cd 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -325,6 +325,7 @@ endif()
+ if (NOT GGML_BACKEND_DL AND GGML_CPU)
+     # these tests use the backends directly and cannot be built with dynamic loading
+     llama_build_and_test(test-barrier.cpp)
++    llama_build_and_test(test-cpu-device-split.cpp)
+     llama_build_and_test(test-quantize-fns.cpp)
+     llama_build_and_test(test-quantize-perf.cpp)
+     llama_build_and_test(test-rope.cpp)
+diff --git a/tests/test-cpu-device-split.cpp b/tests/test-cpu-device-split.cpp
+new file mode 100644
+index 000000000..5b374d4dd
+--- /dev/null
++++ b/tests/test-cpu-device-split.cpp
+@@ -0,0 +1,140 @@
++// Covers the "Track A" locality-aware CPU device split (see plan
++// create-a-plan-to-abundant-whistle.md): CPU locality-domain auto-detection,
++// the CPU device registry's 1->N extension, and that regular (unmocked)
++// hardware still yields the byte-for-byte N=1 fallback path.
++//
++// GGML_CPU_LOCALITY_SYSFS_ROOT lets this test point detection at a fixture
++// directory instead of live /sys, so it exercises the N>1 path deterministically
++// on any host, including single-die CI runners.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-backend.h"
++
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <fstream>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static void write_file(const std::string & path, const std::string & content) {
++    std::ofstream f(path);
++    f << content;
++}
++
++static void make_dirs(const std::string & path) {
++    std::string cur;
++    for (size_t i = 0; i <= path.size(); i++) {
++        if (i == path.size() || path[i] == '/') {
++            if (!cur.empty()) {
++                mkdir(cur.c_str(), 0755);
++            }
++            if (i < path.size()) {
++                cur += path[i];
++            }
++        } else {
++            cur += path[i];
++        }
++    }
++}
++
++// Builds a fixture sysfs tree with n_domains groups of cores_per_domain cores each,
++// every core's shared_cpu_list naming exactly its own domain's core range.
++static std::string build_fixture(const std::string & root, int n_domains, int cores_per_domain) {
++    for (int d = 0; d < n_domains; d++) {
++        int lo = d * cores_per_domain;
++        int hi = lo + cores_per_domain - 1;
++        std::string list = std::to_string(lo) + "-" + std::to_string(hi);
++        for (int c = lo; c <= hi; c++) {
++            std::string dir = root + "/cpu" + std::to_string(c) + "/cache/index3";
++            make_dirs(dir);
++            write_file(dir + "/shared_cpu_list", list + "\n");
++        }
++    }
++    return root;
++}
++
++static size_t count_cpu_devices() {
++    size_t n = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            n++;
++        }
++    }
++    return n;
++}
++
++int main() {
++    // NOTE: ggml_backend_cpu_locality_domains() memoizes on first use (see
++    // ggml/src/ggml-cpu/ggml-cpu.cpp), so GGML_CPU_LOCALITY_SYSFS_ROOT must be set
++    // via setenv() before the FIRST call to ggml_backend_dev_count()/get() in this
++    // process -- this test relies on being a fresh process per invocation (it is
++    // registered as its own CTest binary, not merged into another test's process).
++    std::string fixture_root = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp")
++        + "/test-cpu-device-split-fixture-" + std::to_string(getpid());
++    build_fixture(fixture_root, /* n_domains = */ 2, /* cores_per_domain = */ 4);
++
++    setenv("GGML_CPU_LOCALITY_SYSFS_ROOT", fixture_root.c_str(), 1);
++
++    ggml_backend_load_all();
++
++    const size_t n_cpu = count_cpu_devices();
++    printf("detected %zu CPU device(s) under mocked 2-domain fixture\n", n_cpu);
++    if (n_cpu != 2) {
++        fprintf(stderr, "FAIL: expected 2 CPU devices, got %zu\n", n_cpu);
++        return 1;
++    }
++
++    // Each domain's device must report a distinct, disjoint core mask matching the fixture.
++    bool cpumask[2][GGML_MAX_N_THREADS];
++    size_t seen = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        if (!ggml_backend_cpu_device_get_locality_mask(dev, cpumask[seen])) {
++            fprintf(stderr, "FAIL: ggml_backend_cpu_device_get_locality_mask returned false for a CPU device\n");
++            return 1;
++        }
++        seen++;
++    }
++    assert(seen == 2);
++
++    int domain0_count = 0, domain1_count = 0;
++    bool overlap = false;
++    for (int c = 0; c < GGML_MAX_N_THREADS; c++) {
++        if (cpumask[0][c]) domain0_count++;
++        if (cpumask[1][c]) domain1_count++;
++        if (cpumask[0][c] && cpumask[1][c]) overlap = true;
++    }
++    if (domain0_count != 4 || domain1_count != 4) {
++        fprintf(stderr, "FAIL: expected 4 cores per domain, got %d and %d\n", domain0_count, domain1_count);
++        return 1;
++    }
++    if (overlap) {
++        fprintf(stderr, "FAIL: domain core masks overlap, should be disjoint\n");
++        return 1;
++    }
++
++    // Two distinct CPU backend instances must actually be constructible (registry
++    // extension isn't just reporting a count -- get_device() must work per index too).
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++        if (!backend) {
++            fprintf(stderr, "FAIL: ggml_backend_dev_init failed for CPU device '%s'\n", ggml_backend_dev_name(dev));
++            return 1;
++        }
++        ggml_backend_free(backend);
++    }
++
++    printf("PASS: 2-domain mocked fixture -> 2 CPU devices, disjoint 4-core masks, both constructible\n");
++    return 0;
++}
+diff --git a/tools/server/tests/unit/test_cpu_split.py b/tools/server/tests/unit/test_cpu_split.py
+new file mode 100644
+index 000000000..e560a7076
+--- /dev/null
++++ b/tools/server/tests/unit/test_cpu_split.py
+@@ -0,0 +1,69 @@
++# Covers the "Track A" locality-aware CPU device split (--cpu-split auto|off),
++# see ~/.claude/plans/create-a-plan-to-abundant-whistle.md for the full design.
++# GGML_CPU_LOCALITY_SYSFS_ROOT lets the auto case exercise a real >1-domain split
++# deterministically, since the CI/dev host itself may only have one L3 domain.
++
++import os
++
++import pytest
++from utils import *
++
++server = ServerPreset.tinyllama2()
++
++
++@pytest.fixture(autouse=True)
++def create_server():
++    global server
++    server = ServerPreset.tinyllama2()
++
++
++def make_mock_sysfs_2domain(tmp_path, cores_per_domain=4) -> str:
++    root = tmp_path / "mock-sysfs"
++    for domain in range(2):
++        lo = domain * cores_per_domain
++        hi = lo + cores_per_domain - 1
++        shared_list = f"{lo}-{hi}"
++        for cpu in range(lo, hi + 1):
++            d = root / f"cpu{cpu}" / "cache" / "index3"
++            d.mkdir(parents=True)
++            (d / "shared_cpu_list").write_text(shared_list + "\n")
++    return str(root)
++
++
++def test_cpu_split_off_serves_completion():
++    global server
++    server.cpu_split = "off"
++    server.start()
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "I believe the meaning of life is",
++        "n_predict": 8,
++    })
++    assert res.status_code == 200
++    assert len(res.body["content"]) > 0
++
++
++def test_cpu_split_auto_single_domain_serves_completion():
++    # No mocked sysfs: real host topology, expected to be a single-domain no-op here.
++    global server
++    server.cpu_split = "auto"
++    server.start()
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "I believe the meaning of life is",
++        "n_predict": 8,
++    })
++    assert res.status_code == 200
++    assert len(res.body["content"]) > 0
++
++
++def test_cpu_split_auto_mocked_multi_domain_serves_completion(tmp_path):
++    # Mocked 2-domain sysfs: exercises the real N>1 registry + weighted-split path.
++    global server
++    server.cpu_split = "auto"
++    server.cpu_locality_sysfs_root = make_mock_sysfs_2domain(tmp_path)
++    server.start()
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "I believe the meaning of life is",
++        "n_predict": 8,
++    })
++    assert res.status_code == 200
++    assert len(res.body["content"]) > 0
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index 5de966868..fa3d37412 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -124,6 +124,8 @@ class ServerProcess:
+     mcp_servers_config: str | None = None
+     mcp_servers_json: str | None = None
+     cors_origins: str | None = None
++    cpu_split: Literal['auto', 'off'] | None = None
++    cpu_locality_sysfs_root: str | None = None
+ 
+     # session variables
+     process: subprocess.Popen | None = None
+@@ -298,6 +300,10 @@ class ServerProcess:
+         if self.gcp_compat:
+             env["AIP_MODE"] = "PREDICTION"
+             env["AIP_HTTP_PORT"] = str(self.server_port)
++        if self.cpu_split is not None:
++            server_args.extend(["--cpu-split", self.cpu_split])
++        if self.cpu_locality_sysfs_root is not None:
++            env["GGML_CPU_LOCALITY_SYSFS_ROOT"] = self.cpu_locality_sysfs_root
+ 
+         args = [str(arg) for arg in [server_path, *server_args]]
+         print(f"tests: starting server with: {' '.join(args)}")
+-- 
+2.43.0
+

@@ -1,0 +1,70 @@
+From 3a713c1c4838deb8272fed6be29724ef6aace267 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 16:24:44 -0500
+Subject: [PATCH] tests: skip test-cpu-device-split on non-Linux platforms
+
+Windows CI failed to compile this test: unistd.h, sys/stat.h's mkdir,
+and setenv are all POSIX-only. Swapping in portable equivalents isn't
+enough on its own though -- the code under test,
+ggml_backend_cpu_detect_locality_domains() (ggml/src/ggml-cpu/ggml-cpu.cpp),
+is itself #ifdef __linux__-gated and always returns the N=1 fallback on
+any other platform regardless of GGML_CPU_LOCALITY_SYSFS_ROOT. This
+test's N=2 mocked-fixture assertions could never pass on Windows even
+with a portable POSIX shim, since the feature it exercises reads a
+Linux-only sysfs tree. Skip the whole thing (build and run) outside
+Linux instead of porting code toward an assertion that would just fail
+a different way.
+
+Found and fixed incidentally while investigating unrelated CI failures
+on PR #5 (K2-Horizon EOG/reasoning-tag fixes) -- this file was untouched
+by that PR; confirmed unrelated by content inspection before digging in.
+
+Assisted-by: Claude Sonnet
+---
+ tests/test-cpu-device-split.cpp | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test-cpu-device-split.cpp b/tests/test-cpu-device-split.cpp
+index 5b374d4dd..001533364 100644
+--- a/tests/test-cpu-device-split.cpp
++++ b/tests/test-cpu-device-split.cpp
+@@ -11,8 +11,20 @@
+ #include "ggml-cpu.h"
+ #include "ggml-backend.h"
+ 
+-#include <cassert>
+ #include <cstdio>
++
++// The fixture below mocks a Linux sysfs tree (/sys/devices/system/cpu/.../
++// cache/index3/shared_cpu_list) and relies on setenv() + POSIX mkdir() to
++// build it. The detection code it exercises,
++// ggml_backend_cpu_detect_locality_domains() in ggml/src/ggml-cpu/ggml-cpu.cpp,
++// is itself #ifdef __linux__-gated -- on any other platform it always
++// returns the N=1 fallback regardless of GGML_CPU_LOCALITY_SYSFS_ROOT, so
++// this test's N=2 assertions could never pass there even with a portable
++// mkdir/setenv shim. Skip the whole thing outside Linux rather than porting
++// code that would just fail a different way.
++#ifdef __linux__
++
++#include <cassert>
+ #include <cstdlib>
+ #include <cstring>
+ #include <string>
+@@ -138,3 +150,14 @@ int main() {
+     printf("PASS: 2-domain mocked fixture -> 2 CPU devices, disjoint 4-core masks, both constructible\n");
+     return 0;
+ }
++
++#else // !__linux__
++
++int main() {
++    printf("SKIP: CPU locality-domain split fixture is Linux-only (sysfs-based); "
++           "ggml_backend_cpu_detect_locality_domains() always returns the N=1 "
++           "fallback on this platform, so there is nothing this test can exercise here\n");
++    return 0;
++}
++
++#endif // __linux__
+-- 
+2.43.0
+

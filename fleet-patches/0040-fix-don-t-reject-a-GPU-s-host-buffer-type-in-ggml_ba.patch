@@ -1,0 +1,71 @@
+From 3a5e3c498dc93c88264c618171b09450cbf1be5b Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 18 Sep 2026 13:23:17 -0500
+Subject: [PATCH] fix: don't reject a GPU's host buffer type in
+ ggml_backend_cpu_device_supports_buft
+
+Real production incident (2026-09-18, both gabesrv06 and gabesrv10):
+GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]))
+failed in ggml_backend_sched_new, crash-looping the server on model load --
+even on gabesrv06, a monolithic-die node where this feature should have
+been a complete no-op (1 detected domain, identical to pre-feature
+behavior).
+
+Root cause: the device-identity guard added for this feature
+(buft->device != nullptr && buft->device != dev -> reject) was meant to
+stop domain N's private layer_buft from being accepted by domain M's CPU
+backend. But llama_context's pre-existing backend init
+(src/llama-context.cpp) substitutes a GPU's own host buffer type for the
+CPU backend's buft whenever model.devices is non-empty (an existing,
+unrelated optimization for fast CPU<->GPU transfer) -- and that host buft
+also carries a non-null buft->device (the GPU itself). The guard rejected
+that too, on every node with GPU offload, regardless of CPU domain count.
+
+Fix: only reject when buft->device is itself a CPU-type device different
+from dev -- a GPU's host buft (or anything else) is unaffected and keeps
+the pre-existing supports_buft behavior.
+
+Verified this time with a REAL model load (not just --help/build), with
+GPU offload (-ngl 999) and --cpu-split auto explicitly enabled, plus a
+real completion round-trip -- gap in the previous fix's verification that
+let this reach production; won't skip a real model-load smoke test again
+before the next deploy.
+
+Assisted-by: Claude Sonnet
+---
+ ggml/src/ggml-cpu/ggml-cpu.cpp | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index d6d4c3e62..c179581f7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -619,15 +619,19 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+ }
+ 
+ static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+-    // A buft tagged for a specific device (a GPU's own buffer type, or another CPU locality
+-    // domain's per-domain layer_buft) is only supported by that exact device; buft->device ==
+-    // NULL is the shared/generic case (the plain CPU singleton, extra bufts), supported by every
+-    // CPU device, same as before this feature existed.
+-    if (buft->device != nullptr && buft->device != dev) {
++    // Reject only ANOTHER CPU locality domain's own private layer_buft (buft->device is a CPU
++    // device that isn't this one) -- that's the only case this feature needs to route away from
++    // the wrong domain's backend. A GPU's own host buffer type also carries a non-null
++    // buft->device (the GPU itself), but is legitimately usable by any CPU backend regardless of
++    // device identity -- that's the entire point of the pre-existing host-buffer CPU<->GPU
++    // transfer optimization in llama_context's backend init (llama-context.cpp), which predates
++    // this feature and must not be broken by it. buft->device == NULL is the shared/generic case
++    // (the plain CPU singleton, extra bufts), supported by every CPU device, same as always.
++    if (buft->device != nullptr && buft->device != dev &&
++        ggml_backend_dev_type(buft->device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+         return false;
+     }
+     return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
+-    GGML_UNUSED(dev);
+ }
+ 
+ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+-- 
+2.43.0
+

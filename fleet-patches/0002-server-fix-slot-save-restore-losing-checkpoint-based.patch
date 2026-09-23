@@ -1,4 +1,4 @@
-From a1e9795680b1714158111ccb035eae7c4f6c5c3b Mon Sep 17 00:00:00 2001
+From 4790afadf9eabf0f9b484f15af3014a19d335af4 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:28 -0500
 Subject: [PATCH] server: fix slot save/restore losing checkpoint-based cache

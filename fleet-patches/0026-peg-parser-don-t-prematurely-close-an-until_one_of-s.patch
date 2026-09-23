@@ -1,0 +1,132 @@
+From dc1510e38d3defa8abb6c58c90e1d9f7bdb6ede8 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 17 Sep 2026 16:54:40 -0500
+Subject: [PATCH] peg-parser: don't prematurely close an until_one_of span on
+ an ambiguous partial delimiter match
+
+Root cause (traced with --template Qwen3-Coder --detailed): tests/test-chat.cpp's
+test_template_output_peg_parsers() crashes (uncaught std::terminate, "now finding less
+tool calls") feeding models/templates/Qwen3-Coder.jinja's html-tool test case in byte-by-
+byte, because the html markup value's content starts with a literal '<' -- also the first
+character of several of xml-arg-string's until_one_of terminators ("<tool_call>",
+"<function=", "<parameter="). At the exact byte-offset where only that lone '<' has
+streamed in so far, common_trie::check_at correctly reports PARTIAL_MATCH (genuinely
+ambiguous: more input could still complete a real terminator, or turn out to be ordinary
+content that just happens to share a prefix). common_peg_until_parser's executor
+(common/peg-parser.cpp) treated PARTIAL_MATCH the same as COMPLETE_MATCH and returned
+SUCCESS with an empty captured span right there, instead of NEED_MORE_INPUT. That made the
+immediately-following arg_close literal ("\n</parameter>\n") get tested against the real
+next characters ("html>...") and fail outright -- not "need more input" -- which collapsed
+the whole in-progress "html" tool call out of the AST entirely (REPEAT's child-failed path,
+not its need-more-input path) instead of just waiting one more byte to disambiguate. This
+was a real, fixable bug in the incremental parser, not an inherent property of incremental
+parsing: the trie can only ever report PARTIAL_MATCH when the ambiguous prefix runs all the
+way to the true end of currently-available input (common_trie::check_at), so it is always
+safe to treat it as "need more input" during a lenient/partial parse.
+
+Fix: PARTIAL_MATCH now returns COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT when
+ctx.is_lenient(), mirroring the existing ran-off-the-end-with-no-match fallback a few
+lines below (which already did this correctly) rather than duplicating its old SUCCESS
+behavior. Non-lenient (final) parses are unaffected -- no more input is coming, so the
+ambiguous tail is just ordinary content, same as before.
+
+This is a low-level combinator used throughout the PEG parser (any grammar built with
+until()/until_one_of()), not specific to qwen3-coder -- the qwen3-coder html case is just
+the one this session found and traced. Verified with the same before/after
+build-and-run-test-chat method as 35e651927: reverting just this change reproduces the
+exact original crash; restoring it, the entire test-chat suite (including
+--force-reconstruction-test across every template) and test-chat-peg-parser (39 tests,
+210 assertions) pass cleanly.
+
+Updates the FLEET.md entry from 35e651927/24947d11e (which flagged this as NOT FIXED) to
+document the actual root cause and fix.
+
+Assisted-by: Claude Sonnet 5
+---
+ FLEET.md              | 41 ++++++++++++++++++++++++++---------------
+ common/peg-parser.cpp | 17 ++++++++++++++++-
+ 2 files changed, 42 insertions(+), 16 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index 0a284655b..dd0024e57 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -83,21 +83,32 @@ discipline by standing convention).
+   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
+   `fleet-patches`.
+ 
+-- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashes
++- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashed
+   (uncaught `std::terminate`) on `models/templates/Qwen3-Coder.jinja`'s
+   `html` tool.** Found 2026-09-17 while fixing the server-side "now finding
+   less tool calls" invariant crash (see `35e651927`, `server: end
+-  generation cleanly on a tool-call-diff inconsistency`). Root cause: a
+-  partial PEG reparse of that template's output speculatively opens an
+-  `html` tool call that a fuller reparse of the same text later retracts --
+-  `common_chat_msg_diff::compute_diffs()` throws on the retraction (now
+-  `common_chat_msg_diff_invalid_error`), and this test calls `compute_diffs`
+-  directly rather than through the server's `update_chat_msg()`, so it
+-  isn't caught by that fix at all. Confirmed via `git stash` that this
+-  crash pre-dates `35e651927` and is unaffected by it either way. **NOT
+-  FIXED** -- this is the qwen3-coder PEG parser's own false-positive
+-  tool-call detection, a separate, deeper parsing problem than the server
+-  crash above; out of scope for that session's task on purpose. Repro:
+-  `./build/bin/test-chat` (default args, no template filter) crashes deep
+-  into `test_template_output_peg_parsers`; see the commit message of
+-  `35e651927` for the exact backtrace/output.
++  generation cleanly on a tool-call-diff inconsistency`); that fix alone
++  didn't cover this test since it calls `compute_diffs()` directly, not
++  through the server's `update_chat_msg()`. **FIXED** (see the commit
++  titled `peg-parser: don't prematurely close an until_one_of span on an
++  ambiguous partial delimiter match`) -- this genuinely was a fixable
++  PEG-parser bug, not an inherent property of incremental parsing. Root
++  cause, traced with `--template Qwen3-Coder --detailed`: the html markup
++  value's content starts with a literal `<`, which is also the first
++  character of several of `xml-arg-string`'s `until_one_of` terminators
++  (`<tool_call>`, `<function=`, `<parameter=`). At the exact byte-offset
++  where only that lone `<` has streamed in so far, `common_trie::check_at`
++  correctly reports `PARTIAL_MATCH` (ambiguous -- could still complete into
++  a real terminator, or turn out to be ordinary content), but
++  `common_peg_until_parser`'s executor (`common/peg-parser.cpp`) treated
++  `PARTIAL_MATCH` the same as `COMPLETE_MATCH` and returned `SUCCESS` with
++  an empty captured span right there. That made the immediately-following
++  `arg_close` literal (`\n</parameter>\n`) get tested against the real next
++  characters (`html>...`) and fail outright (not "need more input"), which
++  collapsed the whole in-progress tool call from the AST instead of just
++  waiting for one more byte to disambiguate. Fixed by making the
++  `PARTIAL_MATCH` branch return `NEED_MORE_INPUT` (matching the existing
++  ran-off-the-end-of-input fallback a few lines below) whenever
++  `ctx.is_lenient()`, so `SEQUENCE`/`REPEAT` correctly stay pending instead
++  of hard-failing. Confirmed via the same before/after
++  build-and-run-test-chat method as `35e651927`.
+diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
+index 75a908a28..5c8214845 100644
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -716,7 +716,22 @@ struct parser_executor {
+             }
+ 
+             if (match == common_trie::PARTIAL_MATCH) {
+-                // Found a partial match extending to end of input, return everything before it
++                // The remaining input is a non-empty prefix of one of the delimiters, and that
++                // prefix runs all the way to the end of the currently available input (see
++                // common_trie::check_at: PARTIAL_MATCH only fires when the scan hits end-of-input
++                // while still mid-trie). This is genuinely ambiguous during incremental parsing --
++                // more input could still complete the delimiter, or could just as easily turn out
++                // to be ordinary content that happens to share a delimiter's prefix (e.g. a lone
++                // '<' that's about to become a literal "<html>" tag inside a string value, not the
++                // start of a structural marker like "<function="). Reporting SUCCESS here would
++                // wrongly commit to "the until-content ends right before this ambiguous suffix",
++                // which then makes a following literal match (e.g. a closing delimiter) fail
++                // outright instead of also waiting for more input -- collapsing an otherwise-valid
++                // in-progress match. Same NEED_MORE_INPUT-when-lenient rule as the no-match-at-all
++                // case below; only a final (non-lenient) parse treats the ambiguous tail as content.
++                if (ctx.is_lenient()) {
++                    return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos, {}, std::move(invalid_utf8));
++                }
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos, {}, std::move(invalid_utf8));
+             }
+ 
+-- 
+2.43.0
+

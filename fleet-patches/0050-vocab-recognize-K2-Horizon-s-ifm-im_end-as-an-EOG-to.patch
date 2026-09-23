@@ -1,0 +1,55 @@
+From 184e4d5ac8e883a2f77a8f11a23d192905805931 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 15:47:43 -0500
+Subject: [PATCH] vocab: recognize K2-Horizon's <|ifm|im_end|> as an EOG token
+
+K2-Horizon's GGUF metadata registers tokenizer.ggml.eos_token_id as
+<|ifm|endoftext|> (the document-boundary token), but the model's own
+chat template ends every assistant turn with a different token,
+<|ifm|im_end|>, which the model is actually trained to emit there.
+That token matched none of the hardcoded EOG-detection strings in this
+list (only the un-prefixed "<|im_end|>" is checked), so it was never
+registered as end-of-generation.
+
+Effect in production: every chat completion ran to max_tokens
+(finish_reason: "length" on every single request, confirmed live),
+since the model had no way to signal it was done. Past the point where
+it would have stopped, it kept generating and visibly spiraled into
+self-doubting "wait, let me re-check..." loops that hallucinated
+digits/characters in otherwise-correct strings -- this explains the
+"keeps misspelling directory names" / repeated-prefill behavior
+reported from a live opencode session, previously suspected to be a
+quantization or MoE-value-routing bug in src/models/k2-horizon.cpp
+(both ruled out directly: Q8_0 requantization showed identical
+corruption to Q4_K_M, and the MoE value-routing sum in
+build_routed_value matches build_moe_ffn's reference pattern exactly).
+
+Verified live via --override-kv tokenizer.ggml.eot_token_id=int:250019
+against the deployed model before touching this file: finish_reason
+flipped from "length" (300/300 tokens, corrupted) to "stop" (14-22
+tokens, byte-correct) on every case in a 5-string test battery
+(plain English, digit/hyphen strings, identifiers, word lists, and
+the original failing path string). Confirmed again post-fix with a
+from-scratch local CPU build against the real deployed GGUF, no
+override needed.
+
+Assisted-by: Claude Sonnet
+---
+ src/llama-vocab.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index 80892e1c9..853e7ba8d 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2915,6 +2915,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+                     || t.first == "<|tool_response>" // gemma4
+                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
+                     || t.first == "[e~[" // minimax-m2/m3
++                    || t.first == "<|ifm|im_end|>" // k2-horizon
+                ) {
+                 special_eog_ids.insert(t.second);
+                 if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+-- 
+2.43.0
+

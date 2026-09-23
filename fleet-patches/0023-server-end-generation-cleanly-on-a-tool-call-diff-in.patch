@@ -1,0 +1,280 @@
+From 8e23577a71024403267debb9e9b6823ac1d78e1c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 17 Sep 2026 16:30:07 -0500
+Subject: [PATCH] server: end generation cleanly on a tool-call-diff
+ inconsistency
+
+Root cause: common_chat_msg_diff::compute_diffs() throws when a later,
+fuller reparse of the accumulated generation legitimately finds fewer tool
+calls than an earlier partial reparse speculatively recognized (the earlier
+parse guessed a tool-call shape that more text later retracts). This is a
+real, non-buggy outcome of incremental parsing, but task_result_state::
+update_chat_msg() calls compute_diffs() once per streamed chunk (re-parsing
+the whole accumulated text each time) with no way to recover from the
+throw, so it propagates uncaught all the way to server-http.cpp's fail-safe
+exception handler, turning a well-formed streaming completion into a raw
+500 mid-stream. Downstream, LiteLLM's OpenAI-compatible client surfaces
+this as `APIConnectionError: ... Invalid diff: now finding less tool
+calls!`, and its order-based-fallback retry logic discards the whole
+generation and retries from scratch on the next tier every time this
+happens.
+
+Reproduction: confirmed live via LiteLLM/opencode against this fork's
+production llama-server, and independently reproduced locally --
+`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` already hits
+this exact condition (uncaught, crashing test-chat) against
+models/templates/Qwen3-Coder.jinja's `html` tool: a partial reparse
+speculatively opens an `html` tool call that a fuller reparse retracts.
+Confirmed via `git stash` that this crash pre-exists on fleet-patches,
+unrelated to and unaffected by this fix (it calls compute_diffs() directly,
+bypassing update_chat_msg() below) -- the parser's own false-positive tool-
+call detection is a separate, deeper problem, not addressed here.
+
+Fix: give compute_diffs()'s throw a distinguishable exception type
+(common_chat_msg_diff_invalid_error, deriving from std::runtime_error so
+existing generic catches still work) instead of a bare std::runtime_error.
+update_chat_msg() catches it specifically, rolls back to the last
+successfully-diffed message, and sets a new diff_error_stop flag instead of
+propagating. server_response_reader::next() (the single chokepoint every
+streaming route funnels through) checks that flag after update() returns:
+cancels the task's remaining generation via the existing stop() mechanism
+(same as any other early termination -- no further tokens are generated
+for the request past this point), and forces a still-streaming partial
+result to report is_stop() so the normal end-of-stream bookkeeping
+(received_count, [DONE]) fires unchanged. For the OAI chat-completions
+format (the reported/reproduced path), cmpl_partial::to_json_oaicompat_
+chat() emits one extra finish_reason="stop" delta so the client sees a
+normal, well-formed completion instead of a dropped stream. Every
+content/tool-call delta already sent before the inconsistency was detected
+is untouched.
+
+Scope note: the Responses (/v1/responses) and Anthropic Messages
+(/v1/messages) streaming formats are also chat/tool-call-capable and can
+hit the same underlying inconsistency, but their SSE lifecycles are
+event-based (response.output_item.done, message_stop, etc.) rather than a
+single finish_reason field; this fix does not add a bespoke graceful-finish
+event for them. They still get the crash-free, generation-stopped behavior
+(via the same diff_error_stop / stop() path), just without an explicit
+in-band finish event -- the stream simply ends. Not fixed here for scope
+reasons; flagged in case it's worth closing later.
+
+Added a unit test in test_msg_diffs_compute() (tests/test-chat.cpp)
+constructing a msg_prv with more tool_calls than msg_new, confirming
+compute_diffs() throws common_chat_msg_diff_invalid_error specifically (not
+just any std::runtime_error) and that the existing growth-diff assertions
+in the same function are unaffected.
+
+Assisted-by: Claude Sonnet 5
+---
+ common/chat.cpp               |  2 +-
+ common/chat.h                 | 11 +++++++++++
+ tests/test-chat.cpp           | 35 +++++++++++++++++++++++++++++++++
+ tools/server/server-queue.cpp | 13 ++++++++++++
+ tools/server/server-task.cpp  | 37 ++++++++++++++++++++++++++++++++++-
+ tools/server/server-task.h    | 15 +++++++++++++-
+ 6 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 6c8099cf2..f4d704b51 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -294,7 +294,7 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
+             err += "    - name: '" + tc.name + "', args: '" + tc.arguments + "'\n";
+         }
+         err += "  Current msg text content:\n" + msg_new.content + "\n";
+-        throw std::runtime_error(err);
++        throw common_chat_msg_diff_invalid_error(err);
+     }
+ 
+     if (!msg_prv.tool_calls.empty()) {
+diff --git a/common/chat.h b/common/chat.h
+index 0e1423a5a..5cfe78c73 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -13,6 +13,7 @@
+ #include <chrono>
+ #include <functional>
+ #include <map>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -127,6 +128,16 @@ struct common_chat_msg {
+     bool operator!=(const common_chat_msg & other) const { return !(*this == other); }
+ };
+ 
++// thrown by common_chat_msg_diff::compute_diffs() when a later, fuller reparse of the
++// accumulated generation legitimately finds fewer tool calls than an earlier partial
++// reparse guessed (the earlier parse speculatively recognized a tool-call shape that more
++// text later retracts). derives from std::runtime_error so existing generic catch sites
++// keep working; callers that need to react specifically (e.g. end generation cleanly
++// instead of treating this as an unrecoverable server error) can catch this type instead.
++struct common_chat_msg_diff_invalid_error : std::runtime_error {
++    explicit common_chat_msg_diff_invalid_error(const std::string & what) : std::runtime_error(what) {}
++};
++
+ struct common_chat_msg_diff {
+     std::string           reasoning_content_delta;
+     std::string           content_delta;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 13733c1d9..69bcc1289 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -7546,6 +7546,41 @@ static void test_msg_diffs_compute() {
+ 
+         assert_equals({ diff1, diff2 }, common_chat_msg_diff::compute_diffs(msg0, msg2));
+     }
++    {
++        // A later, fuller reparse can legitimately retract a tool call an earlier partial
++        // reparse speculatively recognized. compute_diffs() can't represent that as a diff,
++        // so it must throw a specific, catchable exception type (not a bare
++        // std::runtime_error) so callers can end generation cleanly instead of treating this
++        // as an unrecoverable server error.
++        common_chat_msg msg_prv;
++        msg_prv.tool_calls = {
++            { "f1", "{\"arg1\": 1}", /* .id = */ "123" },
++            { "f2", "{\"arg2\": 2}", /* .id = */ "222" },
++        };
++
++        common_chat_msg msg_new;
++        msg_new.tool_calls = {
++            { "f1", "{\"arg1\": 1}", /* .id = */ "123" },
++        };
++
++        bool caught_expected_type = false;
++        try {
++            common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
++            throw std::runtime_error("Expected common_chat_msg_diff_invalid_error to be thrown");
++        } catch (const common_chat_msg_diff_invalid_error & e) {
++            caught_expected_type = true;
++            if (std::string(e.what()).find("now finding less tool calls") == std::string::npos) {
++                throw std::runtime_error("Unexpected common_chat_msg_diff_invalid_error message");
++            }
++        } catch (const std::exception & e) {
++            throw std::runtime_error(
++                (std::string("Expected common_chat_msg_diff_invalid_error, got a different exception: ") + e.what())
++                    .c_str());
++        }
++        if (!caught_expected_type) {
++            throw std::runtime_error("Expected common_chat_msg_diff_invalid_error to be thrown");
++        }
++    }
+ }
+ 
+ int main(int argc, char ** argv) {
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 78169e9a5..ec3b436d5 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -566,6 +566,19 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()>
+                 const size_t idx = result->index;
+                 GGML_ASSERT(idx < states.size());
+                 result->update(states[idx]);
++
++                if (states[idx].diff_error_stop) {
++                    // a tool-call-diff inconsistency ended this task's generation early
++                    // (see task_result_state::update_chat_msg). cancel any further
++                    // generation for it -- same mechanism as any other early termination --
++                    // and, for a partial (still-streaming) chunk, force it to report a
++                    // normal stop so the client gets a clean finish reason instead of a
++                    // dropped connection.
++                    if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
++                        partial->force_stop = true;
++                    }
++                    stop();
++                }
+             }
+             if (result->is_stop()) {
+                 received_count++;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 5beb79ea0..f81dab42b 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -174,7 +174,23 @@ common_chat_msg task_result_state::update_chat_msg(
+     if (!new_msg.empty()) {
+         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+         chat_msg = new_msg;
+-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
++
++        std::vector<common_chat_msg_diff> all_diffs;
++        try {
++            all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
++        } catch (const common_chat_msg_diff_invalid_error & e) {
++            // a fuller reparse of the accumulated generation retracted a tool call an
++            // earlier partial reparse had speculatively recognized. this is a real,
++            // non-buggy outcome of incremental parsing (not fixed here -- the parser's
++            // false-positive tool-call detection is a separate, deeper problem), but the
++            // diff invariant can't reconcile it. end generation cleanly at this point:
++            // keep everything already sent, emit no more diffs, and signal the caller to
++            // stop rather than let the inconsistency surface as a server error.
++            SRV_ERR("generation ended early due to a tool-call-diff inconsistency: %s\n", e.what());
++            chat_msg = msg_prv_copy;
++            diff_error_stop = true;
++            return msg_prv_copy;
++        }
+ 
+         if (!filter_tool_calls) {
+             diffs = std::move(all_diffs);
+@@ -1144,6 +1160,25 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
+         add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
+     }
+ 
++    if (force_stop) {
++        // ended early due to a tool-call-diff inconsistency (see update_chat_msg()) -- close
++        // out the completion with a normal finish reason, same shape as a real stop.
++        deltas.push_back({
++            {"choices", json::array({
++                json {
++                    {"finish_reason", "stop"},
++                    {"index", index},
++                    {"delta", json::object()},
++                },
++            })},
++            {"created", t},
++            {"id", oaicompat_cmpl_id},
++            {"model", oaicompat_model},
++            {"system_fingerprint", std::string(llama_build_info())},
++            {"object", "chat.completion.chunk"},
++        });
++    }
++
+     if (!deltas.empty()) {
+         auto & last_json = deltas[deltas.size() - 1];
+         GGML_ASSERT(last_json.at("choices").size() >= 1);
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f8..6a8f616f9 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -111,6 +111,12 @@ struct task_result_state {
+     std::vector<std::string> generated_tool_call_ids;
+     std::unordered_set<size_t> sent_tool_call_names;
+ 
++    // set by update_chat_msg() when a later, fuller reparse of the accumulated generation
++    // legitimately finds fewer tool calls than an earlier partial reparse guessed. the caller
++    // (server_response_reader::next()) checks this after update() returns and ends the
++    // generation cleanly instead of letting the inconsistency surface as a server error.
++    bool diff_error_stop = false;
++
+     // for OpenAI Responses and Anthropic streaming API:
+     // track output item / content block state across chunks
+     bool thinking_block_started = false;
+@@ -430,8 +436,15 @@ struct server_task_result_cmpl_partial : server_task_result {
+     // for Anthropic API: track if any reasoning content has been generated
+     bool anthropic_has_reasoning = false;
+ 
++    // set by server_response_reader::next() when this chunk's update() hit a tool-call-diff
++    // inconsistency (task_result_state::diff_error_stop) -- ends the stream early with a
++    // normal finish reason instead of letting the inconsistency surface as a server error.
++    bool force_stop = false;
++
+     virtual bool is_stop() override {
+-        return false; // in stream mode, partial responses are not considered stop
++        // in stream mode, partial responses are not considered stop, except when
++        // force_stop was set to end generation early due to a diff inconsistency.
++        return force_stop;
+     }
+ 
+     virtual void update(task_result_state & state) override;
+-- 
+2.43.0
+

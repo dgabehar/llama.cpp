@@ -1,0 +1,66 @@
+From 07d2e0e67fc25f5ce7f4c161b01ce54b67084eb7 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 16:44:14 -0500
+Subject: [PATCH] tests: loosen slot-action-timeout test's join timeout margin
+
+test_slot_action_timeout_returns_error_instead_of_hanging's background
+"keep busy" thread has its own 60s HTTP request timeout, but the test
+only joined it with a 30s timeout -- tighter than the request it's
+waiting on. Under real CI parallelism (pytest-xdist running several
+other CPU-heavy completions concurrently) an 8000-token generation can
+legitimately take 30-60+ wall-clock seconds, failing the join on
+timing alone with no real regression. Observed live: CI failure with
+the busy thread still alive after the 30s join while several sibling
+tests logged 7-14s call times each in the same worker pool.
+
+Bumped the busy request's own timeout to 90s and the join to 100s
+(comfortably past it) for real margin under contention. The actual
+behavior under test -- the save action failing fast, bounded by
+slot_action_timeout_ms -- is unchanged; only the unrelated busy
+thread's generous margin changed.
+
+Found and fixed incidentally while investigating unrelated CI failures
+on PR #5 (K2-Horizon EOG/reasoning-tag fixes) -- this file is untouched
+by that PR's own 2 commits; confirmed unrelated by content and log
+inspection (assertion was `assert not t.is_alive()`, a threading/timing
+check, not anything related to vocab or chat-template code).
+
+Assisted-by: Claude Sonnet
+---
+ tools/server/tests/unit/test_slot_save.py | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 9b39acb6b..1240a459e 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -254,7 +254,7 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
+             "prompt": "Tell me a very long, very detailed story about dragons:",
+             "n_predict": 8000,
+             "id_slot": 0,
+-        }, timeout=60)
++        }, timeout=90)
+         busy["status_code"] = r.status_code
+     t = threading.Thread(target=keep_slot_busy)
+     t.start()
+@@ -270,8 +270,15 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
+     assert "timed out" in save_res.body["error"]["message"].lower()
+     assert elapsed < 10  # must fail fast (bounded by slot_action_timeout_ms), not hang
+ 
+-    # the cancelled save must not have disturbed the real, unrelated busy completion
+-    t.join(timeout=30)
++    # the cancelled save must not have disturbed the real, unrelated busy completion.
++    # join timeout must exceed keep_slot_busy()'s own request timeout above (90s) --
++    # it was previously 30s, tighter than the busy request's own 60s HTTP timeout, so
++    # under real CI parallelism (pytest-xdist running several other CPU-heavy
++    # completions concurrently) an 8000-token generation legitimately taking
++    # 30-60+ wall-clock seconds would fail this join on timing alone, unrelated to
++    # any real regression (observed live: CI failure with the busy thread still
++    # alive after 30s while several sibling tests logged 7-14s call times each).
++    t.join(timeout=100)
+     assert not t.is_alive()
+     assert busy.get("status_code") == 200
+ 
+-- 
+2.43.0
+

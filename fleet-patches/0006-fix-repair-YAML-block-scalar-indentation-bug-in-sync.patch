@@ -1,4 +1,4 @@
-From 290b1023df0be7717da0befea44bf9d707a05f03 Mon Sep 17 00:00:00 2001
+From 0323f33403a189fc16f6851aa979bae97c79d918 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 21:01:01 -0500
 Subject: [PATCH] fix: repair YAML block-scalar indentation bug in sync

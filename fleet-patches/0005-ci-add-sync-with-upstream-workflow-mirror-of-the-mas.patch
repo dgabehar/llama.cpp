@@ -1,4 +1,4 @@
-From 9950b9dd4a1fc8c52b1a27540f221f5a9fd4ec51 Mon Sep 17 00:00:00 2001
+From cbf6b1831c856a1bdb365ef619f8661124df23e8 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:59:11 -0500
 Subject: [PATCH] ci: add sync-with-upstream workflow (mirror of the master

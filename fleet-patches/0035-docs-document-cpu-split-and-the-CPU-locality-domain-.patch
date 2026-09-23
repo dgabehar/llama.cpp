@@ -1,0 +1,96 @@
+From 97080cf7b72a7674efa477271dc8faee1895a1de Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 18 Sep 2026 12:17:53 -0500
+Subject: [PATCH] docs: document --cpu-split and the CPU locality-domain split
+ feature
+
+tools/server/README.md: new row for --cpu-split auto|off, same table
+placement as the related --numa flag.
+
+FLEET.md: new "CPU locality-domain split (Track A)" entry describing
+the feature, its safe-by-default auto-detection/collapse-to-N=1
+behavior, and the known, not-yet-resolved Flash-Attention/
+resolve_fused_ops interaction found during verification (see
+src/llama-model.cpp's commit for the technical detail) -- flagged
+explicitly for Murat/Dawn's QA loop per this file's own standing
+requirement.
+
+Assisted-by: Claude Sonnet
+---
+ FLEET.md               | 47 ++++++++++++++++++++++++++++++++++++++++++
+ tools/server/README.md |  1 +
+ 2 files changed, 48 insertions(+)
+
+diff --git a/FLEET.md b/FLEET.md
+index 58dbcb20b..f541fbb33 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -62,6 +62,53 @@ how small the change looks or how confident the build/local-test result
+ is -- a green `tests/test-chat.cpp`/`test_slot_save.py` run is necessary,
+ not sufficient, evidence for a fleet-facing change.
+ 
++## CPU locality-domain split ("Track A", added 2026-09-18)
++
++New `--cpu-split auto|off` flag (default `auto`). Extends the CPU backend
++device registry from a hardcoded 1 device to N, one per detected "locality
++domain" -- a group of cores sharing an L3 cache slice (proxy for a CCD/die
++boundary on multi-chiplet CPUs like AMD Strix Halo/gabesrv10's two CCDs).
++Detection parses `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`
++(`GGML_CPU_LOCALITY_SYSFS_ROOT` overrides the root for testing) and collapses
++to the existing single-device behavior on any monolithic die (every other
++current fleet node) or any `/sys` read failure -- `auto` is a verified no-op
++there, safe as the fleet-wide default. On a real multi-domain box, startup
++calibration (`common_cpu_split_calibrate()`, reusing
++`tools/tuning/bench.h`'s benchmark primitives) times a representative FFN
++matmul per domain and weights each domain's share of CPU-resident layers
++(`src/llama-model.cpp`'s `get_layer_buft_list`/`dev_layer`) proportionally,
++the same `splits[]`/`upper_bound` mechanism already used for multi-GPU
++`--tensor-split`. Device count is locked to real detected domains only --
++no override to split finer than that (a single sequential generation's
++per-token layer dependency means there's no known benefit to splitting a
++shared-L3 domain further). See
++`~/.claude/plans/create-a-plan-to-abundant-whistle.md` for the full design
++and the "Strix Split" research artifact
++(https://claude.ai/artifact/Mht44KMMnoWH8DbnVvUUYk) for the prior-art
++investigation (RPC-over-loopback already works but is the wrong tool; this
++is the maintainers' own previously-proposed real fix, upstream discussions
++#12303 and #19102).
++
++**Known caveat, not yet resolved**: on a real multi-domain box, a layer
++whose CPU-resident tensors land on a non-domain-0 device
++(e.g. `CPU1`) can trigger the existing `resolve_fused_ops`
++(`src/llama-context.cpp`) device-mismatch fallback for Flash Attention --
++`ggml_backend_sched_get_tensor_backend()` resolves that layer's FA fused-op
++tensor to a different device than `model.dev_layer(il)` reports for the
++layer as a whole, and the existing safety net gracefully disables FA for
++that context rather than crashing (confirmed live on a mocked 2-domain
++fixture: `resolve_fused_ops: layer 3 is assigned to device CPU1 but Flash
++Attention is assigned to device CPU`). This is a real, if silent,
++performance regression (FA off) on any node where this feature is both
++enabled (`auto`) and actually engages a >1-domain split, not a correctness
++bug -- the existing fallback is doing exactly what it's designed to do. Not
++fixed here: whether the right fix is keeping a layer's fused ops
++deterministically co-located with its other CPU tensors (a `dev_layer`-level
++change) or something else is a real design decision, not obvious from the
++code alone -- needs Doug's input before changing `resolve_fused_ops` or the
++per-layer split logic further. Flag to Murat/Dawn explicitly when testing
++this on gabesrv10.
++
+ ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+ 
+ - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
+diff --git a/tools/server/README.md b/tools/server/README.md
+index 755206ef6..53452ea93 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -75,6 +75,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
+ | `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident<br/>(env: LLAMA_ARG_LAZY_MODE) |
+ | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
++| `--cpu-split auto\|off` | split CPU-resident layers across auto-detected CPU locality domains (multiple L3-cache sharing groups / dies), weighted by a startup throughput calibration (default: auto)<br/>- auto: use every detected CPU locality domain (a no-op on single-domain hardware)<br/>- off: always use a single CPU device, regardless of detected domains<br/>(env: LLAMA_ARG_CPU_SPLIT) |
+ | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
+ | `--list-devices` | print list of available devices and exit |
+ | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
+-- 
+2.43.0
+

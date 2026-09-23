@@ -1,4 +1,4 @@
-From b74b2e31c1eb5a2133e1ae9c326f2b8e7bede114 Mon Sep 17 00:00:00 2001
+From f4ed0a034d95ca64962449ad49311a96f86d7960 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:47 -0500
 Subject: [PATCH] common: guard checkpoint update_dft against an empty draft

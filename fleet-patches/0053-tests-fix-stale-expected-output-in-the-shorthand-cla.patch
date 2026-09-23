@@ -1,0 +1,67 @@
+From 0f261f5641a042e75d6805ccdd3c53fa20cc8aae Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 16:24:58 -0500
+Subject: [PATCH] tests: fix stale expected output in the shorthand-class
+ regexp test
+
+"regexp with unsupported shorthand" used \w as its example of an
+unsupported PCRE shorthand class, asserting the whole pattern falls
+back to a generic string acceptor. That assumption predates
+get_shorthand_class() in json-schema-to-grammar.cpp, which now fully
+supports \d/\D/\w/\W/\s/\S as composable grammar tokens (see that
+function's own comment) -- \w in "^[0-9]{3}\w$" is no longer
+unsupported at all, so the actual output is now a correct, fully
+expanded per-character grammar, not the stale expected fallback. This
+was an intentional behavior improvement from an earlier patch that
+never got this pre-existing test's expectation updated to match,
+causing a hard assert(false) abort on every CI run (test-json-schema-
+to-grammar.cpp:39) rather than a soft mismatch.
+
+Fixed by swapping \w for \b (word-boundary assertion): a zero-width
+construct with no GBNF equivalent, confirmed still genuinely
+unsupported (gbnf_escape_length() doesn't recognize it, so it falls
+through to unsupported_pattern). This keeps testing what the test's
+own comment says it's for -- that a partial conversion's intermediate
+rule doesn't leak into the grammar when the pattern is abandoned and
+the whole thing falls back to the generic string acceptor -- without
+asserting something the converter can actually do correctly today.
+
+Found and fixed incidentally while investigating unrelated CI failures
+on PR #5 (K2-Horizon EOG/reasoning-tag fixes) -- reproduced locally
+(exit 134, SIGABRT) before making any change, confirmed unrelated to
+that PR's 2 files by content inspection.
+
+Assisted-by: Claude Sonnet
+---
+ tests/test-json-schema-to-grammar.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-json-schema-to-grammar.cpp b/tests/test-json-schema-to-grammar.cpp
+index d5873c19d..6a745629c 100755
+--- a/tests/test-json-schema-to-grammar.cpp
++++ b/tests/test-json-schema-to-grammar.cpp
+@@ -1460,13 +1460,19 @@ static void test_all(const std::string & title, std::function<void(const TestCas
+         )"""
+     });
+ 
+-    // the rules of the partial conversion (here "root-0") must not leak into the grammar
++    // \w/\d/\s (and their negations) are now fully supported shorthand classes (see
++    // get_shorthand_class() in json-schema-to-grammar.cpp) -- \b (word-boundary
++    // assertion, a zero-width construct with no GBNF equivalent) is not, so it's
++    // used here instead to keep exercising this case: the rules of the partial
++    // conversion (here "root-0"/"root-1") must not leak into the grammar when the
++    // pattern is abandoned partway through and the whole thing falls back to the
++    // generic string acceptor.
+     test({
+         SUCCESS,
+         "regexp with unsupported shorthand",
+         R"""({
+             "type": "string",
+-            "pattern": "^[0-9]{3}\\w$"
++            "pattern": "^[0-9]{3}\\b$"
+         })""",
+         R"""(
+             char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+-- 
+2.43.0
+

@@ -1,4 +1,4 @@
-From c5f91197b5ab6a93efc2a6e1cd116cdd3e121d65 Mon Sep 17 00:00:00 2001
+From fea69e077f76da14f89ef712425f30b8ff80d310 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Thu, 10 Sep 2026 16:57:55 -0500
 Subject: [PATCH] server: include id_slot in OAI-compatible chat completion

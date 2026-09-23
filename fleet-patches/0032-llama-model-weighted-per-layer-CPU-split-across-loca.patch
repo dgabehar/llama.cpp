@@ -1,0 +1,215 @@
+From 552cd5abaae52fcafd549ee9927260b301f1a58d Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 18 Sep 2026 12:17:09 -0500
+Subject: [PATCH] llama-model: weighted per-layer CPU split across locality
+ domains
+
+Extends the existing per-layer device-assignment table
+(get_layer_buft_list/dev_layer) so that whenever llama_model_params
+carries more than one CPU device's calibration weight, CPU-resident
+layers are apportioned across those devices proportional to weight,
+using the same splits[]/std::upper_bound proportional-split logic
+already used for multi-GPU --tensor-split -- just computed from a live
+per-domain matmul measurement instead of a user-supplied ratio. On
+every current fleet node other than gabesrv10, cpu_split_weights is
+empty (single detected domain, calibration short-circuited in the
+previous commit) so this is byte-for-byte the existing single-CPU-
+device assignment path.
+
+Also wires each non-zero-index CPU domain's own distinct buffer type
+(from the registry extension, first commit) into the per-layer buft
+list, so ggml_backend_sched routes a layer's tensors to the domain its
+weight actually assigned it to instead of everything defaulting to
+domain 0's buffer type.
+
+Verified end-to-end against a mocked 2-domain GGML_CPU_LOCALITY_SYSFS_ROOT
+fixture with a live llama-server instance: a real layer (layer 3, with
+this build's synthetic test model) was assigned to the second detected
+CPU domain ("CPU1"), confirmed via the resolve_fused_ops log line
+(src/llama-context.cpp) that fires only when a layer's device actually
+differs from model.dev_layer()'s default -- direct proof the weighted
+split is functioning, not just compiling.
+
+Known caveat, not fixed here (see FLEET.md's new "CPU locality-domain
+split" entry): that same resolve_fused_ops check found that a
+cross-domain layer split can make Flash Attention's fused-op tensor
+resolve to a different device than the rest of its layer, and the
+existing device-mismatch fallback correctly, but silently, disables FA
+for that context rather than crashing. This is a real (if graceful)
+performance regression risk on any node that both enables --cpu-split
+auto and engages a real >1-domain split -- whether the fix is keeping a
+layer's fused ops deterministically co-located, or something else, is a
+design decision flagged for Doug rather than made unilaterally here.
+
+Assisted-by: Claude Sonnet
+---
+ src/llama-model.cpp | 90 ++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 68 insertions(+), 22 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 03e4243be..0950a4c21 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1060,7 +1060,7 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
+ }
+ 
+ // CPU: ACCEL -> GPU host -> CPU extra -> CPU
+-static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
++static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, ggml_backend_dev_t cpu_dev) {
+     buft_list_t buft_list;
+ 
+     // add ACCEL buffer types
+@@ -1093,11 +1093,6 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+ 
+     // add extra buffer types
+     if (use_extra_bufts) {
+-        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-        if (cpu_dev == nullptr) {
+-            throw std::runtime_error(format("%s: no CPU backend found", __func__));
+-        }
+-
+         auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+             ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+@@ -1110,13 +1105,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+         }
+     }
+ 
+-    // add the CPU buffer type
+-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+-            buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+-        }
+-    }
++    // add the CPU buffer type for this specific domain (see ggml_backend_cpu_locality_domains():
++    // each CPU device beyond index 0 reports its own distinct buffer type, so the scheduler
++    // routes tensors allocated here to this domain's backend instead of always domain 0's)
++    buft_list.emplace_back(cpu_dev, ggml_backend_dev_buffer_type(cpu_dev));
+ 
+     return buft_list;
+ }
+@@ -1192,9 +1184,14 @@ struct llama_model::impl {
+     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+ 
+-    buft_list_t cpu_buft_list;
++    buft_list_t cpu_buft_list; // domain 0's list (used for the input layer and as a GPU fallback, same as before this feature existed)
+     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+ 
++    // one buft_list per detected CPU locality domain, in device-index order; entry [0] is the
++    // same as cpu_buft_list above. Only has more than one entry when params.cpu_split is true
++    // and more than one CPU device was detected (see ggml_backend_cpu_locality_domains()).
++    std::vector<std::pair<ggml_backend_dev_t, buft_list_t>> cpu_domain_buft_lists;
++
+     struct layer_dev {
+         ggml_backend_dev_t dev;
+         buft_list_t * buft_list;
+@@ -1474,7 +1471,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         __func__, load_mode_name);
+ 
+     // build a list of buffer types for the CPU and GPU devices
+-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
++    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    if (cpu_dev == nullptr) {
++        throw std::runtime_error(format("%s: no CPU backend found", __func__));
++    }
++
++    // One buft_list per detected CPU locality domain (device index order). --cpu-split off
++    // (params.cpu_split == false) keeps only domain 0, i.e. today's exact single-CPU-device
++    // behavior; a monolithic-die host detects exactly one domain regardless, so this is a
++    // no-op there too.
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        if (!params.cpu_split && dev != cpu_dev) {
++            continue;
++        }
++        pimpl->cpu_domain_buft_lists.emplace_back(dev, make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host, dev));
++    }
++    pimpl->cpu_buft_list = pimpl->cpu_domain_buft_lists.front().second;
++
+     for (const auto & dev : devices) {
+         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+         // add CPU buffer types as a fallback
+@@ -1482,11 +1499,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+     }
+ 
+-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-    if (cpu_dev == nullptr) {
+-        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+-    }
+-
+     // calculate the split points
+     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+     std::vector<float> splits(n_devices());
+@@ -1520,13 +1532,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         splits[i] /= split_sum;
+     }
+ 
++    // split points for CPU-resident layers across the detected CPU locality domains, same
++    // splits[]/upper_bound convention as the GPU splits above. cpu_split_weights (set from a
++    // startup throughput calibration) is normalized/prefix-summed the same way tensor_split is;
++    // absent that, domains are weighted equally rather than left unsplit.
++    const size_t n_cpu_domains = pimpl->cpu_domain_buft_lists.size();
++    std::vector<float> cpu_splits(n_cpu_domains, 1.0f);
++    if (n_cpu_domains > 1) {
++        if (params.cpu_split_weights != nullptr) {
++            std::copy(params.cpu_split_weights, params.cpu_split_weights + n_cpu_domains, cpu_splits.begin());
++        }
++        float cpu_split_sum = 0.0f;
++        for (size_t i = 0; i < n_cpu_domains; ++i) {
++            cpu_split_sum += cpu_splits[i];
++            cpu_splits[i] = cpu_split_sum;
++        }
++        for (size_t i = 0; i < n_cpu_domains; ++i) {
++            cpu_splits[i] /= cpu_split_sum;
++        }
++    }
++
+     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
++    // number of CPU-resident repeating layers, known ahead of time so CPU-domain layer index can
++    // be turned into a fraction in [0,1) the same way the GPU branch does with act_gpu_layers
++    const int act_cpu_layers = n_layer_all + 1 - act_gpu_layers;
++    int cpu_layer_idx = 0;
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+-            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+-            return {cpu_dev, &pimpl->cpu_buft_list};
++            ggml_backend_dev_t layer_cpu_dev = cpu_dev;
++            buft_list_t * layer_cpu_buft_list = &pimpl->cpu_buft_list;
++            if (n_cpu_domains > 1) {
++                const int domain = std::upper_bound(cpu_splits.begin(), cpu_splits.end(), float(cpu_layer_idx) / act_cpu_layers) - cpu_splits.begin();
++                layer_cpu_dev       = pimpl->cpu_domain_buft_lists.at(domain).first;
++                layer_cpu_buft_list = &pimpl->cpu_domain_buft_lists.at(domain).second;
++            }
++            cpu_layer_idx++;
++            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(layer_cpu_dev), is_swa);
++            return {layer_cpu_dev, layer_cpu_buft_list};
+         }
+         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+         auto * dev = devices.at(layer_gpu).dev;
+@@ -2796,6 +2840,7 @@ llama_model_params llama_model_default_params() {
+         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+         /*.main_gpu                    =*/ 0,
+         /*.tensor_split                =*/ nullptr,
++        /*.cpu_split_weights           =*/ nullptr,
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
+@@ -2805,6 +2850,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.cpu_split                   =*/ true,
+     };
+ 
+     return result;
+-- 
+2.43.0
+
