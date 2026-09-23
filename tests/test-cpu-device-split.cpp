@@ -11,8 +11,20 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 
-#include <cassert>
 #include <cstdio>
+
+// The fixture below mocks a Linux sysfs tree (/sys/devices/system/cpu/.../
+// cache/index3/shared_cpu_list) and relies on setenv() + POSIX mkdir() to
+// build it. The detection code it exercises,
+// ggml_backend_cpu_detect_locality_domains() in ggml/src/ggml-cpu/ggml-cpu.cpp,
+// is itself #ifdef __linux__-gated -- on any other platform it always
+// returns the N=1 fallback regardless of GGML_CPU_LOCALITY_SYSFS_ROOT, so
+// this test's N=2 assertions could never pass there even with a portable
+// mkdir/setenv shim. Skip the whole thing outside Linux rather than porting
+// code that would just fail a different way.
+#ifdef __linux__
+
+#include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -138,3 +150,14 @@ int main() {
     printf("PASS: 2-domain mocked fixture -> 2 CPU devices, disjoint 4-core masks, both constructible\n");
     return 0;
 }
+
+#else // !__linux__
+
+int main() {
+    printf("SKIP: CPU locality-domain split fixture is Linux-only (sysfs-based); "
+           "ggml_backend_cpu_detect_locality_domains() always returns the N=1 "
+           "fallback on this platform, so there is nothing this test can exercise here\n");
+    return 0;
+}
+
+#endif // __linux__
