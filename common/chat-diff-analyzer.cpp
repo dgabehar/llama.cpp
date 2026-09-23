@@ -201,6 +201,44 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               LOG_DBG(ANSI_ORANGE "[Patch: Bailing V3]\n" ANSI_RESET);
           }
       },
+      // K2-Horizon (MBZUAI-IFM) - the reasoning open/close tag is conditional on the
+      // request's chat_template_kwargs.reasoning_effort ("high" -> "<ifm|think>",
+      // "medium" -> "<ifm|think_fast>", "low" -> "<ifm|think_faster>"). The diff-analyzer
+      // renders the template once with a fixed set of probe kwargs, so it never observes
+      // the effort-conditional branch at all -- detection comes back reasoning_mode::NONE
+      // (confirmed live: /props reported chat_format "Content-only", reasoning_format
+      // "none"), not a wrong guess. Without this, the model's own thinking-close tag
+      // leaks verbatim into the API response's "content" field instead of being split
+      // into "reasoning_content" (reported live as e.g. content starting with the raw
+      // "</ifm|think_faster>" token).
+      //
+      // This fleet's own deployment pins reasoning_effort:"low" everywhere K2-Horizon
+      // runs (home-infrastructure's values-k2horizon7b-gabesrv06/10.yaml -- chosen over
+      // the default "high" specifically because "high" reproduced multi-token proper-noun
+      // garbling during its own chain-of-thought), so the parser is targeted at the "low"
+      // tag actually in production use. The auto-parser only supports one static
+      // start/end tag pair per template (no per-request alternation), so if a deployment
+      // ever switches reasoning_effort away from "low" fleet-wide, this workaround needs
+      // updating to match -- it will not silently adapt.
+      [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+          if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
+              analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+              analysis.reasoning.start = "<ifm|think_faster>";
+              analysis.reasoning.end   = "</ifm|think_faster>";
+              analysis.preserved_tokens.push_back("<ifm|think_faster>");
+              analysis.preserved_tokens.push_back("</ifm|think_faster>");
+              // Not the registered start/end pair (see comment above), but still real
+              // control tokens this model can emit under other reasoning_effort values --
+              // preserved so they're never mangled as arbitrary text if that ever happens.
+              analysis.preserved_tokens.push_back("<ifm|think>");
+              analysis.preserved_tokens.push_back("</ifm|think>");
+              analysis.preserved_tokens.push_back("<ifm|think_fast>");
+              analysis.preserved_tokens.push_back("</ifm|think_fast>");
+              analysis.assistant_start = "<|ifm|im_start|>assistant";
+              analysis.user_start      = "<|ifm|im_start|>user";
+              LOG_DBG(ANSI_ORANGE "[Patch: K2-Horizon]\n" ANSI_RESET);
+          }
+      },
 
     });
 
