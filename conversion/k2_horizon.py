@@ -9,6 +9,7 @@ from torch import Tensor
 
 from .base import ModelBase, TextModel, gguf
 
+
 @ModelBase.register(
     "K2HorizonForCausalLM",
     "K2AuroraForCausalLM", # TODO: DELETE
@@ -61,7 +62,7 @@ class K2HorizonModel(TextModel):
                     dense_layers += 1
 
             self.gguf_writer.add_expert_feed_forward_length(moe_ff)
-            self.gguf_writer.add_leading_dense_block_count(dense_layers)            
+            self.gguf_writer.add_leading_dense_block_count(dense_layers)
             self.gguf_writer.add_moe_every_n_layers(sparse_step)
             self.gguf_writer.add_expert_shared_count(shared_experts)
             self.gguf_writer.add_expert_weights_norm(normalize_topk)
@@ -71,7 +72,7 @@ class K2HorizonModel(TextModel):
                 self.gguf_writer.add_expert_weights_scale(float(router_scale))
             match router_func:
                 case "sigmoid":
-                    gating_func = gguf.ExpertGatingFuncType.SIGMOID    
+                    gating_func = gguf.ExpertGatingFuncType.SIGMOID
                 case "softmax":
                     gating_func = gguf.ExpertGatingFuncType.SOFTMAX
                 case _:
@@ -94,6 +95,7 @@ class K2HorizonModel(TextModel):
 
     _experts: list[dict[str, Tensor]] | None = None
     _value_experts: list[dict[str, Tensor]] | None = None
+
     def modify_tensors(
         self,
         data_torch: Tensor,
@@ -144,7 +146,7 @@ class K2HorizonModel(TextModel):
                     bid
                 )
             return
-        
+
         # MoVA
         is_mova_weights = re.fullmatch(r"model\.layers\.\d+\.self_attn\.v_experts\.\d+\.weight", name)
         if is_mova_weights:
@@ -209,4 +211,3 @@ class K2HorizonModel(TextModel):
                     "Unprocessed MoVA value experts: "
                     f"{remaining_value_experts}"
                 )
-
