@@ -23,6 +23,7 @@
 #include <atomic>
 #include <thread>
 #include <list>
+#include <chrono>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -2280,15 +2281,26 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
             }
             continue; // transient (aborted handshake, EINTR, fd/memory pressure); keep serving
         }
-        for (auto it = conns.begin(); it != conns.end(); ) {
-            if ((*it)->done.load()) {
-                (*it)->thread.join();
-                it = conns.erase(it);
-            } else {
-                ++it;
+        auto reap = [&conns]() {
+            for (auto it = conns.begin(); it != conns.end(); ) {
+                if ((*it)->done.load()) {
+                    (*it)->thread.join();
+                    it = conns.erase(it);
+                } else {
+                    ++it;
+                }
             }
-        }
+        };
+        reap();
         std::string peer = client_socket->peer_address();
+        // A connection that has just closed (e.g. a TCP health probe) keeps its
+        // slot until its thread notices EOF. Give such connections a moment to
+        // finish before rejecting, so a probe racing a real client at the cap
+        // doesn't get the client rejected.
+        for (int i = 0; i < 50 && sparams.max_clients > 0 && conns.size() >= sparams.max_clients; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            reap();
+        }
         if (sparams.max_clients > 0 && conns.size() >= sparams.max_clients) {
             printf("Rejected client %s: %zu of %u connections in use\n", peer.c_str(), conns.size(), sparams.max_clients);
             fflush(stdout);
