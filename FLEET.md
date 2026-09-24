@@ -239,8 +239,9 @@ Patches (see `fleet-patches/README.md`):
   - At startup it times each device with synthetic matmuls shaped like the
     model's layers (RPC devices over the normal protocol, so the worker
     needs no change) and caches the result in
-    `~/.cache/llama.cpp/split-balance.json` (`--split-calibrate force` to
-    redo it).
+    `~/.cache/llama.cpp/split-balance.json`, keyed by device, model shape
+    and build and re-measured after 7 days (`--split-calibrate force` to
+    redo it now).
   - It picks layer counts that minimize the predicted time of a
     `--split-workload P:G` request (default 4096:256), capped by the fit
     memory projection.

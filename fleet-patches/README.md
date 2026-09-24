@@ -89,6 +89,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0069 | `4727d61e0` | common : split-balance: time the dominant weight type, model n_batch drains |
 | 0070 | `a0543ca83` | vulkan : keep the flop-sized submits of a graph below the kernel job queue |
 | 0071 | `bed797907` | common : split-balance: model imperfect stage overlap in prefill |
+| 0074 | (this commit) | common : split-balance: key the calibration cache by build, expire after 7 days |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
@@ -126,7 +127,7 @@ authorship kept; 0059-0061 and 0063 build on them (see FLEET.md, "rpc-server
 multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
 and resolve 0059 against whatever shape upstream landed.
 
-0065-0071 are the speed-aware split and pipeline fixes (see FLEET.md, "Speed-aware
+0065-0071 and 0074 are the speed-aware split and pipeline fixes (see FLEET.md, "Speed-aware
 split and pipeline fixes"). Fork-only, not submitted upstream.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
