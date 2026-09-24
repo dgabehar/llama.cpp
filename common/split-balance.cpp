@@ -56,8 +56,10 @@ double common_split_predict_prefill(
         const std::vector<common_split_device_perf> & perf,
         const std::vector<uint32_t> & n_layers,
         const common_split_workload & wl) {
-    const uint32_t ub = std::max<uint32_t>(1, std::min(wl.n_ubatch, std::max<uint32_t>(1, wl.n_prompt)));
-    const uint32_t n_ub = (std::max<uint32_t>(1, wl.n_prompt) + ub - 1) / ub;
+    const uint32_t n_prompt = std::max<uint32_t>(1, wl.n_prompt);
+    const uint32_t ub = std::max<uint32_t>(1, std::min(wl.n_ubatch, n_prompt));
+    // the prompt is decoded n_batch tokens at a time and each call drains the pipeline
+    const uint32_t nb = std::max<uint32_t>(ub, wl.n_batch > 0 ? std::min(wl.n_batch, n_prompt) : n_prompt);
 
     // ubatches are pipelined across the stages: the slowest stage sets the pace, and the
     // pipeline takes (n_stages - 1) extra stage times to fill
@@ -78,8 +80,15 @@ double common_split_predict_prefill(
     if (n_stages == 0) {
         return 0.0;
     }
-    // with a single ubatch nothing overlaps; the fill term covers that exactly
-    return (n_ub - 1) * t_stage_max + t_stage_sum;
+    // per call: with a single ubatch nothing overlaps; the fill term covers that exactly
+    // (the last, shorter ubatch of a call is counted as a full one)
+    auto t_call = [&](uint32_t n_tokens) {
+        const uint32_t n_ub = (n_tokens + ub - 1) / ub;
+        return (n_ub - 1) * t_stage_max + t_stage_sum;
+    };
+    const uint32_t n_full = n_prompt / nb;
+    const uint32_t n_rest = n_prompt % nb;
+    return n_full * t_call(nb) + (n_rest > 0 ? t_call(n_rest) : 0.0);
 }
 
 struct split_cost {
@@ -473,6 +482,7 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
 
     double layer_bytes = 0.0;
     double layer_flops = 0.0;
+    std::map<ggml_type, double> type_bytes;
     double output_bytes = 0.0;
     double tok_embd_bytes = 0.0;
     bool   has_output = false;
@@ -495,10 +505,12 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
             if (t->ne[1] > 1) {
                 layer_flops += 2.0 * ggml_nelements(t) * frac;
             }
-            if (info.wtype == GGML_TYPE_COUNT && (name.find(".ffn_up.weight") != std::string::npos || name.find(".ffn_up_exps.weight") != std::string::npos)) {
+            if (t->ne[1] > 1) {
+                type_bytes[t->type] += ggml_nbytes(t) * frac;
+            }
+            if (info.n_ff == 0 && (name.find(".ffn_up.weight") != std::string::npos || name.find(".ffn_up_exps.weight") != std::string::npos)) {
                 info.n_embd = t->ne[0];
                 info.n_ff   = t->ne[1];
-                info.wtype  = t->type;
             }
         } else if (name == "output.weight") {
             output_bytes = ggml_nbytes(t);
@@ -509,7 +521,16 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
     }
     gguf_free(gctx);
 
-    if (info.wtype == GGML_TYPE_COUNT || n_layer == 0) {
+    // time the type that holds most of the weight bytes (mixed-quant files differ per tensor)
+    double best_bytes = 0.0;
+    for (const auto & [type, bytes] : type_bytes) {
+        if (bytes > best_bytes) {
+            best_bytes = bytes;
+            info.wtype = type;
+        }
+    }
+
+    if (info.wtype == GGML_TYPE_COUNT || info.n_ff == 0 || n_layer == 0) {
         return false;
     }
     info.shape.n_layer      = n_layer;
@@ -616,6 +637,7 @@ void common_split_balance_apply(
     wl.n_prompt = params.split_workload_prompt;
     wl.n_gen    = params.split_workload_gen;
     wl.n_ubatch = cparams.n_ubatch;
+    wl.n_batch  = cparams.n_batch;
 
     // optimize, then check the choice against real buffer sizes; shrink the cap of any device
     // that would overflow and try again

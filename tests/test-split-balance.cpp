@@ -71,6 +71,7 @@ int main() {
     wl.n_prompt = 8192;
     wl.n_gen    = 0;
     wl.n_ubatch = 512;
+    wl.n_batch  = 8192;
 
     // memory mode leaves the split to llama.cpp
     CHECK(common_split_balance_optimize(COMMON_SPLIT_BALANCE_MEMORY, shape, perf, { 64, 64 }, wl).empty(), "memory mode must not choose a split");
@@ -94,6 +95,20 @@ int main() {
         const double t_fast  = common_split_predict_prefill(shape, perf, { 0, 64 }, wl);
         CHECK(t_split < t_fast, "balanced prefill should beat the fast device alone (%.3f vs %.3f s)", t_split, t_fast);
     }
+    // every llama_decode() call drains the pipeline, so a smaller n_batch predicts less overlap
+    {
+        const std::vector<uint32_t> n = { 13, 51 };
+        common_split_workload small = wl;
+        small.n_batch = 2048;
+        const double t_big   = common_split_predict_prefill(shape, perf, n, wl);
+        const double t_small = common_split_predict_prefill(shape, perf, n, small);
+        CHECK(t_small > t_big, "n_batch 2048 should predict slower prefill than 8192 (%.3f vs %.3f s)", t_small, t_big);
+        // one device has nothing to overlap, so n_batch doesn't matter there
+        const double t1_big   = common_split_predict_prefill(shape, perf, { 0, 64 }, wl);
+        const double t1_small = common_split_predict_prefill(shape, perf, { 0, 64 }, small);
+        CHECK(std::fabs(t1_big - t1_small) < 1e-9, "single device prefill should not depend on n_batch");
+    }
+
     // auto: decode-heavy request behaves like decode, prompt-heavy like prefill
     {
         common_split_workload chat = wl;
