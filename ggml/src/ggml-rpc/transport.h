@@ -28,6 +28,10 @@ struct socket_t {
     // Enable TCP keepalive so a peer that vanished without closing the
     // connection (crashed host, pulled cable) is eventually detected.
     bool set_keepalive(int idle_sec, int interval_sec, int count);
+    // Receive timeout for a blocking recv, 0 = none. Used to bound the handshake.
+    bool set_recv_timeout(int sec);
+    // Ends a blocking send/recv on this socket from another thread.
+    void shutdown();
     std::string peer_address() const;
 
     void get_caps(uint8_t * local_caps);

@@ -697,6 +697,25 @@ bool socket_t::set_keepalive(int idle_sec, int interval_sec, int count) {
     return true;
 }
 
+bool socket_t::set_recv_timeout(int sec) {
+    sockfd_t fd = pimpl->fd;
+#ifdef _WIN32
+    DWORD tv = (DWORD) sec * 1000;
+#else
+    timeval tv = {};
+    tv.tv_sec = sec;
+#endif
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
+}
+
+void socket_t::shutdown() {
+#ifdef _WIN32
+    ::shutdown(pimpl->fd, SD_BOTH);
+#else
+    ::shutdown(pimpl->fd, SHUT_RDWR);
+#endif
+}
+
 std::string socket_t::peer_address() const {
     sockaddr_storage addr = {};
     socklen_t addr_len = sizeof(addr);

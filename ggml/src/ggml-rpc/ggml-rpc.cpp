@@ -24,6 +24,7 @@
 #include <thread>
 #include <list>
 #include <chrono>
+#include <functional>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -355,6 +356,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
+    if (response.major == 0 && response.minor == 0 && response.patch == 0) {
+        GGML_LOG_ERROR("RPC server refused the connection: all of its client slots are in use (rpc-server --max-clients)\n");
+        return false;
+    }
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
@@ -1908,7 +1913,9 @@ rpc_server::~rpc_server() {
     }
 }
 
-static void rpc_serve_client(rpc_server_context & sctx, socket_ptr sock) {
+// `admit` is asked for a client slot once the HELLO has arrived: connections that never complete a
+// HELLO (TCP health probes, port scans, stuck peers) never hold a slot.
+static void rpc_serve_client(rpc_server_context & sctx, socket_ptr sock, const std::function<bool()> & admit) {
     rpc_server server(sctx);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
@@ -1936,7 +1943,15 @@ static void rpc_serve_client(rpc_server_context & sctx, socket_ptr sock) {
         return;
     }
 
+    // a connected client may stay idle for as long as it likes
+    sock->set_recv_timeout(0);
+
     rpc_msg_hello_rsp rsp = {};
+    if (!admit()) {
+        // all-zero version: the client reports that the server is full
+        send_msg(sock, &rsp, sizeof(rsp));
+        return;
+    }
     server.hello(rsp);
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
@@ -2192,6 +2207,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 struct rpc_connection {
     uint64_t          id = 0;
     std::string       peer;
+    socket_ptr        sock;
+    std::atomic<bool> handshaking{true};
     std::thread       thread;
     std::atomic<bool> done{false};
 };
@@ -2269,8 +2286,28 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
     // its connection open for the lifetime of the model, so serving
     // connections one at a time starves every other client (and TCP health
     // probes) behind the first one. Only this thread touches `conns`.
+    //
+    // A connection takes a client slot only once its HELLO arrives, and the
+    // HELLO must arrive within a timeout. Health probes and idle sockets that
+    // never speak therefore neither hold slots nor delay accepting others.
+    constexpr int      handshake_timeout_sec = 10;
+    constexpr uint32_t max_handshakes        = 64; // connections still waiting for their HELLO
     std::list<std::unique_ptr<rpc_connection>> conns;
+    std::mutex         slots_mutex;
+    std::condition_variable slots_cv;
+    uint32_t           n_active = 0;
+    std::atomic<uint32_t> n_handshaking{0};
     uint64_t next_id = 1;
+    auto reap = [&conns]() {
+        for (auto it = conns.begin(); it != conns.end(); ) {
+            if ((*it)->done.load()) {
+                (*it)->thread.join();
+                it = conns.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
     while (true) {
         bool fatal = false;
         auto client_socket = server_socket->accept(&fatal);
@@ -2279,32 +2316,27 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
                 fprintf(stderr, "Failed to accept client connection, shutting down\n");
                 break;
             }
+            reap(); // finished connections still hold their fds until reaped
             continue; // transient (aborted handshake, EINTR, fd/memory pressure); keep serving
         }
-        auto reap = [&conns]() {
-            for (auto it = conns.begin(); it != conns.end(); ) {
-                if ((*it)->done.load()) {
-                    (*it)->thread.join();
-                    it = conns.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        };
         reap();
         std::string peer = client_socket->peer_address();
-        // A connection that has just closed (e.g. a TCP health probe) keeps its
-        // slot until its thread notices EOF. Give such connections a moment to
-        // finish before rejecting, so a probe racing a real client at the cap
-        // doesn't get the client rejected.
-        for (int i = 0; i < 50 && sparams.max_clients > 0 && conns.size() >= sparams.max_clients; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            reap();
+        if (n_handshaking.load() >= max_handshakes) {
+            // make room by closing the connection that has waited longest: a real client sends its
+            // HELLO right after connecting, so a flood of silent connections can't keep it out
+            for (auto & other : conns) {
+                if (other->handshaking.load() && !other->done.load()) {
+                    printf("Closing connection %" PRIu64 " (%s): %u connections have not sent HELLO yet\n",
+                           other->id, other->peer.c_str(), max_handshakes);
+                    fflush(stdout);
+                    other->sock->shutdown();
+                    other->handshaking.store(false); // its thread still does the accounting
+                    break;
+                }
+            }
         }
-        if (sparams.max_clients > 0 && conns.size() >= sparams.max_clients) {
-            printf("Rejected client %s: %zu of %u connections in use\n", peer.c_str(), conns.size(), sparams.max_clients);
-            fflush(stdout);
-            continue;
+        if (!client_socket->set_recv_timeout(handshake_timeout_sec)) {
+            GGML_LOG_WARN("Failed to set the handshake timeout for %s\n", peer.c_str());
         }
         if (sparams.keepalive_sec > 0) {
             const int idle     = (int) sparams.keepalive_sec;
@@ -2316,18 +2348,53 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         auto conn  = std::make_unique<rpc_connection>();
         conn->id   = next_id++;
         conn->peer = peer;
-        printf("Accepted client %" PRIu64 " (%s), %zu active\n", conn->id, conn->peer.c_str(), conns.size() + 1);
-        fflush(stdout);
+        conn->sock = client_socket;
         rpc_connection * c = conn.get();
-        c->thread = std::thread([&sctx, c, client_socket]() {
+        n_handshaking++;
+        c->thread = std::thread([&sctx, &sparams, &slots_mutex, &slots_cv, &n_active, &n_handshaking, c, client_socket]() {
+            bool handshaking = true;
+            bool admitted    = false;
+            auto admit = [&]() {
+                handshaking = false;
+                c->handshaking.store(false);
+                n_handshaking--;
+                std::unique_lock<std::mutex> lock(slots_mutex);
+                // a client that has just closed keeps its slot until its thread sees the EOF; give
+                // that a moment, so a quick reconnect at the cap is not rejected
+                slots_cv.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+                    return sparams.max_clients == 0 || n_active < sparams.max_clients;
+                });
+                if (sparams.max_clients > 0 && n_active >= sparams.max_clients) {
+                    printf("Rejected client %" PRIu64 " (%s): %u of %u connections in use\n", c->id, c->peer.c_str(), n_active, sparams.max_clients);
+                    fflush(stdout);
+                    return false;
+                }
+                n_active++;
+                admitted = true;
+                printf("Accepted client %" PRIu64 " (%s), %u active\n", c->id, c->peer.c_str(), n_active);
+                fflush(stdout);
+                return true;
+            };
             try {
-                rpc_serve_client(sctx, client_socket);
+                rpc_serve_client(sctx, client_socket, admit);
             } catch (const std::exception & e) {
                 // an exception escaping a thread would std::terminate the whole server
                 GGML_LOG_ERROR("Client %" PRIu64 " (%s): %s\n", c->id, c->peer.c_str(), e.what());
             }
-            printf("Client %" PRIu64 " (%s) disconnected\n", c->id, c->peer.c_str());
-            fflush(stdout);
+            if (handshaking) {
+                n_handshaking--;
+            }
+            if (admitted) {
+                {
+                    std::lock_guard<std::mutex> lock(slots_mutex);
+                    n_active--;
+                }
+                slots_cv.notify_all();
+                printf("Client %" PRIu64 " (%s) disconnected\n", c->id, c->peer.c_str());
+                fflush(stdout);
+            }
+            // the connection keeps a reference to the socket until it is reaped, so end it here
+            client_socket->shutdown();
             c->done.store(true);
         });
         conns.push_back(std::move(conn));

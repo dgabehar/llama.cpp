@@ -35,9 +35,19 @@ wait_for_port() {
 }
 
 start_server() {
-    "$server" --device CPU --host 127.0.0.1 --port "$port" "$@" >"$test_dir/server.log" 2>&1 &
-    pid=$!
-    wait_for_port || fail "server did not start"
+    # the port is derived from the pid and may be taken (parallel ctest); move on to the next one
+    for _ in 1 2 3 4 5; do
+        "$server" --device CPU --host 127.0.0.1 --port "$port" "$@" >"$test_dir/server.log" 2>&1 &
+        pid=$!
+        if wait_for_port && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        grep -q "Failed to create server socket" "$test_dir/server.log" || fail "server did not start"
+        wait "$pid" 2>/dev/null || true
+        port=$((port + 1))
+        ep="127.0.0.1:${port}"
+    done
+    fail "server did not start (no free port)"
 }
 
 stop_server() {
@@ -107,6 +117,18 @@ wait "$h1" || fail "held client broken by probes"
 sleep 0.2
 "$client" hello "$ep" 1000 || fail "slot not freed after clients left"
 grep -q "Rejected client" "$test_dir/server.log" || fail "no rejection logged"
+# connections that never send HELLO hold no slot: a real client joins at once, even during a
+# probe storm, and the server closes the silent ones itself
+"$client" hold "$ep" 4 >/dev/null & h1=$!
+sleep 0.3
+"$client" silent "$ep" 5 & s1=$!
+"$client" flood "$ep" 300 2000 >/dev/null & f1=$!
+sleep 0.3
+"$client" hello "$ep" 1000 || fail "client not admitted beside silent connections and a probe storm"
+wait "$h1" || fail "held client broken by silent connections"
+wait "$f1" || true
+wait "$s1" || fail "silent connections were not closed by the server"
+alive "silent connections"
 stop_server
 
 echo "== accept errors (fd exhaustion) are not fatal"
