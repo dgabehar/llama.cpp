@@ -255,6 +255,9 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // reserves the worst-case prompt-processing graph, see sched_plan_worst_pp
+    bool graph_reserve_worst_pp(const llama_memory_context_i * mctx);
+
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
@@ -373,6 +376,11 @@ private:
     };
 
     copy_experts_info copy_experts;
+    // true while the scheduler's allocation plan is the worst-case prompt-processing
+    // graph from sched_reserve; small graphs (token generation) replace that plan, and
+    // allocating large graphs against a plan sized for the current graph reallocates
+    // (and synchronizes every backend) each time the KV cache grows
+    bool sched_plan_worst_pp = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
