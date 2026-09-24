@@ -176,6 +176,55 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+common_device_memory_data_vec common_get_device_memory_data_with_extra(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const common_fit_extra_model * extra,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        ggml_log_level log_level) {
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+    std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    if (extra != nullptr) {
+        std::vector<ggml_backend_dev_t> devs_extra;
+        uint32_t ngl_extra = 0;
+        uint32_t nct_extra = 0;
+        uint32_t nex_extra = 0;
+        llama_context_params cparams_extra = *extra->cparams;
+        cparams_extra.n_ctx = cparams->n_ctx;
+        try {
+            const auto measured = common_get_device_memory_data_impl(
+                extra->path_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+            for (size_t je = 0; je < devs_extra.size(); je++) {
+                for (size_t id = 0; id < devs.size(); id++) {
+                    if (devs_extra[je] == devs[id]) {
+                        main[id].mb.model   += extra->shares_model ? 0 : measured[je].mb.model;
+                        main[id].mb.context += measured[je].mb.context;
+                        main[id].mb.compute += measured[je].mb.compute;
+                        break;
+                    }
+                }
+            }
+        } catch (const std::runtime_error & e) {
+            LOG_WRN("%s: failed to measure the memory of the extra model: %s\n", __func__, e.what());
+        }
+    }
+
+    common_device_memory_data_vec ret(main.size());
+    for (size_t i = 0; i < main.size(); i++) {
+        ret[i].total   = main[i].total;
+        ret[i].free    = main[i].free;
+        ret[i].model   = main[i].mb.model;
+        ret[i].context = main[i].mb.context;
+        ret[i].compute = main[i].mb.compute;
+    }
+    return ret;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
