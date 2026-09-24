@@ -6,6 +6,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "split-balance.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1298,6 +1299,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // --split-balance only chooses the split when the user did not give one
+    const bool user_split = std::any_of(params.tensor_split, params.tensor_split + llama_max_devices(),
+                                        [](float x) { return x != 0.0f; });
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
@@ -1330,6 +1335,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        if (!user_split) {
+            common_split_balance_apply(params, mparams, cparams, has_draft || spec_mtp ? &extra : nullptr);
+        }
+    } else if (!user_split) {
+        common_split_balance_apply(params, mparams, cparams, nullptr);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

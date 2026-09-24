@@ -55,6 +55,17 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+// Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
+// main model's devices the way common_fit_params accounts for it. extra may be nullptr.
+common_device_memory_data_vec common_get_device_memory_data_with_extra(
+                         const char * path_model,
+                 const llama_model_params * mparams,
+               const llama_context_params * cparams,
+       const common_fit_extra_model * extra,
+      std::vector<ggml_backend_dev_t> & devs,
+                           uint32_t & hp_ngl,
+                     ggml_log_level   log_level);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,

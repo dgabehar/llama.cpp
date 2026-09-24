@@ -585,6 +585,12 @@ struct common_params {
     bool cpu_split         = true;  // --cpu-split auto|off: split CPU-resident layers across auto-detected CPU locality domains
     std::vector<float> cpu_split_weights; // calibrated per-CPU-domain throughput weights; empty = equal weighting
 
+    // --split-balance: how layers are split across devices when -ts is not given (see common/split-balance.h)
+    int      split_balance         = 3;     // common_split_balance_mode: 0 memory, 1 decode, 2 prefill, 3 auto
+    uint32_t split_workload_prompt = 4096;  // --split-workload: reference request that auto mode optimizes for
+    uint32_t split_workload_gen    = 256;
+    bool     split_calibrate_force = false; // --split-calibrate force: re-measure devices instead of using the cache
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

@@ -108,6 +108,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    split-balance.cpp
+    split-balance.h
     subproc.cpp
     subproc.h
     trie.cpp

@@ -2743,6 +2743,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_SPLIT"));
     add_opt(common_arg(
+        {"--split-balance"}, "auto|decode|prefill|memory",
+        "how to split layers across devices when --tensor-split is not given (default: auto)\n"
+        "- auto: time each device at startup and pick the split with the lowest predicted time\n"
+        "  for --split-workload, within each device's free memory\n"
+        "- decode: fastest per-token generation (fewest layers on slow devices)\n"
+        "- prefill: fastest prompt processing (layers proportional to device speed)\n"
+        "- memory: split by free memory, fitting the most model and context",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "memory")  { params.split_balance = 0; }
+            else if (value == "decode")  { params.split_balance = 1; }
+            else if (value == "prefill") { params.split_balance = 2; }
+            else if (value == "auto")    { params.split_balance = 3; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_SPLIT_BALANCE"));
+    add_opt(common_arg(
+        {"--split-workload"}, "P:G",
+        string_format("reference request for --split-balance auto: P prompt tokens, G generated tokens (default: %u:%u)",
+            params.split_workload_prompt, params.split_workload_gen),
+        [](common_params & params, const std::string & value) {
+            const auto pos = value.find(':');
+            if (pos == std::string::npos) {
+                throw std::invalid_argument("expected P:G");
+            }
+            params.split_workload_prompt = (uint32_t) std::stoul(value.substr(0, pos));
+            params.split_workload_gen    = (uint32_t) std::stoul(value.substr(pos + 1));
+        }
+    ).set_env("LLAMA_ARG_SPLIT_WORKLOAD"));
+    add_opt(common_arg(
+        {"--split-calibrate"}, "cache|force",
+        "device timings for --split-balance: reuse cached results (cache, default) or measure again (force)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "cache") { params.split_calibrate_force = false; }
+            else if (value == "force") { params.split_calibrate_force = true; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_SPLIT_CALIBRATE"));
+    add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
