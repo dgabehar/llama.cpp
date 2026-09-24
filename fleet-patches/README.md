@@ -89,7 +89,11 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0069 | `4727d61e0` | common : split-balance: time the dominant weight type, model n_batch drains |
 | 0070 | `a0543ca83` | vulkan : keep the flop-sized submits of a graph below the kernel job queue |
 | 0071 | `bed797907` | common : split-balance: model imperfect stage overlap in prefill |
-| 0074 | (this commit) | common : split-balance: key the calibration cache by build, expire after 7 days |
+| 0074 | `d7cd53de7` | common : split-balance: key the calibration cache by build, expire after 7 days |
+| 0075 | `980ea324a` | split-balance: ignore overrides that match nothing, validate and re-check the cache, calibrated overheads |
+| 0076 | `8b92aab27` | server: only an explicit off value disables LLAMA_SERVER_CKPT_CAPTURE |
+| 0077 | `46568f521` | rpc: take a client slot at HELLO, bound the handshake, report a full server |
+| 0079 | (this commit) | rpc: say that the connection to the server was lost when a request fails |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

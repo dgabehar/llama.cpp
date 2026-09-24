@@ -35,7 +35,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Lost the connection to the RPC server (it exited, restarted or is unreachable) or it sent a malformed response")
 
 // all RPC structures must be packed
 #pragma pack(push, 1)

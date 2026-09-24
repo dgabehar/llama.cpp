@@ -1,0 +1,27 @@
+From 7fddc20408894e7bb734ee0e856e9959587e96dd Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 16:29:50 -0500
+Subject: [PATCH] rpc: say that the connection to the server was lost when a
+ request fails
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index ddaa3f899..75db11c7c 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -35,7 +35,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ namespace fs = std::filesystem;
+ 
+ // macro for nicer error messages on server crash
+-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
++#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Lost the connection to the RPC server (it exited, restarted or is unreachable) or it sent a malformed response")
+ 
+ // all RPC structures must be packed
+ #pragma pack(push, 1)
+-- 
+2.43.0
+
