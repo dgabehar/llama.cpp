@@ -1,0 +1,27 @@
+From a5993bf2d69192598f41461521c949da3774febd Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 09:44:43 -0500
+Subject: [PATCH] fleet: patch table: 0065-0071 are fork-only
+
+Assisted-by: Claude Opus 5.5
+---
+ fleet-patches/README.md | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/fleet-patches/README.md b/fleet-patches/README.md
+index c90d844bc..6b77b5464 100644
+--- a/fleet-patches/README.md
++++ b/fleet-patches/README.md
+@@ -127,8 +127,7 @@ multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
+ and resolve 0059 against whatever shape upstream landed.
+ 
+ 0065-0071 are the speed-aware split and pipeline fixes (see FLEET.md, "Speed-aware
+-split and pipeline fixes"). 0065 and 0070 (Vulkan submit sizing) and 0066
+-(scheduler plan) are upstream candidates.
++split and pipeline fixes"). Fork-only, not submitted upstream.
+ 
+ See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
+ full workflow this fits into (weekly upstream rebase, when to add a new
+-- 
+2.43.0
+

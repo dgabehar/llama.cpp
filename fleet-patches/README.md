@@ -127,8 +127,7 @@ multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
 and resolve 0059 against whatever shape upstream landed.
 
 0065-0071 are the speed-aware split and pipeline fixes (see FLEET.md, "Speed-aware
-split and pipeline fixes"). 0065 and 0070 (Vulkan submit sizing) and 0066
-(scheduler plan) are upstream candidates.
+split and pipeline fixes"). Fork-only, not submitted upstream.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new
