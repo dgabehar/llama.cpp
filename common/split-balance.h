@@ -46,6 +46,7 @@ struct common_split_workload {
     uint32_t n_prompt = 4096;
     uint32_t n_gen    = 256;
     uint32_t n_ubatch = 512;
+    uint32_t n_batch  = 2048; // the pipeline drains at the end of every llama_decode() call
 };
 
 // predicted seconds per decoded token / for processing n_prompt tokens, for
