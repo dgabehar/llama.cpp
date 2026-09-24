@@ -21,7 +21,9 @@ struct socket_t {
     // here. No-op on TCP.
     bool flush();
 
-    socket_ptr accept();
+    // Returns nullptr on failure; *fatal is set when the listening socket
+    // itself is unusable (as opposed to a single failed connection).
+    socket_ptr accept(bool * fatal = nullptr);
 
     // Enable TCP keepalive so a peer that vanished without closing the
     // connection (crashed host, pulled cable) is eventually detected.

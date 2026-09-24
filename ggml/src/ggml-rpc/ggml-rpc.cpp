@@ -1452,8 +1452,13 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        // a bad tensor from one client must not abort the server (and every other client)
+        if (tensor->data + tensor_size < tensor->data ||
+            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", size=%" PRIu64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+                           __func__, tensor->data, tensor_size, buffer_start, buffer_start + buffer_size);
+            return nullptr;
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1514,9 +1519,22 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        // several connections may cache the same tensor at once: write a
+        // private temp file and rename it into place atomically
+        fs::path tmp_file = cache_file;
+        tmp_file += ".tmp." + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        {
+            std::ofstream ofs(tmp_file, std::ios::binary);
+            ofs.write((const char *)data, size);
+        }
+        std::error_code ec;
+        fs::rename(tmp_file, cache_file, ec);
+        if (ec) {
+            GGML_LOG_WARN("[%s] failed to save '%s': %s\n", __func__, cache_file.string().c_str(), ec.message().c_str());
+            fs::remove(tmp_file, ec);
+        } else {
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -1827,7 +1845,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         lock = std::unique_lock<std::mutex>(*sctx.device_mutexes[device]);
     }
     ggml_status status = ggml_backend_graph_compute(backend, graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        // RPC has no way to report a compute failure to the client, so drop
+        // this connection instead of aborting the server for every client.
+        GGML_LOG_ERROR("[%s] graph computation failed on device %u, status: %d\n", __func__, device, (int) status);
+        stored_graphs[device].graph = nullptr;
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1851,7 +1875,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         lock = std::unique_lock<std::mutex>(*sctx.device_mutexes[device]);
     }
     ggml_status status = ggml_backend_graph_compute(backend, graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph computation failed on device %u, status: %d\n", __func__, device, (int) status);
+        return false;
+    }
     return true;
 }
 
@@ -2244,10 +2271,14 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
     std::list<std::unique_ptr<rpc_connection>> conns;
     uint64_t next_id = 1;
     while (true) {
-        auto client_socket = server_socket->accept();
+        bool fatal = false;
+        auto client_socket = server_socket->accept(&fatal);
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            break;
+            if (fatal) {
+                fprintf(stderr, "Failed to accept client connection, shutting down\n");
+                break;
+            }
+            continue; // transient (aborted handshake, EINTR, fd/memory pressure); keep serving
         }
         for (auto it = conns.begin(); it != conns.end(); ) {
             if ((*it)->done.load()) {
@@ -2277,7 +2308,12 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         fflush(stdout);
         rpc_connection * c = conn.get();
         c->thread = std::thread([&sctx, c, client_socket]() {
-            rpc_serve_client(sctx, client_socket);
+            try {
+                rpc_serve_client(sctx, client_socket);
+            } catch (const std::exception & e) {
+                // an exception escaping a thread would std::terminate the whole server
+                GGML_LOG_ERROR("Client %" PRIu64 " (%s): %s\n", c->id, c->peer.c_str(), e.what());
+            }
             printf("Client %" PRIu64 " (%s) disconnected\n", c->id, c->peer.c_str());
             fflush(stdout);
             c->done.store(true);
