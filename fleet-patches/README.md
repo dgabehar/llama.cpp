@@ -28,50 +28,63 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-09-21)
+## Current patches (regenerated 2026-09-23)
 
 | # | Commit | Summary |
 |---|---|---|
-| 0001 | `467589f6b` | grammar: translate PCRE shorthand escapes (`\d \w \s`) to GBNF classes |
-| 0002 | `a1e979568` | server: fix slot save/restore losing checkpoint-based cache reuse |
-| 0003 | `b74b2e31c` | common: guard checkpoint `update_dft` against an empty draft sequence |
-| 0004 | `5078faa5e` | ggml-alloc: finalize view init in a pass after all buft max_size splits |
-| 0005 | `9950b9dd4` | ci: add sync-with-upstream workflow (mirror of the master copy) |
-| 0006 | `290b1023d` | fix: repair YAML block-scalar indentation bug in sync workflow |
-| 0007 | `c5f91197b` | server: include `id_slot` in OAI-compatible chat completion responses |
-| 0008 | `87b0c16d4` | ggml: add `GGML_OP_SSM_CONV_SPLIT` (CPU+Vulkan) to skip the per-layer conv-state concat |
-| 0009 | `b7fd9fc37` | fleet: revert qwen3-coder complex-type parsing regression (upstream #28736/#28742) |
-| 0010 | `f60302abe` | fleet: mirror fork patches to disk, document fleet workflow separately |
-| 0011 | `17ecd9d52` | server: disable speculative decoding for grammar-constrained requests |
-| 0012 | `3c4e5bf4b` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
-| 0014 | `a1b3b4199` | vulkan: occupancy-aware S/M/L tile selector for non-coopmat2 path (AMD/Intel) |
-| 0016 | `2bef5fb62` | model: K2 Horizon gguf conversion code |
-| 0017 | `04dec3511` | model: loading hparams and tensors in k2-horizon.cpp |
-| 0018 | `24b5a208f` | model: K2 Horizon compute graph |
-| 0019 | `d1e6830aa` | model: K2 Horizon compute graph adjustment and registering tokenizers |
-| 0020 | `40fd73c38` | model: K2 Horizon chat template and accomodate safetensors naming |
-| 0021 | `7f9e25ec4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
-| 0024 | `35e651927` | server: end generation cleanly on a tool-call-diff inconsistency |
-| 0027 | `9e917cddf` | peg-parser: don't prematurely close an until_one_of span on an ambiguous partial delimiter match |
-| 0028 | `72a88ea77` | server: bound slot-action queue wait, and explain empty child-slot saves |
-| 0030 | `faee26a4c` | FLEET.md: require Murat/Dawn QA loop for every fork-exclusive change |
-| 0031 | `84b660c0d` | ggml-cpu: extend CPU backend device registry to N locality domains |
-| 0032 | `6fe8f7c86` | common: new `--cpu-split auto|off` flag with startup throughput calibration |
-| 0033 | `1d8ec4bc5` | llama-model: weighted per-layer CPU split across locality domains |
-| 0034 | `849dacc67` | llama-context: make backend_cpu locality-domain aware |
-| 0035 | `7e43e4a6d` | tests: cover the CPU locality-domain split |
-| 0036 | `1335f74e1` | docs: document `--cpu-split` and the CPU locality-domain split feature |
-| 0039 | `33581fbd8` | fix: route `ggml_backend_cpu_device_get_locality_mask` through the DL proc-address table |
-| 0041 | `5f25d2b3e` | fix: don't reject a GPU's host buffer type in `ggml_backend_cpu_device_supports_buft` |
-| 0043 | `b0530e2bc` | FLEET.md: document the 2026-09-18 CPU-split rollout outage and its fix |
-| 0045 | `9530d2baa` | fix: correct units in CPU split calibration log line (µs, not seconds) |
-| 0047 | `9eccefb98` | unicode: add the K2-Horizon pre-tokenizer splitter |
-| 0048 | `a54948f2e` | tests: expand K2 Horizon unicode splitter coverage |
-| 0049 | `8c4f7f7f7` | unicode: handle K2 Horizon case folding and empty input |
+| 0001 | `4449b934f` | grammar: translate PCRE shorthand escapes (`\d \w \s`) to GBNF classes |
+| 0002 | `4790afadf` | server: fix slot save/restore losing checkpoint-based cache reuse |
+| 0003 | `f4ed0a034` | common: guard checkpoint `update_dft` against an empty draft sequence |
+| 0004 | `20ac9695d` | ggml-alloc: finalize view init in a pass after all buft max_size splits |
+| 0005 | `cbf6b1831` | ci: add sync-with-upstream workflow (mirror of the master copy) |
+| 0006 | `0323f3340` | fix: repair YAML block-scalar indentation bug in sync workflow |
+| 0007 | `fea69e077` | server: include `id_slot` in OAI-compatible chat completion responses |
+| 0008 | `d0cd6ad32` | ggml: add `GGML_OP_SSM_CONV_SPLIT` (CPU+Vulkan) to skip the per-layer conv-state concat |
+| 0009 | `94fb9b77d` | fleet: mirror fork patches to disk, document fleet workflow separately |
+| 0010 | `0818a8fd3` | server: disable speculative decoding for grammar-constrained requests |
+| 0011 | `b4f77289c` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
+| 0013 | `42a54bd31` | vulkan: occupancy-aware S/M/L tile selector for non-coopmat2 path (AMD/Intel) |
+| 0015 | `45c96fc15` | model: K2 Horizon gguf conversion code |
+| 0016 | `3f172ae8f` | model: loading hparams and tensors in k2-horizon.cpp |
+| 0017 | `c6126e292` | model: K2 Horizon compute graph |
+| 0018 | `d12a4910b` | model: K2 Horizon compute graph adjustment and registering tokenizers |
+| 0019 | `f7cf09604` | model: K2 Horizon chat template and accomodate safetensors naming |
+| 0020 | `a8e59d1a4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
+| 0022 | `017177b59` | fleet-patches: reference upstream tracking issue for K2-Horizon support |
+| 0023 | `8e23577a7` | server: end generation cleanly on a tool-call-diff inconsistency |
+| 0024 | `27e786074` | FLEET.md: flag pre-existing qwen3-coder peg-parser test crash |
+| 0026 | `dc1510e38` | peg-parser: don't prematurely close an until_one_of span on an ambiguous partial delimiter match |
+| 0027 | `c7b01f7db` | server: bound slot-action queue wait, and explain empty child-slot saves |
+| 0029 | `63877150f` | FLEET.md: require Murat/Dawn QA loop for every fork-exclusive change |
+| 0030 | `4d4b442dd` | ggml-cpu: extend CPU backend device registry to N locality domains |
+| 0031 | `3c3764c39` | common: new `--cpu-split auto|off` flag with startup throughput calibration |
+| 0032 | `552cd5aba` | llama-model: weighted per-layer CPU split across locality domains |
+| 0033 | `b28e5a923` | llama-context: make backend_cpu locality-domain aware |
+| 0034 | `96c9bf74b` | tests: cover the CPU locality-domain split |
+| 0035 | `97080cf7b` | docs: document `--cpu-split` and the CPU locality-domain split feature |
+| 0036 | `31abfbbf7` | docs: record ship-as-is decision + TODO for FA/resolve_fused_ops caveat |
+| 0038 | `ff6e937d3` | fix: route `ggml_backend_cpu_device_get_locality_mask` through the DL proc-address table |
+| 0040 | `3a5e3c498` | fix: don't reject a GPU's host buffer type in `ggml_backend_cpu_device_supports_buft` |
+| 0042 | `613de6d57` | FLEET.md: document the 2026-09-18 CPU-split rollout outage and its fix |
+| 0044 | `ff256fe8d` | fix: correct units in CPU split calibration log line (µs, not seconds) |
+| 0046 | `5446ea5cc` | unicode: add the K2-Horizon pre-tokenizer splitter |
+| 0047 | `524c26c7a` | tests: expand K2 Horizon unicode splitter coverage |
+| 0048 | `fe31aa6f8` | unicode: handle K2 Horizon case folding and empty input |
+| 0050 | `184e4d5ac` | vocab: recognize K2-Horizon's <\|ifm\|im_end\|> as an EOG token |
+| 0051 | `4a25953cb` | chat: add K2-Horizon workaround for reasoning-tag auto-detection |
+| 0052 | `3a713c1c4` | tests: skip test-cpu-device-split on non-Linux platforms |
+| 0053 | `0f261f564` | tests: fix stale expected output in the shorthand-class regexp test |
+| 0054 | `07d2e0e67` | tests: loosen slot-action-timeout test's join timeout margin |
+| 0055 | `9fc9046f4` | conversion: fix flake8 lint violations in k2_horizon.py |
+| 0057 | `32038f723` | rpc : serve each client connection on its own thread |
+| 0058 | `a8c9c9973` | rpc : serialize backend compute across connection threads |
+| 0059 | `22ce3a307` | rpc : per-connection backends, tracked connections, client cap, keepalive |
+| 0060 | `52170fc4c` | rpc : keep one bad client from taking down the whole server |
+| 0061 | `727f39e3e` | tests : add test-rpc-server-multiclient |
 
-0047-0049 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
+0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
-of this fork's original 0016-0020 fork point. Fixes an MSVC `std::regex`
+of this fork's original 0015-0019 fork point. Fixes an MSVC `std::regex`
 crash that blocked K2-Horizon GGUFs from loading on Windows, plus
 ZWNJ/ZWJ/case-folding/empty-input edge cases in the pre-tokenizer word
 splitter. Does **not** touch BPE merge-table granularity -- unrelated to the
@@ -79,10 +92,10 @@ splitter. Does **not** touch BPE merge-table granularity -- unrelated to the
 live on gabesrv06 2026-09-21 (that's normal BPE-vocab behavior, shared with
 gpt-oss-20b's tokenizer on the same string, not a bug this fixes).
 
-Patches 0016-0020 are cherry-picked from the vendor's own architecture-support
+Patches 0015-0019 are cherry-picked from the vendor's own architecture-support
 branch (`MBZUAI-IFM/llama.cpp@model/K2Horizon`, forked from upstream
 2026-08-28) -- model-definition/conversion/vocab layer only, no backend code
-touched. 0021 is this fork's own fix for API drift in `llama_hparams::n_ff_exp`
+touched. 0020 is this fork's own fix for API drift in `llama_hparams::n_ff_exp`
 (plain field -> per-layer accessor) that landed upstream after the vendor's
 fork point. See `home-infrastructure`'s TODO.md ("K2-Horizon Ascent" entry,
 2026-09-16) for the full port/build/canary writeup.
@@ -97,6 +110,13 @@ point back to the same vendor branch these patches are cherry-picked from
 issue before this fork's next upstream rebase -- if a real PR lands and
 merges, these patches become redundant and should be dropped rather than
 carried forward as a rebase conflict.
+
+0057-0058 are cherry-picked from upstream PR
+[ggml-org/llama.cpp#28916](https://github.com/ggml-org/llama.cpp/pull/28916)
+(fix for issue #28908, rpc-server serving only one client at a time), original
+authorship kept; 0059-0061 build on them (see FLEET.md, "rpc-server
+multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
+and resolve 0059 against whatever shape upstream landed.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new

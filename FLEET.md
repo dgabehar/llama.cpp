@@ -119,6 +119,54 @@ obvious from the code alone. Flag this caveat to Murat/Dawn explicitly when
 testing this on gabesrv10 -- the A/B tok/s comparison is what determines
 whether the TODO is needed at all.
 
+## rpc-server multi-client (added 2026-09-23)
+
+Upstream `ggml-rpc-server` served one connection at a time
+(`while (true) { accept(); rpc_serve_client(); }` with `listen(fd, 1)`), and a
+llama-server master holds its RPC socket for the model's whole lifetime. So
+once a master connected, everything else sat in the kernel backlog: a second
+master, `--list-devices` (about 127s of SYN retries, then `GGML_ABORT "Failed
+to connect"`), and k8s `tcpSocket` probes. That's the root cause of the
+Aug-2026 worker liveness-kill problem (the chart's `failureThreshold: 45`
+workaround) and of the 2026-09-23 gabesrv10->gabesrv06 Thunderbolt test
+failures. Upstream issue ggml-org/llama.cpp#28908.
+
+Patches 0057-0061 (see `fleet-patches/README.md`):
+
+- **Thread per connection** (0057-0058, upstream PR #28916 cherry-picks),
+  then 0059 replaces #28916's detached threads and global compute mutex
+  with a tracked connection list (joined, reaped, logged with id + peer),
+  `listen(fd, SOMAXCONN)`, and **per-connection backend instances**: each
+  connection gets its own `ggml_backend_dev_init()` backend, so clients
+  compute concurrently with no server-side lock. The device-level
+  queue/submit locking in the backends (e.g. Vulkan's `device->mutex`,
+  `device_submit_mutex`) handles the sharing, same as several llama
+  contexts on one GPU.
+- **New rpc-server flags:** `--max-clients N` (default 8, 0 = unlimited;
+  over the cap the socket is accepted and closed immediately),
+  `--keepalive N` (TCP keepalive idle seconds, default 30, so a vanished
+  master's buffers are freed in about 60s instead of never), and
+  `--serialize-compute` (fallback: one shared backend per device plus a
+  per-device mutex, in case a backend proves unsafe with several
+  instances).
+- **One client can't kill the others** (0060): `MSG_NOSIGNAL` on send (a
+  client that FIN-closed before its reply killed the server with SIGPIPE,
+  exit 141), transient `accept()` errors (fd exhaustion etc.) no longer end
+  the accept loop, and out-of-bounds tensors and failed graph computes now
+  close only that connection instead of `GGML_ASSERT`-aborting.
+  Tensor-cache writes are atomic (tmp + rename).
+- **Test:** `test-rpc-server-multiclient` (0061, label `main`, UNIX only).
+  Every case in it fails against the pre-fix server.
+
+No wire-protocol change; old clients work unchanged. Still open,
+client-side: the coordinator aborts when a worker dies (client half of
+upstream PR #26724), and `get_dispatcher` holds its global mutex during a
+blocking `connect`.
+
+**Live-verify on real GPUs before shipping.** A second master costs a second
+backend instance's worth of device memory on the worker. Measure it on
+gabesrv06 (plan Step 4) before relying on several masters per worker.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on

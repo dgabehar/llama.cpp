@@ -1,0 +1,49 @@
+From 32038f72357d77d2d4b574060ce1bcfdb93c73e0 Mon Sep 17 00:00:00 2001
+From: Shikanime Deva <william.phetsinorath@shikanime.studio>
+Date: Mon, 14 Sep 2026 22:12:35 +0200
+Subject: [PATCH] rpc : serve each client connection on its own thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ggml_backend_rpc_start_server serves clients from a single accept loop: it
+accepts one socket, runs rpc_serve_client to completion, then accepts the
+next. In router mode each model child holds a long-lived RPC connection for
+the model's lifetime, so the first loaded model permanently occupies the
+loop and every later model starves in the kernel accept backlog — its
+HELLO is never answered and the child blocks in recv(8) forever. Any
+second long-lived connection wedges; it only looks MoE-shaped because a
+dense model usually loads first.
+
+Serve each connection on its own detached thread. rpc_server is already
+constructed per connection inside rpc_serve_client, so per-connection state
+is isolated; the shared backends handles are the same objects the serial
+loop already used. Verified with a two-client repro: client A holds its
+connection, client B's HELLO returns in 0.00s with this change and never
+returns before it.
+
+Signed-off-by: Shikanime Deva <william.phetsinorath@shikanime.studio>
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index c24caad77..c615e2aa3 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2141,8 +2141,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         }
+         printf("Accepted client connection\n");
+         fflush(stdout);
+-        rpc_serve_client(backends, cache_dir, client_socket);
+-        printf("Client connection closed\n");
++        std::thread([backends, cache_dir, client_socket]() {
++            rpc_serve_client(backends, cache_dir, client_socket);
++        }).detach();
++        printf("Client connection accepted for serving\n");
+         fflush(stdout);
+     }
+     rpc_transport_shutdown();
+-- 
+2.43.0
+
