@@ -13893,7 +13893,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
-    uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
 
     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
@@ -13904,7 +13903,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // Size the batches from this graph's own work. Using the previous graph's total instead
+    // makes the first large graph after a small one (e.g. a prompt ubatch after a single-token
+    // decode) submit almost every node separately; on amdgpu those submits fill the kernel job
+    // queue and graph_compute blocks until the GPU drains, which defeats pipeline parallelism.
+    uint64_t graph_flops = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+    }
+    uint64_t flops_per_submit = std::min(flops_cap, graph_flops / 40u);
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -13943,7 +13950,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         {
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
-            total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
             if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
@@ -14249,7 +14255,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask = 0;
     }
 
-    ctx->last_total_flops = total_flops;
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
