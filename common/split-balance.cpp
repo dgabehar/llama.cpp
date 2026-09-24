@@ -19,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <regex>
 #include <sstream>
 
 const char * common_split_balance_mode_name(common_split_balance_mode mode) {
@@ -30,6 +31,13 @@ const char * common_split_balance_mode_name(common_split_balance_mode mode) {
     }
     return "?";
 }
+
+// Calibration times only the weight matmuls; attention, norms, SSM scans and the host side of each
+// graph are not in layer_flops/layer_bytes. Against measured llama-server runs of Qwen3.8-27B
+// (8060S + 780M over RPC, 0-23 layers on the 780M) the matmul-only model was 25-31% optimistic for
+// prompt processing and 11-15% for generation.
+static constexpr double k_prefill_overhead = 1.28;
+static constexpr double k_decode_overhead  = 1.13;
 
 double common_split_predict_decode(
         const common_split_model_shape & shape,
@@ -48,7 +56,7 @@ double common_split_predict_decode(
             bytes += shape.output_bytes;
         }
         // a remote stage costs a round trip per token: activations in, activations out
-        t += bytes * p.s_decode_byte + 2.0 * (p.t_hop + shape.act_bytes * p.s_hop_byte);
+        t += bytes * p.s_decode_byte * k_decode_overhead + 2.0 * (p.t_hop + shape.act_bytes * p.s_hop_byte);
     }
     return t;
 }
@@ -73,7 +81,7 @@ double common_split_predict_prefill(
             continue;
         }
         const auto & p = perf[i];
-        const double t = n_layers[i] * shape.layer_flops * ub * p.s_prefill_flop
+        const double t = n_layers[i] * shape.layer_flops * ub * p.s_prefill_flop * k_prefill_overhead
                        + 2.0 * (p.t_hop + ub * shape.act_bytes * p.s_hop_byte);
         t_stage_max = std::max(t_stage_max, t);
         t_stage_sum += t;
@@ -378,6 +386,49 @@ static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_f
     return true;
 }
 
+// A short decode timing (a fraction of the full calibration) used to notice that the device behind
+// a cached entry has changed. For RPC devices the cache key only knows the endpoint, so a worker
+// with other hardware, driver or build behind the same address would otherwise reuse stale speeds.
+static bool quick_check(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, double & s_byte) {
+    ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
+    if (!backend) {
+        return false;
+    }
+    const int n_decode = 8;
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * (n_decode + 4) + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    // big enough to stream from memory rather than a cache (~32 MiB), small enough to upload quickly
+    const int64_t rows_32m = (int64_t) ((32u << 20) / ggml_row_size(wtype, n_embd));
+    const int64_t n_rows   = std::min<int64_t>(3 * n_ff, std::max<int64_t>(n_ff / 8, rows_32m));
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx.get(), wtype, n_embd, n_rows);
+    ggml_tensor * x1 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, 1);
+    ggml_cgraph * gd = ggml_new_graph(ctx.get());
+    for (int i = 0; i < n_decode; i++) {
+        ggml_build_forward_expand(gd, ggml_mul_mat(ctx.get(), w, x1));
+    }
+    if (!ggml_backend_supports_op(backend.get(), ggml_graph_node(gd, 0))) {
+        return false;
+    }
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()) };
+    if (!buf) {
+        return false;
+    }
+    fill_weight(w);
+    fill_f32(x1);
+    s_byte = time_graph(backend.get(), gd, 7) / (double) (n_decode * ggml_nbytes(w));
+    return true;
+}
+
+static bool perf_valid(const common_split_device_perf & p) {
+    auto pos = [](double v) { return std::isfinite(v) && v > 0.0; };
+    auto nonneg = [](double v) { return std::isfinite(v) && v >= 0.0; };
+    return pos(p.s_decode_byte) && pos(p.s_prefill_flop) && nonneg(p.t_hop) && nonneg(p.s_hop_byte);
+}
+
 std::vector<common_split_device_perf> common_split_balance_calibrate(
         const std::vector<ggml_backend_dev_t> & devs,
         int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
@@ -419,6 +470,23 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
                 perf[i].s_prefill_flop = e.at("s_prefill_flop").get<double>();
                 perf[i].t_hop          = e.at("t_hop").get<double>();
                 perf[i].s_hop_byte     = e.at("s_hop_byte").get<double>();
+                if (!perf_valid(perf[i])) {
+                    throw std::runtime_error("invalid");
+                }
+                if (dev_is_remote(devs[i])) {
+                    const double s_ref = e.at("s_check_byte").get<double>();
+                    double s_now = 0.0;
+                    if (!(s_ref > 0.0) || !quick_check(devs[i], n_embd, n_ff, wtype, s_now)) {
+                        throw std::runtime_error("no check");
+                    }
+                    const double ratio = s_now / s_ref;
+                    // wide enough for run-to-run noise; a different worker is typically off by 2x or more
+                    if (ratio > 1.5 || ratio < 1.0 / 1.5) {
+                        LOG_INF("%s: %s runs at %.2fx its cached speed, calibrating again\n", __func__,
+                                ggml_backend_dev_name(devs[i]), 1.0 / ratio);
+                        throw std::runtime_error("changed");
+                    }
+                }
                 continue;
             } catch (const std::exception &) {
                 // fall through and measure again
@@ -429,8 +497,17 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             LOG_WRN("%s: could not calibrate %s, not balancing by speed\n", __func__, ggml_backend_dev_name(devs[i]));
             return {};
         }
+        if (!perf_valid(perf[i])) {
+            LOG_WRN("%s: calibration of %s gave invalid timings, not balancing by speed\n", __func__, ggml_backend_dev_name(devs[i]));
+            return {};
+        }
+        double s_check = 0.0;
+        if (dev_is_remote(devs[i]) && !quick_check(devs[i], n_embd, n_ff, wtype, s_check)) {
+            s_check = 0.0;
+        }
         LOG_INF("%s: calibrated %s in %.1f s\n", __func__, ggml_backend_dev_name(devs[i]), (ggml_time_us() - t0) * 1e-6);
         cache[key] = common_json::object({
+            {"s_check_byte",   s_check},
             {"s_decode_byte",  perf[i].s_decode_byte},
             {"s_prefill_flop", perf[i].s_prefill_flop},
             {"t_hop",          perf[i].t_hop},
@@ -441,14 +518,39 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
     }
 
     if (dirty && !cache_path.empty()) {
+        // drop entries of other builds and expired ones, so the file does not grow with every build
+        const std::string build = std::string("|") + llama_commit();
+        std::vector<std::string> drop;
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            const std::string & k = it.key();
+            const bool same_build = k.size() >= build.size() && k.compare(k.size() - build.size(), build.size(), build) == 0;
+            int64_t t_meas = 0;
+            if (it.value().is_object()) {
+                t_meas = it.value().value("measured_at", (int64_t) 0);
+            }
+            if (!same_build || now_s - t_meas > max_age_s) {
+                drop.push_back(k);
+            }
+        }
+        for (const auto & k : drop) {
+            cache.erase(k);
+        }
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(cache_path).parent_path(), ec);
         const std::string tmp = cache_path + ".tmp";
         std::ofstream f(tmp);
+        bool ok = false;
         if (f) {
             f << cache.dump(2);
             f.close();
-            std::filesystem::rename(tmp, cache_path, ec);
+            ok = !f.fail();
+            if (ok) {
+                std::filesystem::rename(tmp, cache_path, ec);
+                ok = !ec;
+            }
+        }
+        if (!ok) {
+            LOG_WRN("%s: could not write the calibration cache %s\n", __func__, cache_path.c_str());
         }
     }
     return perf;
@@ -463,10 +565,18 @@ struct model_layer_info {
     int64_t   n_embd = 0;
     int64_t   n_ff   = 0;
     ggml_type wtype  = GGML_TYPE_COUNT;
+    bool      overridden = false; // a tensor buffer override matches a tensor of this model
 };
 
 // layer sizes, compute and the dominant FFN matmul shape from the GGUF metadata
-static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_info & info) {
+static bool read_model_layers(const char * path, uint32_t n_layer, const llama_model_tensor_buft_override * overrides,
+                              model_layer_info & info) {
+    // same matching as the model loader; -ncmoe on a dense model adds patterns that match nothing
+    std::vector<std::regex> ov;
+    for (const auto * o = overrides; o != nullptr && o->pattern != nullptr; o++) {
+        ov.emplace_back(o->pattern);
+    }
+
     ggml_context * meta = nullptr;
     gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ &meta };
     gguf_context * gctx = gguf_init_from_file(path, gp);
@@ -511,6 +621,11 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
         const ggml_tensor * t = ggml_get_tensor(meta, name.c_str());
         if (t == nullptr) {
             continue;
+        }
+        for (const auto & re : ov) {
+            if (!info.overridden && std::regex_search(name, re)) {
+                info.overridden = true;
+            }
         }
         const bool   is_expert = name.find("_exps") != std::string::npos;
         const double frac      = is_expert ? expert_frac : 1.0;
@@ -579,10 +694,6 @@ void common_split_balance_apply(
     if (mparams.split_mode != LLAMA_SPLIT_MODE_LAYER) {
         return;
     }
-    if (mparams.tensor_buft_overrides && mparams.tensor_buft_overrides->pattern) {
-        LOG_INF("%s: tensor overrides are in use (partial offload), keeping the memory split\n", __func__);
-        return;
-    }
 
     const int64_t t_start = ggml_time_us();
     const ggml_log_level lvl = GGML_LOG_LEVEL_ERROR;
@@ -609,8 +720,12 @@ void common_split_balance_apply(
     }
 
     model_layer_info info;
-    if (!read_model_layers(params.model.path.c_str(), n_layer, info)) {
+    if (!read_model_layers(params.model.path.c_str(), n_layer, mparams.tensor_buft_overrides, info)) {
         LOG_WRN("%s: could not read the layer shapes, keeping the memory split\n", __func__);
+        return;
+    }
+    if (info.overridden) {
+        LOG_INF("%s: tensor buffer overrides move weights of this model off the split, keeping the memory split\n", __func__);
         return;
     }
 
