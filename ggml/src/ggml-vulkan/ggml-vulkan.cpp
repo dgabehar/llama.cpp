@@ -13894,13 +13894,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
+    bool     flops_cap_timeout = false;
 
     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
         if (ctx->device->architecture == AMD_GCN && ctx->device->shader_core_count < 32) {
             flops_cap = 500'000'000ULL * ctx->device->shader_core_count;
+            flops_cap_timeout = true;
         } else if (ctx->device->architecture != AMD_GCN && ctx->device->shader_core_count < 24) {
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
+            flops_cap_timeout = true;
         }
     }
     // Size the batches from this graph's own work. Using the previous graph's total instead
@@ -13912,6 +13915,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
     }
     uint64_t flops_per_submit = std::min(flops_cap, graph_flops / 40u);
+    // Each submit is a job in the kernel's queue (amdgpu sched_jobs, 32 by default). With too many of them
+    // vkQueueSubmit blocks until the GPU catches up and graph_compute is no longer asynchronous, so with
+    // pipeline parallelism the host can't feed the next device. Keep the flop-sized submits of a graph
+    // well below that, except where the cap above protects against the driver timeout.
+    if (!flops_cap_timeout) {
+        constexpr uint64_t n_submits_max = 12;
+        flops_per_submit = std::max(flops_per_submit, graph_flops / n_submits_max);
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
