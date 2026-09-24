@@ -81,6 +81,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0059 | `22ce3a307` | rpc : per-connection backends, tracked connections, client cap, keepalive |
 | 0060 | `52170fc4c` | rpc : keep one bad client from taking down the whole server |
 | 0061 | `727f39e3e` | tests : add test-rpc-server-multiclient |
+| 0063 | `b917b2aec` | rpc : don't reject a client because a just-closed probe still holds a slot |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
@@ -114,7 +115,7 @@ carried forward as a rebase conflict.
 0057-0058 are cherry-picked from upstream PR
 [ggml-org/llama.cpp#28916](https://github.com/ggml-org/llama.cpp/pull/28916)
 (fix for issue #28908, rpc-server serving only one client at a time), original
-authorship kept; 0059-0061 build on them (see FLEET.md, "rpc-server
+authorship kept; 0059-0061 and 0063 build on them (see FLEET.md, "rpc-server
 multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
 and resolve 0059 against whatever shape upstream landed.
 

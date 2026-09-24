@@ -131,7 +131,7 @@ Aug-2026 worker liveness-kill problem (the chart's `failureThreshold: 45`
 workaround) and of the 2026-09-23 gabesrv10->gabesrv06 Thunderbolt test
 failures. Upstream issue ggml-org/llama.cpp#28908.
 
-Patches 0057-0061 (see `fleet-patches/README.md`):
+Patches 0057-0061 and 0063 (see `fleet-patches/README.md`):
 
 - **Thread per connection** (0057-0058, upstream PR #28916 cherry-picks),
   then 0059 replaces #28916's detached threads and global compute mutex
@@ -163,9 +163,39 @@ client-side: the coordinator aborts when a worker dies (client half of
 upstream PR #26724), and `get_dispatcher` holds its global mutex during a
 blocking `connect`.
 
-**Live-verify on real GPUs before shipping.** A second master costs a second
-backend instance's worth of device memory on the worker. Measure it on
-gabesrv06 (plan Step 4) before relying on several masters per worker.
+**Live results (2026-09-23, gabesrv10 master -> gabesrv06 worker over
+Thunderbolt, hostNetwork raw pods, test image
+`llamacpp-rpc-server:commit-2120ac537...@sha256:2e6b361d...`):**
+
+- `--list-devices` from a second process while a master is connected:
+  0.24s (was a ~127s hang, then `GGML_ABORT "Failed to connect"`).
+- Two masters on one worker (Qwen3.8-27B + K2-Horizon-7B), concurrent
+  chat requests: correct answers, no worker errors. Per-connection backend
+  instances cost no measurable extra device memory (~28 MiB difference vs
+  `--serialize-compute`).
+- Dead master (flow black-holed with iptables, then SIGKILL, so no
+  FIN/RST reaches the worker): dropped by keepalive after ~36s, and worker
+  free memory returned to the expected level.
+- Probe racing a client at the cap got the client rejected; fixed in
+  patch 0063 (reap grace at the cap) with a regression test.
+- Throughput, Qwen3.8-27B Q4_K_XL, ~1.9k-token prompt + 256 tokens,
+  median of 3:
+
+  | setup | pp t/s | tg t/s | load |
+  |---|---|---|---|
+  | gabesrv10 alone | 283 | 11.6 | |
+  | split over Thunderbolt | 139 | 7.0 | 25s |
+  | split over LAN (192.168.1.x) | 124 | 6.9 | 64s |
+  | TB split, 2 masters concurrent, per-connection backends | 114 | 6.3 | |
+  | TB split, 2 masters concurrent, `--serialize-compute` | 112 | 6.6 | |
+
+  So: a split is much slower than one node for a model that fits on one
+  node. Only use RPC for models that don't fit. Thunderbolt mostly speeds
+  up loading. Steady-state speed is close to LAN, because a layer split
+  only sends activations per token. With two masters the GPU is the
+  bottleneck, so per-connection backends vs `--serialize-compute` is a
+  wash on throughput. Per-connection backends stay the default for
+  isolation, not speed.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
