@@ -1318,9 +1318,13 @@ private:
             ckpt_capture     = params_base.n_ctx_checkpoints > 0 && !has_eagle3;
             ckpt_capture_dft = ctx_dft != nullptr && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
-            const char * env = getenv("LLAMA_SERVER_CKPT_CAPTURE");
-            if (env && atoi(env) == 0) {
-                ckpt_capture = false;
+            // only an explicit off value disables it ("true", "on" or "" must not)
+            if (const char * env = getenv("LLAMA_SERVER_CKPT_CAPTURE")) {
+                std::string v = env;
+                std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) { return (char) std::tolower(ch); });
+                if (v == "0" || v == "false" || v == "off" || v == "no") {
+                    ckpt_capture = false;
+                }
             }
 
             SRV_INF("context checkpoints inside a batch: %s\n", ckpt_capture ? (ckpt_capture_dft ? "captured (with draft)" : "captured") : "split");
