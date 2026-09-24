@@ -82,6 +82,13 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0060 | `52170fc4c` | rpc : keep one bad client from taking down the whole server |
 | 0061 | `727f39e3e` | tests : add test-rpc-server-multiclient |
 | 0063 | `b917b2aec` | rpc : don't reject a client because a just-closed probe still holds a slot |
+| 0065 | `b1ff71165` | vulkan : size submit batches from the current graph's flops |
+| 0066 | `d19689876` | llama : restore the worst-case sched plan before large ubatches |
+| 0067 | `2fd18e2a1` | common : --split-balance for speed-aware layer splits |
+| 0068 | `ac9411b42` | llama, server : capture context checkpoints inside a batch |
+| 0069 | `4727d61e0` | common : split-balance: time the dominant weight type, model n_batch drains |
+| 0070 | `a0543ca83` | vulkan : keep the flop-sized submits of a graph below the kernel job queue |
+| 0071 | `bed797907` | common : split-balance: model imperfect stage overlap in prefill |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
@@ -118,6 +125,10 @@ carried forward as a rebase conflict.
 authorship kept; 0059-0061 and 0063 build on them (see FLEET.md, "rpc-server
 multi-client"). If #28916 merges upstream, drop 0057-0058 on the next rebase
 and resolve 0059 against whatever shape upstream landed.
+
+0065-0071 are the speed-aware split and pipeline fixes (see FLEET.md, "Speed-aware
+split and pipeline fixes"). 0065 and 0070 (Vulkan submit sizing) and 0066
+(scheduler plan) are upstream candidates.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (weekly upstream rebase, when to add a new

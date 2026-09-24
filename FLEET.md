@@ -197,6 +197,95 @@ Thunderbolt, hostNetwork raw pods, test image
   wash on throughput. Per-connection backends stay the default for
   isolation, not speed.
 
+## Speed-aware split and pipeline fixes (added 2026-09-24)
+
+Why a gabesrv10 (8060S) + gabesrv06 (780M, RPC over Thunderbolt) split of
+Qwen3.8-27B ran at about half of gabesrv10 alone: **not RPC.** A decoded
+token needs one round trip and ~40 KB of inputs. A layer split runs the
+devices one after another, and the default split (proportional to free
+memory) put 23 of 64 layers on a GPU that is ~2.6x slower per layer for
+decode and ~3.7x for prefill. Prompt processing can overlap the devices
+across ubatches, but four things stopped that overlap:
+
+1. **`GGML_VK_MAX_NODES_PER_SUBMIT=1`** (fleet env). Every node became a
+   job in amdgpu's 32-job ring queue (`sched_jobs`), so `vkQueueSubmit`
+   blocked and `graph_compute` turned synchronous.
+2. **Vulkan sized submits from the previous graph's flops.** The first
+   prompt ubatch after a 1-token decode went out node by node, which is
+   the same blocking as item 1.
+3. **Too many flop-sized submits.** ~110 per 512-token ubatch on the 8060S,
+   so the queue filled anyway.
+4. **Scheduler reallocs and checkpoint breaks.** Scheduler reallocs synced
+   all backends when the ubatch shape changed. llama-server also split
+   every prompt at its context checkpoints, and each break drained the
+   pipeline.
+
+Patches (see `fleet-patches/README.md`):
+
+- **vulkan: size submits from the current graph** fixes item 2.
+- **llama: restore the worst-case sched plan before large ubatches** fixes
+  the reallocs.
+- **vulkan: keep a graph's flop-sized submits below the job queue** (at
+  most 12) fixes item 3. The weak-AMD timeout cap stays as it was.
+- **llama, server: capture context checkpoints inside a batch.** New
+  experimental `llama_state_seq_capture_add/get/clear`: the ubatch is cut at
+  the checkpoint token, and the state is copied on the device in stream
+  order. The server no longer splits the prompt for checkpoints.
+  - Saves are byte-identical to the old behavior when ubatch boundaries
+    match.
+  - `LLAMA_SERVER_CKPT_CAPTURE=0` restores the old behavior.
+  - eagle3 still splits.
+- **common: `--split-balance auto|decode|prefill|memory`**, default `auto`.
+  - At startup it times each device with synthetic matmuls shaped like the
+    model's layers (RPC devices over the normal protocol, so the worker
+    needs no change) and caches the result in
+    `~/.cache/llama.cpp/split-balance.json` (`--split-calibrate force` to
+    redo it).
+  - It picks layer counts that minimize the predicted time of a
+    `--split-workload P:G` request (default 4096:256), capped by the fit
+    memory projection.
+  - `memory` is the old behavior, for when the model only fits split.
+    An explicit `-ts` always wins.
+
+**Results (Qwen3.8-27B Q4_K_XL, llama-server, 1.9K / 8.1K-token prompts +
+256 generated tokens):**
+
+| config | layers on 06 | pp 1.9K | pp 8.1K | tg |
+|---|---|---|---|---|
+| before: memory split, old binary | 23 | 164* | | 7.2 |
+| `--split-balance memory` (new binary) | 23 | 175 | 185 | 6.8 |
+| `auto` (default, 4096:256) | 0 | 309 | 294 | 12.0 |
+| `auto`, `--split-workload 32768:16 -b 8192` | 13 | 261 | 312 | 7.8 |
+| fit-limited (`-fitt 1024,100000`), `memory` | 23 | 172 | 184 | 6.8 |
+| fit-limited, `auto` | 21 | 172 | 199 | 7.0 |
+
+\* at 20/80, the earlier measurement. The same split with the capture and
+scheduler fixes: 262.
+
+So for a model that fits on one node, `auto` keeps it there. RPC helps
+throughput only for long-prompt workloads, and only over Thunderbolt:
+over 1 GbE, prefill loses 9-21% and tg ~1.4%.
+
+**`GGML_VK_MAX_NODES_PER_SUBMIT=1` on gabesrv06/10 (B4):** stress-tested
+without it on this build, with the incident profile of 36-51K-token prompts:
+
+- gabesrv10: production Qwen3.8-27B flags (`--parallel 3`, draft-mtp,
+  `-b/-ub 1024`, 786K ctx). 6 prompts, 3 at a time.
+- gabesrv06: production gpt-oss-20b flags. 8 prompts.
+
+No DeviceLost and no amdgpu reset/timeout in dmesg. Both hosts already run
+`amdgpu.lockup_timeout=10000`, and each submit is capped far below that.
+The env can go from the 06/10 values. Keep it on gfx90c (gabesrv01/04),
+where the incident happened and the 2 s default timeout applies.
+
+**Not done, measured:**
+
+- **The KQ mask over RPC** costs ~0.13% of tg at 12K context over LAN
+  (below the 1% bar).
+- **`-sm tensor`** aborts on qwen35 hybrid ("view of permuted tensor not
+  implemented", `ggml-backend-meta.cpp:702`). It would also need an
+  all-reduce per layer over RPC.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on

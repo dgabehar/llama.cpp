@@ -1,0 +1,42 @@
+From bed797907ac46d79e3ffdeedb2a6a1076e69c4b6 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 01:25:42 -0500
+Subject: [PATCH] common : split-balance: model imperfect stage overlap in
+ prefill
+
+The prefill model assumed the shorter pipeline stages are fully hidden
+behind the longest one. Measured on 8060S + 780M (RPC) at 13/51 layers
+the split gains 1.08x over the fast device alone where the model said
+1.4x, which made prefill mode spread layers onto the slow device for
+4K-token workloads where that measurably loses. Hide 80% of the shorter
+stages instead (fitted to that measurement). With it, prefill/auto keep
+4K workloads on the fast device and use the split for 32K prompts,
+matching what the hardware does (pp8K 312 vs 297 t/s).
+
+Assisted-by: Claude Opus 5.5
+---
+ common/split-balance.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+index 77a9d4b52..0877f7ebf 100644
+--- a/common/split-balance.cpp
++++ b/common/split-balance.cpp
+@@ -82,9 +82,13 @@ double common_split_predict_prefill(
+     }
+     // per call: with a single ubatch nothing overlaps; the fill term covers that exactly
+     // (the last, shorter ubatch of a call is counted as a full one)
++    // the stages don't overlap perfectly (host-side copies between them, submission stalls): measured on
++    // an 8060S + 780M (RPC) split, about 80% of the shorter stages' time is hidden
++    constexpr double overlap = 0.8;
++    const double t_steady = t_stage_max + (1.0 - overlap) * (t_stage_sum - t_stage_max);
+     auto t_call = [&](uint32_t n_tokens) {
+         const uint32_t n_ub = (n_tokens + ub - 1) / ub;
+-        return (n_ub - 1) * t_stage_max + t_stage_sum;
++        return (n_ub - 1) * t_steady + t_stage_sum;
+     };
+     const uint32_t n_full = n_prompt / nb;
+     const uint32_t n_rest = n_prompt % nb;
+-- 
+2.43.0
+

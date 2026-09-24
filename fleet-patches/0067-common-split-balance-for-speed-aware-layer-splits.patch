@@ -1,0 +1,1201 @@
+From 2fd18e2a1ddc8c25ed333b58692e1ef44eff3a88 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 23:45:55 -0500
+Subject: [PATCH] common : --split-balance for speed-aware layer splits
+
+A layer split runs the devices one after another for every token, so
+splitting by free memory (the default) is the slowest choice when the
+devices differ in speed: on gabesrv10 (8060S) + gabesrv06 (780M, RPC)
+it put 33% of Qwen3.8-27B on the slow GPU, giving pp8192 204 t/s and
+tg 7.2 t/s vs 297/12.1 on one node.
+
+New modes:
+  memory   split by free memory (previous behavior)
+  decode   fill the fastest devices first
+  prefill  balance pipeline stage times
+  auto     minimize predicted time of a --split-workload P:G request
+           (default 4096:256); the default
+
+Each device is timed with synthetic matmuls shaped like the model's
+layers (decode: single-token, prefill: n_ubatch-token), remote RPC
+devices over the normal protocol with a readback, plus RPC hop latency
+and bandwidth. Results are cached (--split-calibrate cache|force).
+Memory caps come from the fit projection; the chosen split is verified
+against it and shrunk on overflow. An explicit -ts always wins.
+
+tests: test-split-balance checks the optimizer against brute force and
+the expected decode/prefill/auto behavior.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/CMakeLists.txt        |   2 +
+ common/arg.cpp               |  38 ++
+ common/common.cpp            |  11 +
+ common/common.h              |   6 +
+ common/fit.cpp               |  49 +++
+ common/fit.h                 |  11 +
+ common/split-balance.cpp     | 688 +++++++++++++++++++++++++++++++++++
+ common/split-balance.h       |  96 +++++
+ tests/CMakeLists.txt         |   1 +
+ tests/test-split-balance.cpp | 142 ++++++++
+ 10 files changed, 1044 insertions(+)
+ create mode 100644 common/split-balance.cpp
+ create mode 100644 common/split-balance.h
+ create mode 100644 tests/test-split-balance.cpp
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index c738451a0..5cc100aff 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -108,6 +108,8 @@ add_library(${TARGET}
+     sampling.h
+     speculative.cpp
+     speculative.h
++    split-balance.cpp
++    split-balance.h
+     subproc.cpp
+     subproc.h
+     trie.cpp
+diff --git a/common/arg.cpp b/common/arg.cpp
+index a95d59b35..94fdc76a1 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2742,6 +2742,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             else { throw std::invalid_argument("invalid value"); }
+         }
+     ).set_env("LLAMA_ARG_CPU_SPLIT"));
++    add_opt(common_arg(
++        {"--split-balance"}, "auto|decode|prefill|memory",
++        "how to split layers across devices when --tensor-split is not given (default: auto)\n"
++        "- auto: time each device at startup and pick the split with the lowest predicted time\n"
++        "  for --split-workload, within each device's free memory\n"
++        "- decode: fastest per-token generation (fewest layers on slow devices)\n"
++        "- prefill: fastest prompt processing (layers proportional to device speed)\n"
++        "- memory: split by free memory, fitting the most model and context",
++        [](common_params & params, const std::string & value) {
++            /**/ if (value == "memory")  { params.split_balance = 0; }
++            else if (value == "decode")  { params.split_balance = 1; }
++            else if (value == "prefill") { params.split_balance = 2; }
++            else if (value == "auto")    { params.split_balance = 3; }
++            else { throw std::invalid_argument("invalid value"); }
++        }
++    ).set_env("LLAMA_ARG_SPLIT_BALANCE"));
++    add_opt(common_arg(
++        {"--split-workload"}, "P:G",
++        string_format("reference request for --split-balance auto: P prompt tokens, G generated tokens (default: %u:%u)",
++            params.split_workload_prompt, params.split_workload_gen),
++        [](common_params & params, const std::string & value) {
++            const auto pos = value.find(':');
++            if (pos == std::string::npos) {
++                throw std::invalid_argument("expected P:G");
++            }
++            params.split_workload_prompt = (uint32_t) std::stoul(value.substr(0, pos));
++            params.split_workload_gen    = (uint32_t) std::stoul(value.substr(pos + 1));
++        }
++    ).set_env("LLAMA_ARG_SPLIT_WORKLOAD"));
++    add_opt(common_arg(
++        {"--split-calibrate"}, "cache|force",
++        "device timings for --split-balance: reuse cached results (cache, default) or measure again (force)",
++        [](common_params & params, const std::string & value) {
++            /**/ if (value == "cache") { params.split_calibrate_force = false; }
++            else if (value == "force") { params.split_calibrate_force = true; }
++            else { throw std::invalid_argument("invalid value"); }
++        }
++    ).set_env("LLAMA_ARG_SPLIT_CALIBRATE"));
+     add_opt(common_arg(
+         {"-dev", "--device"}, "<dev1,dev2,..>",
+         "comma-separated list of devices to use for offloading (none = don't offload)\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index 32cbb493f..926baf389 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -6,6 +6,7 @@
+ #include "build-info.h"
+ #include "common.h"
+ #include "fit.h"
++#include "split-balance.h"
+ #include "log.h"
+ #include "llama.h"
+ #include "sampling.h"
+@@ -1298,6 +1299,10 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
++    // --split-balance only chooses the split when the user did not give one
++    const bool user_split = std::any_of(params.tensor_split, params.tensor_split + llama_max_devices(),
++                                        [](float x) { return x != 0.0f; });
++
+     if (params.fit_params) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+@@ -1330,6 +1335,12 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++
++        if (!user_split) {
++            common_split_balance_apply(params, mparams, cparams, has_draft || spec_mtp ? &extra : nullptr);
++        }
++    } else if (!user_split) {
++        common_split_balance_apply(params, mparams, cparams, nullptr);
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+diff --git a/common/common.h b/common/common.h
+index c15f4b5d7..0f5574cc6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -585,6 +585,12 @@ struct common_params {
+     bool cpu_split         = true;  // --cpu-split auto|off: split CPU-resident layers across auto-detected CPU locality domains
+     std::vector<float> cpu_split_weights; // calibrated per-CPU-domain throughput weights; empty = equal weighting
+ 
++    // --split-balance: how layers are split across devices when -ts is not given (see common/split-balance.h)
++    int      split_balance         = 3;     // common_split_balance_mode: 0 memory, 1 decode, 2 prefill, 3 auto
++    uint32_t split_workload_prompt = 4096;  // --split-workload: reference request that auto mode optimizes for
++    uint32_t split_workload_gen    = 256;
++    bool     split_calibrate_force = false; // --split-calibrate force: re-measure devices instead of using the cache
++
+     bool single_turn       = false; // single turn chat conversation
+ 
+     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
+diff --git a/common/fit.cpp b/common/fit.cpp
+index faa595f84..31b87b12c 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -176,6 +176,55 @@ common_device_memory_data_vec common_get_device_memory_data(
+     return ret;
+ }
+ 
++common_device_memory_data_vec common_get_device_memory_data_with_extra(
++        const char * path_model,
++        const llama_model_params * mparams,
++        const llama_context_params * cparams,
++        const common_fit_extra_model * extra,
++        std::vector<ggml_backend_dev_t> & devs,
++        uint32_t & hp_ngl,
++        ggml_log_level log_level) {
++    uint32_t hp_nct = 0;
++    uint32_t hp_nex = 0;
++    std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
++            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++
++    if (extra != nullptr) {
++        std::vector<ggml_backend_dev_t> devs_extra;
++        uint32_t ngl_extra = 0;
++        uint32_t nct_extra = 0;
++        uint32_t nex_extra = 0;
++        llama_context_params cparams_extra = *extra->cparams;
++        cparams_extra.n_ctx = cparams->n_ctx;
++        try {
++            const auto measured = common_get_device_memory_data_impl(
++                extra->path_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
++            for (size_t je = 0; je < devs_extra.size(); je++) {
++                for (size_t id = 0; id < devs.size(); id++) {
++                    if (devs_extra[je] == devs[id]) {
++                        main[id].mb.model   += extra->shares_model ? 0 : measured[je].mb.model;
++                        main[id].mb.context += measured[je].mb.context;
++                        main[id].mb.compute += measured[je].mb.compute;
++                        break;
++                    }
++                }
++            }
++        } catch (const std::runtime_error & e) {
++            LOG_WRN("%s: failed to measure the memory of the extra model: %s\n", __func__, e.what());
++        }
++    }
++
++    common_device_memory_data_vec ret(main.size());
++    for (size_t i = 0; i < main.size(); i++) {
++        ret[i].total   = main[i].total;
++        ret[i].free    = main[i].free;
++        ret[i].model   = main[i].mb.model;
++        ret[i].context = main[i].mb.context;
++        ret[i].compute = main[i].mb.compute;
++    }
++    return ret;
++}
++
+ static void common_params_fit_impl(
+         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+diff --git a/common/fit.h b/common/fit.h
+index 824d386b0..24bcbc7ea 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -55,6 +55,17 @@ struct common_device_memory_data {
+ 
+ using common_device_memory_data_vec = std::vector<common_device_memory_data>;
+ 
++// Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
++// main model's devices the way common_fit_params accounts for it. extra may be nullptr.
++common_device_memory_data_vec common_get_device_memory_data_with_extra(
++                         const char * path_model,
++                 const llama_model_params * mparams,
++               const llama_context_params * cparams,
++       const common_fit_extra_model * extra,
++      std::vector<ggml_backend_dev_t> & devs,
++                           uint32_t & hp_ngl,
++                     ggml_log_level   log_level);
++
+ // Load a model + context with no_alloc and return the per-device memory breakdown.
+ common_device_memory_data_vec common_get_device_memory_data(
+                          const char * path_model,
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+new file mode 100644
+index 000000000..aca9f5357
+--- /dev/null
++++ b/common/split-balance.cpp
+@@ -0,0 +1,688 @@
++#include "split-balance.h"
++
++#include "common.h"
++#include "fit.h"
++#include "json.h"
++#include "log.h"
++#include "gguf.h"
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <limits>
++#include <sstream>
++
++const char * common_split_balance_mode_name(common_split_balance_mode mode) {
++    switch (mode) {
++        case COMMON_SPLIT_BALANCE_MEMORY:  return "memory";
++        case COMMON_SPLIT_BALANCE_DECODE:  return "decode";
++        case COMMON_SPLIT_BALANCE_PREFILL: return "prefill";
++        case COMMON_SPLIT_BALANCE_AUTO:    return "auto";
++    }
++    return "?";
++}
++
++double common_split_predict_decode(
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & n_layers) {
++    // the output layer always stays on the last device, so that device is always part of the pipeline
++    const int last = (int) n_layers.size() - 1;
++    double t = 0.0;
++    for (size_t i = 0; i < n_layers.size(); i++) {
++        if (n_layers[i] == 0 && (int) i != last) {
++            continue;
++        }
++        const auto & p = perf[i];
++        double bytes = n_layers[i] * shape.layer_bytes;
++        if ((int) i == last) {
++            bytes += shape.output_bytes;
++        }
++        // a remote stage costs a round trip per token: activations in, activations out
++        t += bytes * p.s_decode_byte + 2.0 * (p.t_hop + shape.act_bytes * p.s_hop_byte);
++    }
++    return t;
++}
++
++double common_split_predict_prefill(
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & n_layers,
++        const common_split_workload & wl) {
++    const uint32_t ub = std::max<uint32_t>(1, std::min(wl.n_ubatch, std::max<uint32_t>(1, wl.n_prompt)));
++    const uint32_t n_ub = (std::max<uint32_t>(1, wl.n_prompt) + ub - 1) / ub;
++
++    // ubatches are pipelined across the stages: the slowest stage sets the pace, and the
++    // pipeline takes (n_stages - 1) extra stage times to fill
++    double t_stage_max = 0.0;
++    double t_stage_sum = 0.0;
++    int    n_stages    = 0;
++    for (size_t i = 0; i < n_layers.size(); i++) {
++        if (n_layers[i] == 0 && i + 1 != n_layers.size()) {
++            continue;
++        }
++        const auto & p = perf[i];
++        const double t = n_layers[i] * shape.layer_flops * ub * p.s_prefill_flop
++                       + 2.0 * (p.t_hop + ub * shape.act_bytes * p.s_hop_byte);
++        t_stage_max = std::max(t_stage_max, t);
++        t_stage_sum += t;
++        n_stages++;
++    }
++    if (n_stages == 0) {
++        return 0.0;
++    }
++    // with a single ubatch nothing overlaps; the fill term covers that exactly
++    return (n_ub - 1) * t_stage_max + t_stage_sum;
++}
++
++struct split_cost {
++    double primary   = std::numeric_limits<double>::infinity();
++    double secondary = std::numeric_limits<double>::infinity();
++};
++
++std::vector<uint32_t> common_split_balance_optimize(
++        common_split_balance_mode mode,
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & max_layers,
++        const common_split_workload & wl) {
++    const size_t nd = perf.size();
++    if (mode == COMMON_SPLIT_BALANCE_MEMORY || nd == 0 || max_layers.size() != nd || shape.n_layer == 0) {
++        return {};
++    }
++    uint64_t cap_sum = 0;
++    for (uint32_t c : max_layers) {
++        cap_sum += c;
++    }
++    if (cap_sum < shape.n_layer) {
++        return {};
++    }
++
++    auto cost = [&](const std::vector<uint32_t> & n) {
++        const double td = common_split_predict_decode(shape, perf, n);
++        const double tp = common_split_predict_prefill(shape, perf, n, wl);
++        split_cost c;
++        switch (mode) {
++            case COMMON_SPLIT_BALANCE_DECODE:  c.primary = td; c.secondary = tp; break;
++            case COMMON_SPLIT_BALANCE_PREFILL: c.primary = tp; c.secondary = td; break;
++            default:                           c.primary = tp + wl.n_gen * td; c.secondary = td; break;
++        }
++        return c;
++    };
++    auto better = [](const split_cost & a, const split_cost & b) {
++        const double eps = 1e-9 * std::max(1.0, std::fabs(b.primary));
++        if (a.primary < b.primary - eps) {
++            return true;
++        }
++        return a.primary <= b.primary + eps && a.secondary < b.secondary;
++    };
++
++    std::vector<uint32_t> best;
++    split_cost best_cost;
++    std::vector<uint32_t> cur(nd, 0);
++
++    // exhaustive over all compositions of n_layer within the caps; this is small for the
++    // device counts a layer split is used with (65 candidates for 2 devices, ~2k for 3)
++    std::function<void(size_t, uint32_t)> search = [&](size_t i, uint32_t left) {
++        if (i + 1 == nd) {
++            if (left > max_layers[i]) {
++                return;
++            }
++            cur[i] = left;
++            const split_cost c = cost(cur);
++            if (best.empty() || better(c, best_cost)) {
++                best = cur;
++                best_cost = c;
++            }
++            return;
++        }
++        // the remaining devices must be able to take what this one leaves
++        uint64_t rest_cap = 0;
++        for (size_t j = i + 1; j < nd; j++) {
++            rest_cap += max_layers[j];
++        }
++        const uint32_t lo = rest_cap >= left ? 0 : (uint32_t) (left - rest_cap);
++        const uint32_t hi = std::min(left, max_layers[i]);
++        for (uint32_t n = lo; n <= hi; n++) {
++            cur[i] = n;
++            search(i + 1, left - n);
++        }
++    };
++
++    uint64_t n_candidates = 1;
++    for (size_t i = 1; i < nd; i++) {
++        n_candidates *= (uint64_t) shape.n_layer + 1;
++    }
++    if (n_candidates <= 4'000'000) {
++        search(0, shape.n_layer);
++        return best;
++    }
++
++    // many devices: start from a speed-proportional split and move single layers
++    // between devices while that improves the cost
++    std::vector<uint32_t> n(nd, 0);
++    {
++        double inv_sum = 0.0;
++        for (const auto & p : perf) {
++            inv_sum += 1.0 / std::max(1e-18, p.s_decode_byte);
++        }
++        uint32_t assigned = 0;
++        for (size_t i = 0; i < nd; i++) {
++            n[i] = std::min<uint32_t>(max_layers[i], (uint32_t) (shape.n_layer * (1.0 / std::max(1e-18, perf[i].s_decode_byte)) / inv_sum));
++            assigned += n[i];
++        }
++        for (size_t i = 0; assigned < shape.n_layer; i = (i + 1) % nd) {
++            if (n[i] < max_layers[i]) {
++                n[i]++;
++                assigned++;
++            }
++        }
++    }
++    split_cost c_n = cost(n);
++    for (bool improved = true; improved; ) {
++        improved = false;
++        for (size_t from = 0; from < nd; from++) {
++            for (size_t to = 0; to < nd; to++) {
++                if (from == to || n[from] == 0 || n[to] >= max_layers[to]) {
++                    continue;
++                }
++                n[from]--; n[to]++;
++                const split_cost c = cost(n);
++                if (better(c, c_n)) {
++                    c_n = c;
++                    improved = true;
++                } else {
++                    n[from]++; n[to]--;
++                }
++            }
++        }
++    }
++    return n;
++}
++
++//
++// calibration
++//
++
++static bool dev_is_remote(ggml_backend_dev_t dev) {
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
++}
++
++static std::string cache_key(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch) {
++    size_t free = 0;
++    size_t total = 0;
++    ggml_backend_dev_memory(dev, &free, &total);
++    std::ostringstream ss;
++    ss << ggml_backend_dev_name(dev) << "|" << ggml_backend_dev_description(dev) << "|" << (total >> 20) << "MiB|"
++       << n_embd << "x" << n_ff << "|" << ggml_type_name(wtype) << "|ub" << n_ubatch;
++    return ss.str();
++}
++
++// fills a quantized tensor with valid data by quantizing a few random rows and repeating them
++static void fill_weight(ggml_tensor * t) {
++    const int64_t n_per_row = t->ne[0];
++    const int64_t n_rows    = ggml_nrows(t);
++    const int64_t n_src     = std::min<int64_t>(16, n_rows);
++    std::vector<float> src(n_per_row * n_src);
++    uint32_t state = 12345;
++    for (auto & v : src) {
++        state = state * 1664525u + 1013904223u;
++        v = ((state >> 8) & 0xffff) / 65536.0f - 0.5f;
++    }
++    const size_t row_size = ggml_row_size(t->type, n_per_row);
++    std::vector<uint8_t> rows(row_size * n_src);
++    ggml_quantize_chunk(t->type, src.data(), rows.data(), 0, n_src, n_per_row, nullptr);
++    std::vector<uint8_t> data(ggml_nbytes(t));
++    for (int64_t r = 0; r < n_rows; r++) {
++        memcpy(data.data() + r * row_size, rows.data() + (r % n_src) * row_size, row_size);
++    }
++    ggml_backend_tensor_set(t, data.data(), 0, data.size());
++}
++
++static void fill_f32(ggml_tensor * t) {
++    std::vector<float> data(ggml_nelements(t));
++    for (size_t i = 0; i < data.size(); i++) {
++        data[i] = (float) (i % 17) * 0.05f - 0.4f;
++    }
++    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
++}
++
++// Reading a value back is what makes this wait for the result: for a remote (RPC) device,
++// graph_compute has no reply and synchronize only waits for the request to be sent.
++static void compute_and_wait(ggml_backend_t backend, ggml_cgraph * gf) {
++    ggml_backend_graph_compute(backend, gf);
++    ggml_backend_synchronize(backend);
++    float v;
++    ggml_backend_tensor_get(ggml_graph_node(gf, -1), &v, 0, sizeof(v));
++}
++
++static double time_graph(ggml_backend_t backend, ggml_cgraph * gf, int reps) {
++    compute_and_wait(backend, gf); // warmup, compiles pipelines
++    std::vector<double> t;
++    for (int r = 0; r < reps; r++) {
++        const int64_t t0 = ggml_time_us();
++        compute_and_wait(backend, gf);
++        t.push_back((ggml_time_us() - t0) * 1e-6);
++    }
++    std::nth_element(t.begin(), t.begin() + t.size() / 2, t.end());
++    return t[t.size() / 2];
++}
++
++static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
++                             common_split_device_perf & out) {
++    ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
++    if (!backend) {
++        return false;
++    }
++
++    // several distinct weights so the decode timing streams from memory instead of a cache
++    const int n_w = 3;
++    const int n_decode  = 12; // single-token matmuls per timed graph
++    const int n_prefill = 3;  // n_ubatch-token matmuls per timed graph
++
++    ggml_init_params params = {
++        /* .mem_size   = */ ggml_tensor_overhead() * (n_w + 2 + n_decode + n_prefill + 8) + 2 * ggml_graph_overhead(),
++        /* .mem_buffer = */ nullptr,
++        /* .no_alloc   = */ true,
++    };
++    ggml_context_ptr ctx { ggml_init(params) };
++    ggml_tensor * w[n_w];
++    for (auto & wi : w) {
++        wi = ggml_new_tensor_2d(ctx.get(), wtype, n_embd, n_ff);
++    }
++    ggml_tensor * x1 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, 1);
++    ggml_tensor * xb = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_ubatch);
++
++    ggml_cgraph * gd = ggml_new_graph(ctx.get());
++    for (int i = 0; i < n_decode; i++) {
++        ggml_build_forward_expand(gd, ggml_mul_mat(ctx.get(), w[i % n_w], x1));
++    }
++    ggml_cgraph * gp = ggml_new_graph(ctx.get());
++    for (int i = 0; i < n_prefill; i++) {
++        ggml_build_forward_expand(gp, ggml_mul_mat(ctx.get(), w[i % n_w], xb));
++    }
++    if (!ggml_backend_supports_op(backend.get(), ggml_graph_node(gd, 0)) ||
++        !ggml_backend_supports_op(backend.get(), ggml_graph_node(gp, 0))) {
++        return false;
++    }
++
++    // weights, inputs and every matmul result in one buffer; both graphs stay allocated
++    ggml_backend_buffer_ptr wbuf { ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()) };
++    if (!wbuf) {
++        return false;
++    }
++    for (auto * wi : w) {
++        fill_weight(wi);
++    }
++    fill_f32(x1);
++    fill_f32(xb);
++
++    // decode: bytes streamed per second
++    const double t_decode = time_graph(backend.get(), gd, 5);
++    out.s_decode_byte = t_decode / (double) (n_decode * ggml_nbytes(w[0]));
++
++    const double t_prefill = time_graph(backend.get(), gp, 3);
++    out.s_prefill_flop = t_prefill / (n_prefill * 2.0 * n_embd * n_ff * n_ubatch);
++
++    out.t_hop      = 0.0;
++    out.s_hop_byte = 0.0;
++    if (dev_is_remote(dev)) {
++        // round trip: small write + read back
++        float v = 1.0f;
++        std::vector<double> rt;
++        for (int i = 0; i < 20; i++) {
++            const int64_t t0 = ggml_time_us();
++            ggml_backend_tensor_set(x1, &v, 0, sizeof(v));
++            ggml_backend_tensor_get(x1, &v, 0, sizeof(v));
++            rt.push_back((ggml_time_us() - t0) * 1e-6);
++        }
++        std::nth_element(rt.begin(), rt.begin() + rt.size() / 2, rt.end());
++        out.t_hop = rt[rt.size() / 2] / 2.0;
++
++        // bandwidth: one ubatch of activations
++        std::vector<uint8_t> buf(ggml_nbytes(xb));
++        std::vector<double> bw;
++        for (int i = 0; i < 3; i++) {
++            const int64_t t0 = ggml_time_us();
++            ggml_backend_tensor_set(xb, buf.data(), 0, buf.size());
++            bw.push_back((ggml_time_us() - t0) * 1e-6);
++        }
++        std::nth_element(bw.begin(), bw.begin() + bw.size() / 2, bw.end());
++        out.s_hop_byte = std::max(0.0, bw[bw.size() / 2] - out.t_hop) / (double) buf.size();
++    }
++    return true;
++}
++
++std::vector<common_split_device_perf> common_split_balance_calibrate(
++        const std::vector<ggml_backend_dev_t> & devs,
++        int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
++        const std::string & cache_path, bool force) {
++    if (ggml_quantize_requires_imatrix(wtype)) {
++        wtype = GGML_TYPE_Q4_K; // timing only needs a similar type, not the exact one
++    }
++
++    common_json cache = common_json::object();
++    if (!cache_path.empty() && !force) {
++        std::ifstream f(cache_path);
++        if (f) {
++            std::stringstream ss;
++            ss << f.rdbuf();
++            cache = common_json::parse_no_throw(ss.str());
++            if (!cache.is_object()) {
++                cache = common_json::object();
++            }
++        }
++    }
++
++    std::vector<common_split_device_perf> perf(devs.size());
++    bool dirty = false;
++    for (size_t i = 0; i < devs.size(); i++) {
++        const std::string key = cache_key(devs[i], n_embd, n_ff, wtype, n_ubatch);
++        if (cache.contains(key)) {
++            try {
++                const common_json & e = cache.at(key);
++                perf[i].s_decode_byte  = e.at("s_decode_byte").get<double>();
++                perf[i].s_prefill_flop = e.at("s_prefill_flop").get<double>();
++                perf[i].t_hop          = e.at("t_hop").get<double>();
++                perf[i].s_hop_byte     = e.at("s_hop_byte").get<double>();
++                continue;
++            } catch (const std::exception &) {
++                // fall through and measure again
++            }
++        }
++        const int64_t t0 = ggml_time_us();
++        if (!calibrate_device(devs[i], n_embd, n_ff, wtype, n_ubatch, perf[i])) {
++            LOG_WRN("%s: could not calibrate %s, not balancing by speed\n", __func__, ggml_backend_dev_name(devs[i]));
++            return {};
++        }
++        LOG_INF("%s: calibrated %s in %.1f s\n", __func__, ggml_backend_dev_name(devs[i]), (ggml_time_us() - t0) * 1e-6);
++        cache[key] = common_json::object({
++            {"s_decode_byte",  perf[i].s_decode_byte},
++            {"s_prefill_flop", perf[i].s_prefill_flop},
++            {"t_hop",          perf[i].t_hop},
++            {"s_hop_byte",     perf[i].s_hop_byte},
++        });
++        dirty = true;
++    }
++
++    if (dirty && !cache_path.empty()) {
++        std::error_code ec;
++        std::filesystem::create_directories(std::filesystem::path(cache_path).parent_path(), ec);
++        const std::string tmp = cache_path + ".tmp";
++        std::ofstream f(tmp);
++        if (f) {
++            f << cache.dump(2);
++            f.close();
++            std::filesystem::rename(tmp, cache_path, ec);
++        }
++    }
++    return perf;
++}
++
++//
++// applying it at model load
++//
++
++struct model_layer_info {
++    common_split_model_shape shape;
++    int64_t   n_embd = 0;
++    int64_t   n_ff   = 0;
++    ggml_type wtype  = GGML_TYPE_COUNT;
++};
++
++// layer sizes, compute and the dominant FFN matmul shape from the GGUF metadata
++static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_info & info) {
++    ggml_context * meta = nullptr;
++    gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ &meta };
++    gguf_context * gctx = gguf_init_from_file(path, gp);
++    if (gctx == nullptr) {
++        return false;
++    }
++    ggml_context_ptr meta_ptr { meta };
++
++    std::string arch;
++    {
++        const int64_t kid = gguf_find_key(gctx, "general.architecture");
++        if (kid >= 0) {
++            arch = gguf_get_val_str(gctx, kid);
++        }
++    }
++    auto get_u32 = [&](const std::string & key, uint32_t def) {
++        const int64_t kid = gguf_find_key(gctx, (arch + "." + key).c_str());
++        if (kid < 0) {
++            return def;
++        }
++        switch (gguf_get_kv_type(gctx, kid)) {
++            case GGUF_TYPE_UINT32: return gguf_get_val_u32(gctx, kid);
++            case GGUF_TYPE_INT32:  return (uint32_t) gguf_get_val_i32(gctx, kid);
++            default:               return def;
++        }
++    };
++    const uint32_t n_expert      = get_u32("expert_count", 0);
++    const uint32_t n_expert_used = get_u32("expert_used_count", 0);
++    // a token only reads (and multiplies with) the experts it is routed to
++    const double expert_frac = n_expert > 0 && n_expert_used > 0 ? (double) n_expert_used / n_expert : 1.0;
++
++    double layer_bytes = 0.0;
++    double layer_flops = 0.0;
++    double output_bytes = 0.0;
++    double tok_embd_bytes = 0.0;
++    bool   has_output = false;
++
++    const int64_t n_tensors = gguf_get_n_tensors(gctx);
++    for (int64_t i = 0; i < n_tensors; i++) {
++        const std::string name = gguf_get_tensor_name(gctx, i);
++        const ggml_tensor * t = ggml_get_tensor(meta, name.c_str());
++        if (t == nullptr) {
++            continue;
++        }
++        const bool   is_expert = name.find("_exps") != std::string::npos;
++        const double frac      = is_expert ? expert_frac : 1.0;
++        if (name.rfind("blk.", 0) == 0) {
++            int il = -1;
++            if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0 || (uint32_t) il >= n_layer) {
++                continue; // e.g. nextn/MTP layers that are not part of the repeating split
++            }
++            layer_bytes += ggml_nbytes(t) * frac;
++            if (t->ne[1] > 1) {
++                layer_flops += 2.0 * ggml_nelements(t) * frac;
++            }
++            if (info.wtype == GGML_TYPE_COUNT && (name.find(".ffn_up.weight") != std::string::npos || name.find(".ffn_up_exps.weight") != std::string::npos)) {
++                info.n_embd = t->ne[0];
++                info.n_ff   = t->ne[1];
++                info.wtype  = t->type;
++            }
++        } else if (name == "output.weight") {
++            output_bytes = ggml_nbytes(t);
++            has_output = true;
++        } else if (name == "token_embd.weight") {
++            tok_embd_bytes = ggml_nbytes(t);
++        }
++    }
++    gguf_free(gctx);
++
++    if (info.wtype == GGML_TYPE_COUNT || n_layer == 0) {
++        return false;
++    }
++    info.shape.n_layer      = n_layer;
++    info.shape.layer_bytes  = layer_bytes / n_layer;
++    info.shape.layer_flops  = layer_flops / n_layer;
++    info.shape.act_bytes    = (double) info.n_embd * sizeof(float);
++    info.shape.output_bytes = has_output ? output_bytes : tok_embd_bytes; // tied embeddings
++    return true;
++}
++
++// layer counts -> tensor_split in the form common_fit_params uses: the output layer counts
++// as one extra layer on the last device
++static void set_split(float * tensor_split, const std::vector<uint32_t> & n) {
++    for (size_t i = 0; i < n.size(); i++) {
++        tensor_split[i] = (float) n[i] + (i + 1 == n.size() ? 1.0f : 0.0f);
++    }
++}
++
++void common_split_balance_apply(
++        common_params & params,
++        llama_model_params & mparams,
++        const llama_context_params & cparams,
++        const common_fit_extra_model * extra) {
++    const auto mode = (common_split_balance_mode) params.split_balance;
++    if (mode == COMMON_SPLIT_BALANCE_MEMORY) {
++        return;
++    }
++    if (mparams.split_mode != LLAMA_SPLIT_MODE_LAYER) {
++        return;
++    }
++    if (mparams.tensor_buft_overrides && mparams.tensor_buft_overrides->pattern) {
++        LOG_INF("%s: tensor overrides are in use (partial offload), keeping the memory split\n", __func__);
++        return;
++    }
++
++    const int64_t t_start = ggml_time_us();
++    const ggml_log_level lvl = GGML_LOG_LEVEL_ERROR;
++
++    // probe: an even split, measured with the model's real buffers
++    std::vector<ggml_backend_dev_t> devs;
++    uint32_t n_layer = 0;
++    float probe_split[128] = { 0 };
++    llama_model_params mp = mparams;
++    common_device_memory_data_vec mem;
++    try {
++        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
++    } catch (const std::exception & e) {
++        LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++        return;
++    }
++    const size_t nd = devs.size();
++    if (nd < 2) {
++        return;
++    }
++    if (mparams.n_gpu_layers >= 0 && (uint32_t) mparams.n_gpu_layers < n_layer + 1) {
++        LOG_INF("%s: model is only partially offloaded, keeping the memory split\n", __func__);
++        return;
++    }
++
++    model_layer_info info;
++    if (!read_model_layers(params.model.path.c_str(), n_layer, info)) {
++        LOG_WRN("%s: could not read the layer shapes, keeping the memory split\n", __func__);
++        return;
++    }
++
++    std::vector<uint32_t> probe(nd, n_layer / nd);
++    probe.back() += n_layer - (n_layer / nd) * nd;
++    set_split(probe_split, probe);
++    mp.tensor_split = probe_split;
++    try {
++        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
++    } catch (const std::exception & e) {
++        LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++        return;
++    }
++
++    // linear memory model per device: fixed (compute buffers, output layer) + per layer (weights, KV/state)
++    std::vector<double> fixed(nd), per_layer(nd), target(nd);
++    for (size_t i = 0; i < nd; i++) {
++        const bool   last  = i + 1 == nd;
++        const double out   = last ? info.shape.output_bytes : 0.0;
++        const double layer = std::max(0.0, (double) mem[i].model + mem[i].context - out);
++        per_layer[i] = probe[i] > 0 ? layer / probe[i] : info.shape.layer_bytes;
++        fixed[i]     = (double) mem[i].compute + out;
++        target[i]    = (double) mem[i].free - (double) params.fit_params_target[i];
++    }
++    auto caps_from_targets = [&]() {
++        std::vector<uint32_t> caps(nd);
++        for (size_t i = 0; i < nd; i++) {
++            const double room = target[i] - fixed[i];
++            caps[i] = room <= 0.0 ? 0 : (uint32_t) std::min<double>(n_layer, std::floor(room / std::max(1.0, per_layer[i])));
++        }
++        return caps;
++    };
++
++    const std::string cache_path = fs_get_cache_directory() + "split-balance.json";
++    const auto perf = common_split_balance_calibrate(devs, info.n_embd, info.n_ff, info.wtype,
++                                                      cparams.n_ubatch, cache_path, params.split_calibrate_force);
++    if (perf.size() != nd) {
++        return;
++    }
++
++    common_split_workload wl;
++    wl.n_prompt = params.split_workload_prompt;
++    wl.n_gen    = params.split_workload_gen;
++    wl.n_ubatch = cparams.n_ubatch;
++
++    // optimize, then check the choice against real buffer sizes; shrink the cap of any device
++    // that would overflow and try again
++    std::vector<uint32_t> n;
++    for (int attempt = 0; attempt < 5; attempt++) {
++        const auto caps = caps_from_targets();
++        n = common_split_balance_optimize(mode, info.shape, perf, caps, wl);
++        if (n.empty()) {
++            LOG_WRN("%s: no split fits the free memory of the devices, keeping the memory split\n", __func__);
++            return;
++        }
++        set_split(probe_split, n);
++        try {
++            mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
++        } catch (const std::exception & e) {
++            LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++            return;
++        }
++        bool fits = true;
++        for (size_t i = 0; i < nd; i++) {
++            const double used = (double) mem[i].model + mem[i].context + mem[i].compute;
++            if (used > target[i]) {
++                fits = false;
++                // fewer layers here next time: pretend the device is smaller by the overflow
++                target[i] -= used - target[i] + per_layer[i];
++            }
++        }
++        if (fits) {
++            break;
++        }
++        if (attempt == 4) {
++            LOG_WRN("%s: could not find a split that fits, keeping the memory split\n", __func__);
++            return;
++        }
++    }
++
++    // report: what was measured, what was chosen, and what the memory split would have done
++    std::vector<uint32_t> n_mem(nd, 0);
++    {
++        double free_sum = 0.0;
++        for (size_t i = 0; i < nd; i++) {
++            free_sum += (double) mem[i].free;
++        }
++        uint32_t assigned = 0;
++        for (size_t i = 0; i + 1 < nd; i++) {
++            n_mem[i] = (uint32_t) std::lround(n_layer * (double) mem[i].free / free_sum);
++            assigned += n_mem[i];
++        }
++        n_mem.back() = n_layer > assigned ? n_layer - assigned : 0;
++    }
++    LOG_INF("%s: device calibration (%s):\n", __func__, ggml_type_name(info.wtype));
++    for (size_t i = 0; i < nd; i++) {
++        LOG_INF("%s:   %-24s decode %7.1f GB/s  prefill %7.2f TFLOPS  hop %6.3f ms  layers %3u (memory split: %u)\n", __func__,
++                ggml_backend_dev_name(devs[i]), 1e-9 / perf[i].s_decode_byte, 1e-12 / perf[i].s_prefill_flop,
++                perf[i].t_hop * 1e3, n[i], n_mem[i]);
++    }
++    auto tps = [&](const std::vector<uint32_t> & x, double & pp, double & tg) {
++        tg = 1.0 / common_split_predict_decode(info.shape, perf, x);
++        pp = wl.n_prompt / common_split_predict_prefill(info.shape, perf, x, wl);
++    };
++    double pp_new, tg_new, pp_mem, tg_mem;
++    tps(n, pp_new, tg_new);
++    tps(n_mem, pp_mem, tg_mem);
++    LOG_INF("%s: --split-balance %s: predicted pp%u %.0f t/s, tg %.1f t/s (memory split: %.0f t/s, %.1f t/s), took %.1f s\n",
++            __func__, common_split_balance_mode_name(mode), wl.n_prompt, pp_new, tg_new, pp_mem, tg_mem,
++            (ggml_time_us() - t_start) * 1e-6);
++
++    set_split(params.tensor_split, n);
++    mparams.tensor_split = params.tensor_split;
++}
+diff --git a/common/split-balance.h b/common/split-balance.h
+new file mode 100644
+index 000000000..70927fe8d
+--- /dev/null
++++ b/common/split-balance.h
+@@ -0,0 +1,96 @@
++#pragma once
++
++// Speed-aware layer split across devices (--split-balance).
++//
++// A layer split runs the devices one after another for every token, so the
++// best split depends on the workload:
++//   - decode (one token at a time) only gets slower with every layer placed on
++//     a slower device, so the fastest devices should be filled first
++//   - prefill pipelines ubatches across the devices, so the stages should take
++//     about the same time, i.e. layers proportional to device speed
++// The default split (proportional to free memory) is neither, and on
++// heterogeneous devices it is the slowest of the three.
++
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++enum common_split_balance_mode {
++    COMMON_SPLIT_BALANCE_MEMORY  = 0, // split by free memory (llama.cpp default)
++    COMMON_SPLIT_BALANCE_DECODE  = 1, // minimize per-token decode time
++    COMMON_SPLIT_BALANCE_PREFILL = 2, // minimize pipelined prompt processing time
++    COMMON_SPLIT_BALANCE_AUTO    = 3, // minimize predicted time of a reference request
++};
++
++// measured speed of one device, see common_split_balance_calibrate
++struct common_split_device_perf {
++    double s_decode_byte   = 0.0; // seconds per weight byte in a single-token matmul (memory bound)
++    double s_prefill_flop  = 0.0; // seconds per flop in an n_ubatch-token matmul (compute bound)
++    double t_hop           = 0.0; // fixed seconds per hand-off into/out of this device (0 = local)
++    double s_hop_byte      = 0.0; // seconds per activation byte moved into/out of this device
++};
++
++// what the cost model needs to know about the model
++struct common_split_model_shape {
++    uint32_t n_layer       = 0;   // repeating layers
++    double   layer_bytes   = 0.0; // mean weight bytes of one repeating layer
++    double   layer_flops   = 0.0; // mean flops per token of one repeating layer
++    double   act_bytes     = 0.0; // bytes per token crossing a device boundary (n_embd floats)
++    double   output_bytes  = 0.0; // weight bytes of the output layer (always on the last device)
++};
++
++struct common_split_workload {
++    uint32_t n_prompt = 4096;
++    uint32_t n_gen    = 256;
++    uint32_t n_ubatch = 512;
++};
++
++// predicted seconds per decoded token / for processing n_prompt tokens, for
++// n_layers[i] repeating layers on device i (the output layer is always on the
++// last device)
++double common_split_predict_decode(
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & n_layers);
++
++double common_split_predict_prefill(
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & n_layers,
++        const common_split_workload & wl);
++
++// Best number of repeating layers per device for the mode, with at most
++// max_layers[i] on device i. Returns an empty vector for
++// COMMON_SPLIT_BALANCE_MEMORY or when the caps can't hold the model.
++std::vector<uint32_t> common_split_balance_optimize(
++        common_split_balance_mode mode,
++        const common_split_model_shape & shape,
++        const std::vector<common_split_device_perf> & perf,
++        const std::vector<uint32_t> & max_layers,
++        const common_split_workload & wl);
++
++// Times each device with synthetic matmuls shaped like the model's layers
++// (n_embd x n_ff weights of type wtype). Remote (RPC) devices are timed over
++// their normal protocol, so nothing changes on the worker. Results are cached
++// in cache_path (empty = no cache) keyed by device, shape and type.
++std::vector<common_split_device_perf> common_split_balance_calibrate(
++        const std::vector<ggml_backend_dev_t> & devs,
++        int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
++        const std::string & cache_path, bool force);
++
++const char * common_split_balance_mode_name(common_split_balance_mode mode);
++
++struct common_params;
++struct common_fit_extra_model;
++
++// Chooses the layer split for params.split_balance and writes it to params.tensor_split and
++// mparams (in the same form common_fit_params uses). Does nothing for the memory mode, a split
++// given by the user, a single device, or a partial offload.
++void common_split_balance_apply(
++        common_params & params,
++        llama_model_params & mparams,
++        const llama_context_params & cparams,
++        const common_fit_extra_model * extra);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 01fcf97cd..6582c4499 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -261,6 +261,7 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+ llama_build_and_test(test-json-schema.cpp)
+ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+ llama_build_and_test(test-chat-template.cpp)
++llama_build_and_test(test-split-balance.cpp)
+ # debug tool for chat template differential analysis (not registered as a test, run it manually)
+ llama_build(test-chat-analysis.cpp)
+ llama_build_and_test(test-log.cpp)
+diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
+new file mode 100644
+index 000000000..556cb7272
+--- /dev/null
++++ b/tests/test-split-balance.cpp
+@@ -0,0 +1,142 @@
++// Tests the --split-balance cost model and optimizer with synthetic device profiles.
++
++#include "split-balance.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++static int n_fail = 0;
++
++#define CHECK(cond, ...) do { if (!(cond)) { n_fail++; fprintf(stderr, "FAIL %s:%d: %s -- ", __FILE__, __LINE__, #cond); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++// shaped like Qwen3.8-27B Q4_K: 64 layers, ~250 MB and ~0.85 GFLOP per layer per token
++static common_split_model_shape qwen27b() {
++    common_split_model_shape s;
++    s.n_layer      = 64;
++    s.layer_bytes  = 250e6;
++    s.layer_flops  = 0.85e9;
++    s.act_bytes    = 5120 * 4;
++    s.output_bytes = 400e6;
++    return s;
++}
++
++// fast local GPU (~190 GB/s, ~15 TFLOPS) and a remote one ~2.6x slower to decode, ~3.7x slower to prefill
++static common_split_device_perf fast_gpu() {
++    common_split_device_perf p;
++    p.s_decode_byte  = 1.0 / 190e9;
++    p.s_prefill_flop = 1.0 / 15e12;
++    return p;
++}
++
++static common_split_device_perf slow_remote() {
++    common_split_device_perf p;
++    p.s_decode_byte  = 2.6 / 190e9;
++    p.s_prefill_flop = 3.7 / 15e12;
++    p.t_hop          = 150e-6;
++    p.s_hop_byte     = 1.0 / 2e9;
++    return p;
++}
++
++static std::vector<uint32_t> brute_force(common_split_balance_mode mode, const common_split_model_shape & shape,
++                                         const std::vector<common_split_device_perf> & perf,
++                                         const std::vector<uint32_t> & caps, const common_split_workload & wl) {
++    // reference for 3 devices
++    std::vector<uint32_t> best;
++    double best_c = INFINITY;
++    for (uint32_t a = 0; a <= shape.n_layer; a++) {
++        for (uint32_t b = 0; a + b <= shape.n_layer; b++) {
++            std::vector<uint32_t> n = { a, b, shape.n_layer - a - b };
++            if (n[0] > caps[0] || n[1] > caps[1] || n[2] > caps[2]) {
++                continue;
++            }
++            const double td = common_split_predict_decode(shape, perf, n);
++            const double tp = common_split_predict_prefill(shape, perf, n, wl);
++            const double c = mode == COMMON_SPLIT_BALANCE_DECODE ? td : mode == COMMON_SPLIT_BALANCE_PREFILL ? tp : tp + wl.n_gen * td;
++            if (c < best_c * (1 - 1e-9)) {
++                best_c = c;
++                best = n;
++            }
++        }
++    }
++    return best;
++}
++
++int main() {
++    const auto shape = qwen27b();
++    // device order as llama.cpp lists them: RPC first, then the local GPU
++    const std::vector<common_split_device_perf> perf = { slow_remote(), fast_gpu() };
++    common_split_workload wl;
++    wl.n_prompt = 8192;
++    wl.n_gen    = 0;
++    wl.n_ubatch = 512;
++
++    // memory mode leaves the split to llama.cpp
++    CHECK(common_split_balance_optimize(COMMON_SPLIT_BALANCE_MEMORY, shape, perf, { 64, 64 }, wl).empty(), "memory mode must not choose a split");
++
++    // decode: everything on the fast device when it fits
++    {
++        auto n = common_split_balance_optimize(COMMON_SPLIT_BALANCE_DECODE, shape, perf, { 64, 64 }, wl);
++        CHECK(n.size() == 2 && n[0] == 0 && n[1] == 64, "decode should avoid the slow device, got %u/%u", n[0], n[1]);
++    }
++    // decode: fast device capped -> only the overflow goes to the slow one
++    {
++        auto n = common_split_balance_optimize(COMMON_SPLIT_BALANCE_DECODE, shape, perf, { 64, 50 }, wl);
++        CHECK(n.size() == 2 && n[0] == 14 && n[1] == 50, "decode should fill the fast device to its cap, got %u/%u", n[0], n[1]);
++    }
++    // prefill: stages balanced, so the slow device gets ~1/(1+3.7) of the layers
++    {
++        auto n = common_split_balance_optimize(COMMON_SPLIT_BALANCE_PREFILL, shape, perf, { 64, 64 }, wl);
++        CHECK(n.size() == 2 && n[0] >= 10 && n[0] <= 15, "prefill should give the slow device ~13 layers, got %u/%u", n[0], n[1]);
++        // and it must predict faster prompt processing than either device alone
++        const double t_split = common_split_predict_prefill(shape, perf, n, wl);
++        const double t_fast  = common_split_predict_prefill(shape, perf, { 0, 64 }, wl);
++        CHECK(t_split < t_fast, "balanced prefill should beat the fast device alone (%.3f vs %.3f s)", t_split, t_fast);
++    }
++    // auto: decode-heavy request behaves like decode, prompt-heavy like prefill
++    {
++        common_split_workload chat = wl;
++        chat.n_prompt = 512;
++        chat.n_gen    = 1024;
++        auto n = common_split_balance_optimize(COMMON_SPLIT_BALANCE_AUTO, shape, perf, { 64, 64 }, chat);
++        CHECK(n.size() == 2 && n[0] == 0, "decode-heavy auto should keep layers off the slow device, got %u/%u", n[0], n[1]);
++
++        common_split_workload rag = wl;
++        rag.n_prompt = 32768;
++        rag.n_gen    = 16;
++        auto m = common_split_balance_optimize(COMMON_SPLIT_BALANCE_AUTO, shape, perf, { 64, 64 }, rag);
++        CHECK(m.size() == 2 && m[0] > 0, "prompt-heavy auto should use the slow device, got %u/%u", m[0], m[1]);
++    }
++    // infeasible caps -> no split
++    CHECK(common_split_balance_optimize(COMMON_SPLIT_BALANCE_AUTO, shape, perf, { 20, 20 }, wl).empty(), "caps below n_layer must fail");
++
++    // 3 devices: optimizer matches brute force in every mode, with and without caps
++    {
++        std::vector<common_split_device_perf> p3 = { slow_remote(), slow_remote(), fast_gpu() };
++        p3[1].s_decode_byte *= 0.7;
++        p3[1].s_prefill_flop *= 0.5;
++        for (auto mode : { COMMON_SPLIT_BALANCE_DECODE, COMMON_SPLIT_BALANCE_PREFILL, COMMON_SPLIT_BALANCE_AUTO }) {
++            for (const auto & caps : std::vector<std::vector<uint32_t>>{ { 64, 64, 64 }, { 30, 20, 30 } }) {
++                common_split_workload w3 = wl;
++                w3.n_gen = 64;
++                auto got = common_split_balance_optimize(mode, shape, p3, caps, w3);
++                auto ref = brute_force(mode, shape, p3, caps, w3);
++                const double c_got = common_split_predict_prefill(shape, p3, got, w3) + (mode == COMMON_SPLIT_BALANCE_PREFILL ? 0 : 1) * w3.n_gen * common_split_predict_decode(shape, p3, got);
++                const double c_ref = common_split_predict_prefill(shape, p3, ref, w3) + (mode == COMMON_SPLIT_BALANCE_PREFILL ? 0 : 1) * w3.n_gen * common_split_predict_decode(shape, p3, ref);
++                if (mode == COMMON_SPLIT_BALANCE_DECODE) {
++                    CHECK(std::fabs(common_split_predict_decode(shape, p3, got) - common_split_predict_decode(shape, p3, ref)) < 1e-12,
++                          "decode mode not optimal for 3 devices");
++                } else {
++                    CHECK(c_got <= c_ref * (1 + 1e-9), "%s mode not optimal for 3 devices (%.6f vs %.6f)", common_split_balance_mode_name(mode), c_got, c_ref);
++                }
++                CHECK(got.size() == 3 && got[0] <= caps[0] && got[1] <= caps[1] && got[2] <= caps[2], "caps violated");
++            }
++        }
++    }
++
++    if (n_fail == 0) {
++        printf("test-split-balance: OK\n");
++    }
++    return n_fail == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+
