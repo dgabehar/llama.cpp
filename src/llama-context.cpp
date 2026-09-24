@@ -686,6 +686,30 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+bool llama_context::graph_reserve_worst_pp(const llama_memory_context_i * mctx) {
+    const uint32_t n_seqs       = cparams.n_seq_max;
+    const uint32_t n_tokens     = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    // TODO: the worst case graph is not always reached for `n_seqs > 1`
+    //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+    ggml_cgraph * gf = nullptr;
+    switch (model.arch) {
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_MINIMAX_01:
+            // [TAG_RESERVE_DIAG_DECAY]
+            // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+            // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+            gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx, model.hparams.no_alloc);
+            break;
+        default:
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx, model.hparams.no_alloc);
+    };
+
+    sched_plan_worst_pp = gf != nullptr;
+    return gf != nullptr;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -779,25 +803,8 @@ void llama_context::sched_reserve() {
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-    {
-        // TODO: the worst case graph is not always reached for `n_seqs > 1`
-        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
-        switch (model.arch) {
-            case LLM_ARCH_KIMI_LINEAR:
-            case LLM_ARCH_MINIMAX_01:
-                // [TAG_RESERVE_DIAG_DECAY]
-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-                break;
-            default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-        };
-
-        if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
-        }
+    if (!graph_reserve_worst_pp(mctx.get())) {
+        throw std::runtime_error("failed to allocate compute pp buffers");
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1486,6 +1493,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        // Small graphs are placed differently by the scheduler (ops move between backends
+        // below the offload batch size) and replace the worst-case allocation plan. A large
+        // graph allocated after that gets a plan sized for itself, so every later ubatch
+        // with a bigger KV view reallocates, which synchronizes all backends and stops
+        // pipeline parallelism. Restore the worst-case plan first instead.
+        constexpr uint32_t n_tokens_large = 32; // default op offload batch size of the GPU backends
+        if (cparams.pipeline_parallel && memory && !model.hparams.no_alloc) {
+            if (ubatch.n_tokens < n_tokens_large) {
+                sched_plan_worst_pp = false;
+            } else if (!sched_plan_worst_pp) {
+                // the full-memory context is a placeholder for sizing and leaves the cache untouched
+                auto mctx_full = memory->init_full();
+                if (mctx_full) {
+                    graph_reserve_worst_pp(mctx_full.get());
+                }
+            }
+        }
+
         gf_res_prev_active = nullptr;
         res->reset();
 
