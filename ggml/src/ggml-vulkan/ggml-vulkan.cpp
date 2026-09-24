@@ -14814,6 +14814,31 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
+// Host RAM the kernel could hand out now (MemAvailable), or SIZE_MAX if unknown.
+// The GTT budget of an integrated GPU only counts GPU allocations, not the host
+// memory that other processes already hold, so on its own it over-reports free.
+static size_t ggml_vk_host_mem_available() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        unsigned long long kb = 0;
+        bool found = false;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                found = true;
+                break;
+            }
+        }
+        fclose(f);
+        if (found) {
+            return (size_t) kb * 1024;
+        }
+    }
+#endif
+    return SIZE_MAX;
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
@@ -14832,19 +14857,28 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     *total = 0;
     *free = 0;
 
+    size_t host_free = 0; // free in heaps backed by host RAM (integrated GPUs)
+
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
 
         if (is_integrated_gpu || (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
             *total += heap.size;
 
+            size_t heap_free = heap.size;
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                heap_free = budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+            }
+            if (is_integrated_gpu && !(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+                host_free += heap_free;
             } else {
-                *free += heap.size;
+                *free += heap_free;
             }
         }
     }
+    // a carved-out device-local heap is separate from host RAM; the host heap cannot
+    // hand out more than the host has available
+    *free += std::min(host_free, ggml_vk_host_mem_available());
 }
 
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
