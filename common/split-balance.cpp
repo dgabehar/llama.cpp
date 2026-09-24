@@ -1,4 +1,5 @@
 #include "split-balance.h"
+#include "build-info.h"
 
 #include "common.h"
 #include "fit.h"
@@ -11,6 +12,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -234,8 +236,10 @@ static std::string cache_key(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_f
     size_t total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
     std::ostringstream ss;
+    // the build is part of the key: kernels change between builds (the remote worker's build is not visible
+    // from here, driver/kernel upgrades neither, hence also the age limit on entries)
     ss << ggml_backend_dev_name(dev) << "|" << ggml_backend_dev_description(dev) << "|" << (total >> 20) << "MiB|"
-       << n_embd << "x" << n_ff << "|" << ggml_type_name(wtype) << "|ub" << n_ubatch;
+       << n_embd << "x" << n_ff << "|" << ggml_type_name(wtype) << "|ub" << n_ubatch << "|" << llama_commit();
     return ss.str();
 }
 
@@ -395,6 +399,11 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         }
     }
 
+    // measurements older than this are taken again (driver, firmware or worker updates, thermal changes)
+    constexpr int64_t max_age_s = 7 * 24 * 3600;
+    const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
     std::vector<common_split_device_perf> perf(devs.size());
     bool dirty = false;
     for (size_t i = 0; i < devs.size(); i++) {
@@ -402,6 +411,10 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         if (cache.contains(key)) {
             try {
                 const common_json & e = cache.at(key);
+                const int64_t t_meas = e.value("measured_at", (int64_t) 0);
+                if (now_s - t_meas > max_age_s || t_meas > now_s) {
+                    throw std::runtime_error("stale");
+                }
                 perf[i].s_decode_byte  = e.at("s_decode_byte").get<double>();
                 perf[i].s_prefill_flop = e.at("s_prefill_flop").get<double>();
                 perf[i].t_hop          = e.at("t_hop").get<double>();
@@ -422,6 +435,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             {"s_prefill_flop", perf[i].s_prefill_flop},
             {"t_hop",          perf[i].t_hop},
             {"s_hop_byte",     perf[i].s_hop_byte},
+            {"measured_at",    now_s},
         });
         dirty = true;
     }
