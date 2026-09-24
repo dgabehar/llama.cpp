@@ -14857,7 +14857,18 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     *total = 0;
     *free = 0;
 
-    size_t host_free = 0; // free in heaps backed by host RAM (integrated GPUs)
+    // On an integrated GPU the largest heap is the one backed by host RAM (GTT). Drivers flag it
+    // device-local or not depending on the carve-out size, so it is found by size. A carved-out
+    // VRAM heap is separate from host RAM and is not capped.
+    uint32_t host_heap = UINT32_MAX;
+    if (is_integrated_gpu) {
+        for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
+            if (host_heap == UINT32_MAX ||
+                memprops.memoryProperties.memoryHeaps[i].size > memprops.memoryProperties.memoryHeaps[host_heap].size) {
+                host_heap = i;
+            }
+        }
+    }
 
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
@@ -14869,16 +14880,13 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
                 heap_free = budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
             }
-            if (is_integrated_gpu && !(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
-                host_free += heap_free;
-            } else {
-                *free += heap_free;
+            if (i == host_heap) {
+                // the budget only counts GPU allocations, not what other processes hold
+                heap_free = std::min(heap_free, ggml_vk_host_mem_available());
             }
+            *free += heap_free;
         }
     }
-    // a carved-out device-local heap is separate from host RAM; the host heap cannot
-    // hand out more than the host has available
-    *free += std::min(host_free, ggml_vk_host_mem_available());
 }
 
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
