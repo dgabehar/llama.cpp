@@ -256,12 +256,44 @@ Patches (see `fleet-patches/README.md`):
 | before: memory split, old binary | 23 | 164* | | 7.2 |
 | `--split-balance memory` (new binary) | 23 | 175 | 185 | 6.8 |
 | `auto` (default, 4096:256) | 0 | 309 | 294 | 12.0 |
-| `auto`, `--split-workload 32768:16 -b 8192` | 13 | 261 | 312 | 7.8 |
+| `auto`, `--split-workload 32768:16 -b 8192` (570db1ff4 only) | 13 | 261 | 312 | 7.8 |
 | fit-limited (`-fitt 1024,100000`), `memory` | 23 | 172 | 184 | 6.8 |
 | fit-limited, `auto` | 21 | 172 | 199 | 7.0 |
 
 \* at 20/80, the earlier measurement. The same split with the capture and
 scheduler fixes: 262.
+
+The 32768:16 row is from 570db1ff4. From d7cd53de7 on (dominant-type and
+n_batch-drain cost model), `auto` keeps that workload on gabesrv10 too.
+
+**Before/after, measured by QA (2026-09-24, image d963996 vs b5f1d1bd,
+llama-server, median of 3, drift 3%):**
+
+| config | pp 1.9K | pp 8.1K | tg |
+|---|---|---|---|
+| production today: old image, memory split (23 on 06), submit env on | 138.6 | 141.5 | 6.7 |
+| new image, `memory` split, capture on | 180.0 | 186.5 | 7.1 |
+| old image, 20/80 | 170 | 183 | 7.9 |
+| new image, 20/80 | 265 | 305 | 8.4 |
+| new image, `auto` (0 on 06) | 352 | 335 | 12.2 |
+| gabesrv10 alone, old image | 284 | 317 | |
+| gabesrv10 alone, new image | 347 | 330 | |
+
+**Using it in the chart:**
+
+- A master that reaches a worker over the Thunderbolt link must run with
+  `hostNetwork`. From the pod network, packets forwarded from `tb-*`
+  (MTU 65520, GRO) into the Calico veth (MTU 1450) are fragmented and dropped
+  (16% retransmits, pp 2.7 t/s).
+- `-ncmoe`/`-ot` patterns that match no tensor of the model (the chart's
+  `nCpuMoe` default on a dense model) don't disable balancing. Patterns that
+  do match keep the memory split.
+
+**rpc-server admission:** a connection takes a `--max-clients` slot only
+once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
+slot. At most 64 connections wait for their HELLO; the oldest is closed to
+make room. A client refused at the cap gets an all-zero HELLO version and
+reports "all of its client slots are in use".
 
 So for a model that fits on one node, `auto` keeps it there. RPC helps
 throughput only for long-prompt workloads, and only over Thunderbolt:
