@@ -387,8 +387,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_f
 }
 
 // A short decode timing (a fraction of the full calibration) used to notice that the device behind
-// a cached entry has changed. For RPC devices the cache key only knows the endpoint, so a worker
-// with other hardware, driver or build behind the same address would otherwise reuse stale speeds.
+// a cached entry has changed or was measured under load. For RPC devices the cache key only knows
+// the endpoint, so a worker with other hardware, driver or build behind the same address would
+// otherwise reuse stale speeds.
 static bool quick_check(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, double & s_byte) {
     ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
     if (!backend) {
@@ -473,7 +474,9 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
                 if (!perf_valid(perf[i])) {
                     throw std::runtime_error("invalid");
                 }
-                if (dev_is_remote(devs[i])) {
+                {
+                    // every entry is re-checked: an RPC key cannot see the hardware behind the endpoint, and a
+                    // local measurement may have been taken while something else loaded the device
                     const double s_ref = e.at("s_check_byte").get<double>();
                     double s_now = 0.0;
                     if (!(s_ref > 0.0) || !quick_check(devs[i], n_embd, n_ff, wtype, s_now)) {
@@ -502,7 +505,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             return {};
         }
         double s_check = 0.0;
-        if (dev_is_remote(devs[i]) && !quick_check(devs[i], n_embd, n_ff, wtype, s_check)) {
+        if (!quick_check(devs[i], n_embd, n_ff, wtype, s_check)) {
             s_check = 0.0;
         }
         LOG_INF("%s: calibrated %s in %.1f s\n", __func__, ggml_backend_dev_name(devs[i]), (ggml_time_us() - t0) * 1e-6);

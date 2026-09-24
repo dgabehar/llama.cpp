@@ -93,7 +93,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0075 | `980ea324a` | split-balance: ignore overrides that match nothing, validate and re-check the cache, calibrated overheads |
 | 0076 | `8b92aab27` | server: only an explicit off value disables LLAMA_SERVER_CKPT_CAPTURE |
 | 0077 | `46568f521` | rpc: take a client slot at HELLO, bound the handshake, report a full server |
-| 0079 | (this commit) | rpc: say that the connection to the server was lost when a request fails |
+| 0079 | `b32f04a9b` | rpc: say that the connection to the server was lost when a request fails |
+| 0080 | `c3705709a` | vulkan: on integrated GPUs, cap the free memory of host heaps at MemAvailable |
+| 0081 | (this commit) | split-balance: re-check local devices' cached timings too |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
