@@ -190,6 +190,30 @@ static int mode_hello(const std::string & ep) {
     return ok ? 0 : 1;
 }
 
+// probe-hello EP N: N times, connect+close (a TCP health probe) and immediately
+// connect again and HELLO; the probe must not hold a slot against the client
+static int mode_probe_hello(const std::string & ep, int n) {
+    for (int i = 0; i < n; i++) {
+        int probe = connect_to(ep);
+        if (probe < 0) {
+            printf("probe-hello: probe connect FAILED\n");
+            return 1;
+        }
+        close(probe);
+        int fd = connect_to(ep);
+        bool ok = fd >= 0 && hello(fd);
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (!ok) {
+            printf("probe-hello: client rejected right after probe %d\n", i);
+            return 1;
+        }
+    }
+    printf("probe-hello: %d ok\n", n);
+    return 0;
+}
+
 // rejected EP: the server must accept and then immediately close the connection
 static int mode_rejected(const std::string & ep) {
     int fd = connect_to(ep);
@@ -345,6 +369,7 @@ int main(int argc, char ** argv) {
     auto arg = [&](int i, double def) { return argc > i ? std::atof(argv[i]) : def; };
 
     if (mode == "hello")          { g_timeout_ms = (int) arg(3, 1000); return mode_hello(ep); }
+    if (mode == "probe-hello")    { g_timeout_ms = 2000; return mode_probe_hello(ep, (int) arg(3, 20)); }
     if (mode == "rejected")       { return mode_rejected(ep); }
     if (mode == "hold")           { return mode_hold(ep, arg(3, 2.0)); }
     if (mode == "malformed")      { return mode_malformed(ep); }

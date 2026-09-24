@@ -99,6 +99,11 @@ sleep 0.5
 "$client" rejected "$ep" || fail "client over the cap was not rejected"
 wait "$h1" || fail "held client 1 broken by rejected client"
 wait "$h2" || fail "held client 2 broken by rejected client"
+# a probe that just closed must not hold a slot against the next real client
+"$client" hold "$ep" 2 >/dev/null & h1=$!
+sleep 0.3
+"$client" probe-hello "$ep" 50 || fail "client rejected right after a probe closed (slot not reaped)"
+wait "$h1" || fail "held client broken by probes"
 sleep 0.2
 "$client" hello "$ep" 1000 || fail "slot not freed after clients left"
 grep -q "Rejected client" "$test_dir/server.log" || fail "no rejection logged"
