@@ -502,6 +502,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         if (idxs.size() >= n_ubatch) {
             break;
         }
+
+        if (is_split_after(idxs.back())) {
+            break;
+        }
     }
 
     return ubatch_add(idxs, idxs.size(), false);
@@ -586,6 +590,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             break;
         }
 
+        bool split_after_cur = false;
+
         for (uint32_t s = 0; s < n_seqs; ++s) {
             const int32_t idx = seq_set_map[cur_seq_set[s]][cur_idx[s]];
 
@@ -595,9 +601,15 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             ++n_used;
 
             ++cur_idx[s];
+
+            split_after_cur = split_after_cur || is_split_after(idx);
         }
 
         if  ((idxs_per_seq[0].size() + 1)*n_seqs > n_ubatch) {
+            break;
+        }
+
+        if (split_after_cur) {
             break;
         }
     }
@@ -609,6 +621,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
+            // a seq that stops at a split-after point is treated as finishing here (the tokens after it are
+            // prompt tokens that are never rolled back into, see llama_state_seq_capture_add)
+            if (!idxs_per_seq[s].empty() && is_split_after(idxs_per_seq[s].back())) {
+                return (uint32_t) 0;
+            }
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };
 
@@ -706,6 +723,10 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
             break;
         }
 
+        if (is_split_after(cur_idx)) {
+            break;
+        }
+
         do {
             ++cur_idx;
         } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx])));
@@ -720,8 +741,29 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
+void llama_batch_allocr::set_split_after(std::vector<std::pair<llama_seq_id, llama_pos>> split_after) {
+    this->split_after = std::move(split_after);
+}
+
+bool llama_batch_allocr::is_split_after(int32_t idx) const {
+    for (const auto & [s, p] : split_after) {
+        if (batch.pos[idx] != p) {
+            continue;
+        }
+        for (int32_t i = 0; i < batch.n_seq_id[idx]; ++i) {
+            if (batch.seq_id[idx][i] == s) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+
+    split_after.clear();
 
     batch = {};
 

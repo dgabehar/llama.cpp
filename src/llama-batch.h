@@ -110,12 +110,20 @@ public:
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // end a ubatch right after the token of seq_id at pos, for each (seq_id, pos) given
+    // (used to capture the memory state at that point, see llama_state_seq_capture_add)
+    // reset by init()
+    void set_split_after(std::vector<std::pair<llama_seq_id, llama_pos>> split_after);
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
 private:
     void clear();
+
+    // true if a ubatch has to end after the token at batch index idx
+    bool is_split_after(int32_t idx) const;
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
@@ -145,6 +153,8 @@ private:
     std::vector<llama_seq_id>   seq_id_unq;
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> split_after;
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

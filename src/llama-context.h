@@ -157,6 +157,10 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    bool   state_seq_capture_add  (llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags);
+    size_t state_seq_capture_get  (llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max);
+    void   state_seq_capture_clear();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -392,6 +396,40 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // state captures taken inside decode(), see llama_state_seq_capture_add
+    struct state_capture {
+        llama_seq_id          seq_id;
+        llama_pos             pos;
+        llama_state_seq_flags flags;
+
+        bool      taken   = false;
+        bool      read    = false; // device copies have been read into data
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+
+        std::vector<uint8_t> data;
+
+        // on-device copies of the tensor ranges, read into data at dst on first access
+        struct range {
+            ggml_tensor * cpy;
+            size_t        dst;
+            size_t        size;
+        };
+        std::vector<range> ranges;
+
+        std::vector<ggml_context_ptr>        ctxs;
+        std::vector<ggml_backend_buffer_ptr> bufs;
+    };
+
+    std::vector<state_capture> state_captures;
+
+    // buffers of cleared captures, reused by later ones
+    std::vector<ggml_backend_buffer_ptr> state_capture_pool;
+
+    // take the captures whose token is in the ubatch just processed (again, if the seq was rolled back and
+    // processed again, so the last pass wins)
+    void state_captures_take(const llama_ubatch & ubatch);
 
     bool has_evaluated_once = false;
 

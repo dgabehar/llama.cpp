@@ -1903,6 +1903,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    if (!state_captures.empty()) {
+        std::vector<std::pair<llama_seq_id, llama_pos>> split_after;
+        for (const auto & cap : state_captures) {
+            split_after.emplace_back(cap.seq_id, cap.pos);
+        }
+        balloc->set_split_after(std::move(split_after));
+    }
+
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -2135,6 +2143,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        if (!state_captures.empty()) {
+            state_captures_take(ubatch);
+        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3309,6 +3321,325 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+// records the host part of a sequence state and the tensor ranges it references
+class llama_io_write_capture : public llama_io_write_i {
+public:
+    struct range {
+        ggml_tensor * tensor;
+        size_t        offset;
+        size_t        size;
+        size_t        dst; // offset in data
+    };
+
+    explicit llama_io_write_capture(std::vector<uint8_t> & data) : data(data) {}
+
+    void write(const void * src, size_t size) override {
+        const size_t n = data.size();
+        data.resize(n + size);
+        memcpy(data.data() + n, src, size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ranges.push_back({ tensor, offset, size, data.size() });
+        data.resize(data.size() + size);
+    }
+
+    size_t n_bytes() override {
+        return data.size();
+    }
+
+    std::vector<range> ranges;
+
+private:
+    std::vector<uint8_t> & data;
+};
+
+// a range of a state tensor can be copied on the device if it is made of whole blocks
+static bool state_capture_range_ok(const ggml_tensor * tensor, size_t offset, size_t size) {
+    const size_t ts = ggml_type_size(tensor->type);
+    return tensor->buffer != nullptr && size % ts == 0 && offset % ts == 0;
+}
+
+// the most tensor ranges a capture copies (a transposed V cache writes one per element row)
+static constexpr size_t state_capture_max_ranges = 4096;
+
+bool llama_context::state_seq_capture_add(llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags) {
+    if (!memory || (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        return false;
+    }
+
+    // check that the current layout of the state can be captured
+    {
+        std::vector<uint8_t> data;
+        llama_io_write_capture io(data);
+        try {
+            memory->state_write(io, seq_id, flags);
+        } catch (const std::exception &) {
+            return false;
+        }
+        if (io.ranges.size() > state_capture_max_ranges) {
+            return false;
+        }
+        for (const auto & r : io.ranges) {
+            if (!state_capture_range_ok(r.tensor, r.offset, r.size)) {
+                return false;
+            }
+        }
+    }
+
+    for (const auto & cap : state_captures) {
+        if (cap.seq_id == seq_id && cap.pos == pos) {
+            return true;
+        }
+    }
+
+    state_capture cap;
+    cap.seq_id = seq_id;
+    cap.pos    = pos;
+    cap.flags  = flags;
+
+    state_captures.push_back(std::move(cap));
+
+    return true;
+}
+
+void llama_context::state_captures_take(const llama_ubatch & ubatch) {
+    for (auto & cap : state_captures) {
+        bool in_ubatch = false;
+        for (uint32_t i = 0; i < ubatch.n_tokens && !in_ubatch; ++i) {
+            if (ubatch.pos[i] != cap.pos) {
+                continue;
+            }
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                if (ubatch.seq_id[i][j] == cap.seq_id) {
+                    in_ubatch = true;
+                    break;
+                }
+            }
+        }
+
+        if (!in_ubatch || memory->seq_pos_max(cap.seq_id) != cap.pos) {
+            continue;
+        }
+
+        // retaking: the buffers are reused, the copies into them are ordered after the earlier ones
+        for (auto & buf : cap.bufs) {
+            state_capture_pool.push_back(std::move(buf));
+        }
+        cap.bufs.clear();
+        cap.ctxs.clear();
+        cap.ranges.clear();
+        cap.taken = false;
+        cap.read  = false;
+
+        cap.data.clear();
+
+        llama_io_write_capture io(cap.data);
+
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&cap.seq_id, sizeof(cap.seq_id));
+
+            memory->state_write(io, cap.seq_id, cap.flags);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_WARN("%s: failed to capture the state of seq %d at pos %d: %s\n", __func__, cap.seq_id, cap.pos, err.what());
+            continue;
+        }
+
+        // copy the tensor ranges into one buffer per buffer type, on the backend that owns it, so that the copies
+        // are queued after this ubatch and before the next one
+        std::map<ggml_backend_buffer_type_t, std::vector<size_t>> groups;
+        for (size_t i = 0; i < io.ranges.size(); ++i) {
+            if (io.ranges[i].size > 0) {
+                groups[ggml_backend_buffer_get_type(io.ranges[i].tensor->buffer)].push_back(i);
+            }
+        }
+
+        bool ok = true;
+
+        for (const auto & [buft, idxs] : groups) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ 2*idxs.size()*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context_ptr ctx_cpy(ggml_init(params));
+
+            const size_t align = ggml_backend_buft_get_alignment(buft);
+
+            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs; // (org, cpy)
+            size_t size_buf = 0;
+
+            for (const size_t i : idxs) {
+                const auto & r = io.ranges[i];
+
+                if (!state_capture_range_ok(r.tensor, r.offset, r.size) || io.ranges.size() > state_capture_max_ranges) {
+                    ok = false;
+                    break;
+                }
+
+                const int64_t n = (int64_t) (r.size/ggml_type_size(r.tensor->type))*ggml_blck_size(r.tensor->type);
+
+                ggml_tensor * org = ggml_view_1d      (ctx_cpy.get(), r.tensor, n, r.offset);
+                ggml_tensor * cpy = ggml_new_tensor_1d(ctx_cpy.get(), r.tensor->type, n);
+
+                pairs.emplace_back(org, cpy);
+                size_buf += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, cpy), align);
+            }
+
+            if (!ok) {
+                break;
+            }
+
+            ggml_backend_buffer_ptr buf;
+            for (auto it = state_capture_pool.begin(); it != state_capture_pool.end(); ++it) {
+                if (ggml_backend_buffer_get_type(it->get()) == buft && ggml_backend_buffer_get_size(it->get()) >= size_buf) {
+                    buf = std::move(*it);
+                    state_capture_pool.erase(it);
+                    break;
+                }
+            }
+            if (!buf) {
+                buf.reset(ggml_backend_buft_alloc_buffer(buft, size_buf));
+                if (!buf) {
+                    ok = false;
+                    break;
+                }
+                LLAMA_LOG_DEBUG("%s: allocated '%s' capture buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), size_buf/1024.0/1024.0);
+            }
+
+            ggml_backend_t backend = nullptr;
+            {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                for (const auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == dev) {
+                        backend = b.get();
+                        break;
+                    }
+                }
+            }
+
+            ggml_tallocr talloc = ggml_tallocr_new(buf.get());
+
+            for (size_t j = 0; j < pairs.size(); ++j) {
+                auto [org, cpy] = pairs[j];
+
+                ggml_backend_view_init(org);
+                if (ggml_tallocr_alloc(&talloc, cpy) != GGML_STATUS_SUCCESS) {
+                    ok = false;
+                    break;
+                }
+
+                if (backend) {
+                    ggml_backend_tensor_copy_async(backend, backend, org, cpy);
+                } else {
+                    synchronize();
+                    ggml_backend_tensor_copy(org, cpy);
+                }
+
+                const auto & r = io.ranges[idxs[j]];
+                cap.ranges.push_back({ cpy, r.dst, r.size });
+            }
+
+            cap.ctxs.push_back(std::move(ctx_cpy));
+            cap.bufs.push_back(std::move(buf));
+
+            if (!ok) {
+                break;
+            }
+        }
+
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: cannot capture the state of seq %d on the device\n", __func__, cap.seq_id);
+
+            for (auto & buf : cap.bufs) {
+                state_capture_pool.push_back(std::move(buf));
+            }
+            cap.bufs.clear();
+            cap.ctxs.clear();
+            cap.ranges.clear();
+            cap.data.clear();
+            continue;
+        }
+
+        cap.taken   = true;
+        cap.pos_min = memory->seq_pos_min(cap.seq_id);
+        cap.pos_max = memory->seq_pos_max(cap.seq_id);
+    }
+}
+
+size_t llama_context::state_seq_capture_get(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) {
+    for (auto & cap : state_captures) {
+        if (cap.seq_id != seq_id || cap.pos != pos) {
+            continue;
+        }
+
+        if (!cap.taken) {
+            return 0;
+        }
+
+        if (!cap.read) {
+            synchronize();
+
+            for (const auto & r : cap.ranges) {
+                ggml_backend_tensor_get(r.cpy, cap.data.data() + r.dst, 0, r.size);
+            }
+
+            for (auto & buf : cap.bufs) {
+                state_capture_pool.push_back(std::move(buf));
+            }
+            cap.bufs.clear();
+            cap.ctxs.clear();
+            cap.ranges.clear();
+
+            cap.read = true;
+        }
+
+        if (pos_min) {
+            *pos_min = cap.pos_min;
+        }
+        if (pos_max) {
+            *pos_max = cap.pos_max;
+        }
+
+        if (dst) {
+            if (size < cap.data.size()) {
+                LLAMA_LOG_ERROR("%s: buffer too small for the capture (%zu < %zu)\n", __func__, size, cap.data.size());
+                return 0;
+            }
+            memcpy(dst, cap.data.data(), cap.data.size());
+        }
+
+        return cap.data.size();
+    }
+
+    return 0;
+}
+
+void llama_context::state_seq_capture_clear() {
+    bool in_flight = false;
+
+    for (auto & cap : state_captures) {
+        in_flight = in_flight || !cap.bufs.empty();
+
+        for (auto & buf : cap.bufs) {
+            state_capture_pool.push_back(std::move(buf));
+        }
+    }
+
+    state_captures.clear();
+
+    // a reused buffer is only written after the copies queued before it, but freeing one needs them done
+    constexpr size_t n_pool_max = 8;
+    if (state_capture_pool.size() > n_pool_max) {
+        if (in_flight) {
+            synchronize();
+        }
+        state_capture_pool.erase(state_capture_pool.begin(), state_capture_pool.end() - n_pool_max);
+    }
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -4384,6 +4715,18 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+bool llama_state_seq_capture_add(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags) {
+    return ctx->state_seq_capture_add(seq_id, pos, flags);
+}
+
+size_t llama_state_seq_capture_get(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) {
+    return ctx->state_seq_capture_get(seq_id, pos, dst, size, pos_min, pos_max);
+}
+
+void llama_state_seq_capture_clear(llama_context * ctx) {
+    ctx->state_seq_capture_clear();
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
