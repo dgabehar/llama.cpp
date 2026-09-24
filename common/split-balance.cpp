@@ -82,9 +82,13 @@ double common_split_predict_prefill(
     }
     // per call: with a single ubatch nothing overlaps; the fill term covers that exactly
     // (the last, shorter ubatch of a call is counted as a full one)
+    // the stages don't overlap perfectly (host-side copies between them, submission stalls): measured on
+    // an 8060S + 780M (RPC) split, about 80% of the shorter stages' time is hidden
+    constexpr double overlap = 0.8;
+    const double t_steady = t_stage_max + (1.0 - overlap) * (t_stage_sum - t_stage_max);
     auto t_call = [&](uint32_t n_tokens) {
         const uint32_t n_ub = (n_tokens + ub - 1) / ub;
-        return (n_ub - 1) * t_stage_max + t_stage_sum;
+        return (n_ub - 1) * t_steady + t_stage_sum;
     };
     const uint32_t n_full = n_prompt / nb;
     const uint32_t n_rest = n_prompt % nb;
