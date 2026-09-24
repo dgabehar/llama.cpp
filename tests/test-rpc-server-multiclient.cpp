@@ -214,17 +214,43 @@ static int mode_probe_hello(const std::string & ep, int n) {
     return 0;
 }
 
-// rejected EP: the server must accept and then immediately close the connection
+// rejected EP: at the cap, the server answers HELLO with an all-zero version (the client reports
+// the server as full) and closes the connection
 static int mode_rejected(const std::string & ep) {
     int fd = connect_to(ep);
     if (fd < 0) {
         printf("rejected: connect failed\n");
         return 1;
     }
-    bool closed = wait_closed(fd);
+    uint8_t req[CONN_CAPS_SIZE] = {};
+    uint8_t rsp[4 + CONN_CAPS_SIZE];
+    const bool answered = send_cmd(fd, CMD_HELLO, req, sizeof(req)) && recv_rsp(fd, rsp, sizeof(rsp));
+    const bool busy     = answered && rsp[0] == 0 && rsp[1] == 0 && rsp[2] == 0;
+    const bool closed   = busy && wait_closed(fd);
     close(fd);
-    printf("rejected: %s\n", closed ? "connection closed by server" : "FAILED, connection still open");
+    printf("rejected: %s\n", closed ? "busy reply, connection closed by server" :
+                              busy   ? "FAILED, connection still open" :
+                              answered ? "FAILED, HELLO accepted" : "FAILED, no HELLO reply");
     return closed ? 0 : 1;
+}
+
+// silent EP N: N connections that never send anything; the server must close them itself
+// (handshake timeout) and they must not keep real clients out meanwhile
+static int mode_silent(const std::string & ep, int n) {
+    std::vector<int> fds;
+    for (int i = 0; i < n; i++) {
+        int fd = connect_to(ep);
+        if (fd >= 0) {
+            fds.push_back(fd);
+        }
+    }
+    int n_closed = 0;
+    for (int fd : fds) {
+        n_closed += wait_closed(fd) ? 1 : 0;
+        close(fd);
+    }
+    printf("silent: %d of %zu closed by server\n", n_closed, fds.size());
+    return n_closed == (int) fds.size() && n_closed == n ? 0 : 1;
 }
 
 // hold EP SECONDS: HELLO + allocate, stay connected, then check the connection still works
@@ -371,6 +397,7 @@ int main(int argc, char ** argv) {
     if (mode == "hello")          { g_timeout_ms = (int) arg(3, 1000); return mode_hello(ep); }
     if (mode == "probe-hello")    { g_timeout_ms = 2000; return mode_probe_hello(ep, (int) arg(3, 20)); }
     if (mode == "rejected")       { return mode_rejected(ep); }
+    if (mode == "silent")         { g_timeout_ms = (int) arg(4, 15000); return mode_silent(ep, (int) arg(3, 5)); }
     if (mode == "hold")           { return mode_hold(ep, arg(3, 2.0)); }
     if (mode == "malformed")      { return mode_malformed(ep); }
     if (mode == "fin-close")      { return mode_fin_close(ep); }
