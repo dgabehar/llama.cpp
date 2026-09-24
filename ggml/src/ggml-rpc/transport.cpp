@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -641,6 +642,54 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+bool socket_t::set_keepalive(int idle_sec, int interval_sec, int count) {
+    sockfd_t fd = pimpl->fd;
+    int on = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&on, sizeof(on)) != 0) {
+        return false;
+    }
+#if defined(__linux__)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle_sec,     sizeof(idle_sec))     != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &count,        sizeof(count))        != 0) {
+        return false;
+    }
+#elif defined(__APPLE__)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle_sec,     sizeof(idle_sec))     != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &count,        sizeof(count))        != 0) {
+        return false;
+    }
+#else
+    GGML_UNUSED(idle_sec);
+    GGML_UNUSED(interval_sec);
+    GGML_UNUSED(count);
+#endif
+    return true;
+}
+
+std::string socket_t::peer_address() const {
+    sockaddr_storage addr = {};
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(pimpl->fd, reinterpret_cast<sockaddr *>(&addr), &addr_len) != 0) {
+        return "unknown";
+    }
+    char host[INET6_ADDRSTRLEN] = {};
+    int port = 0;
+    if (addr.ss_family == AF_INET) {
+        const auto * a = reinterpret_cast<const sockaddr_in *>(&addr);
+        inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
+        port = ntohs(a->sin_port);
+    } else if (addr.ss_family == AF_INET6) {
+        const auto * a = reinterpret_cast<const sockaddr_in6 *>(&addr);
+        inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host));
+        port = ntohs(a->sin6_port);
+    } else {
+        return "unknown";
+    }
+    return std::string(host) + ":" + std::to_string(port);
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -674,7 +723,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, SOMAXCONN) < 0) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
