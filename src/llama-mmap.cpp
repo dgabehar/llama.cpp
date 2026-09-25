@@ -288,6 +288,23 @@ struct llama_file::impl {
                     if (errno == EINTR) {
                         continue;  // Interrupted by signal, retry
                     }
+                    // The destination can't take a direct transfer (e.g. GPU-pinned memory on amdgpu): read
+                    // through an aligned bounce buffer, which keeps direct I/O (no page cache) for the file
+                    if (errno == EFAULT && alignment > 1) {
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            LLAMA_LOG_INFO("%s: destination does not accept direct I/O, reading through a bounce buffer\n", __func__);
+                        }
+                        void * bounce = nullptr;
+                        if (posix_memalign(&bounce, alignment, to_read) != 0) {
+                            throw std::runtime_error("posix_memalign failed for the direct I/O bounce buffer");
+                        }
+                        std::unique_ptr<void, decltype(&free)> bounce_ptr(bounce, &free);
+                        read_raw_unsafe(bounce, to_read);
+                        std::memcpy(reinterpret_cast<char *>(ptr) + bytes_read, bounce, to_read);
+                        return;
+                    }
                     // Fallback to std::fread in case the DMA controller cannot access the buffer
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
