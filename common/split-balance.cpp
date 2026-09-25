@@ -721,9 +721,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
             case 3: out.s_output_byte = t.best / (double) ggml_nbytes(out_w); break;
             case 4: t_op_tg = t.best / n_chain; break;
             case 5: t_op_pp = t.best / n_chain; break;
-            case 0: t_decode  += t.share * t.best * t.byte_scale; break;
-            case 1: t_prefill += t.share * t.best;             break;
-            case 2: t_prefill += t.share * t.best / exp_scale; break;
+            case 0: t_decode  += t.share * t.best * t.byte_scale;             break;
+            case 1: t_prefill += t.share * t.best * t.byte_scale;             break;
+            case 2: t_prefill += t.share * t.best * t.byte_scale / exp_scale; break;
         }
     }
     // the layer's other ops: its real node count minus the ops timed above (their helper copies excluded)
