@@ -4978,6 +4978,48 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reasoning("Repeat it.")
             .expect_content("ghe.coxautoinc.com")
             .run();
+
+        // No tools offered, but the model hallucinates tool-call markup after its answer
+        // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
+        // kept, and the markup itself is dropped like a stray reasoning close tag.
+        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Reasoning here.")
+            .expect_content("Sure, the address is ghe.coxautoin")
+            .run();
+
+        // Same stray tool-call markup, but content starts after a real reasoning block.
+        tst.test("3:40 + 2:55 = 6:35.</ifm|think_faster>6:35 PM.</ifm|tool_call></ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("3:40 + 2:55 = 6:35.")
+            .expect_content("6:35 PM.")
+            .run();
+
+        // Same markup, but tools ARE offered this time: it's real tool-call syntax now, not a
+        // stray leak, and must still parse as a tool call rather than getting cut from content.
+        tst.test("Let me look that up.</ifm|think_faster>"
+                 "<ifm|tool_calls>\n<ifm|tool_call>special_function\n"
+                 "<ifm|arg_key>arg1</ifm|arg_key>\n<ifm|arg_value>1</ifm|arg_value>\n"
+                 "</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect_reasoning("Let me look that up.")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+            })
+            .run();
+
+        // Plain answer, no reasoning close-tag repeat, no tool markup, no tools offered:
+        // unaffected by either stray_ends list.
+        tst.test("Thinking.</ifm|think_faster>The sky is blue.")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Thinking.")
+            .expect_content("The sky is blue.")
+            .run();
     }
 
     // Kimi-K2-Thinking tests - custom parser
