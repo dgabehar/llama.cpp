@@ -128,13 +128,12 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0111 | `0ab13d2bb` | server: don't update the prompt cache of a busy slot picked by id_slot |
 | 0112 | `c4234d605` | FLEET.md: record the busy-slot prompt cache fix |
 | 0113 | `181e60aad` | fleet: regenerate patch mirror for the busy-slot prompt cache fix |
-| 0114 || `1b177d4e5` | chat : K2-Horizon: don't leak tool-call markup into content with no tools |
-| 0115 || `3a15bf975` | chat : K2-Horizon tests and comment: use a neutral example hostname |
-| 0116 || `9ecf429da` | common : split-balance: scale prefill by byte_scale too, not just decode |
-| 0117 || `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
-| 0118 || `74405080c` | chat : drop whitespace between reasoning end tag and content |
-| 0119 || (this commit) | fleet: regenerate patch mirror for the round-7 fixes |
-| 0110 | (this commit) | fleet: regenerate patch mirror |
+| 0114 | `1b177d4e5` | chat : K2-Horizon: don't leak tool-call markup into content with no tools |
+| 0115 | `3a15bf975` | chat : K2-Horizon tests and comment: use a neutral example hostname |
+| 0116 | `9ecf429da` | common : split-balance: scale prefill by byte_scale too, not just decode |
+| 0117 | `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
+| 0118 | `74405080c` | chat : drop whitespace between reasoning end tag and content |
+| 0119 | `b098565ad` | fleet: regenerate patch mirror for the round-7 fixes |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
