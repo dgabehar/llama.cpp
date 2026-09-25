@@ -263,6 +263,9 @@ struct server_slot {
         int64_t   n_tokens; // prompt tokens covered by the checkpoint
         llama_pos pos;      // position of the last of them
         int32_t   i_batch;  // index of that token in the batch
+        // the task that submitted it: the checkpoint may be created after that task finished and the slot
+        // released it (a request ending right after its prompt, e.g. n_predict 1 or EOS first)
+        int       id_task = -1;
 
         // set once the batch holding it has been submitted; it is read after a later llama_decode()
         // has been submitted too, so that reading it does not drain the pipeline
@@ -2414,9 +2417,10 @@ private:
 
     // n_tokens_ckpt: the number of prompt tokens covered by the checkpoint
     // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
+    // id_task_ckpt: the task the checkpoint belongs to, when the slot may no longer hold it (captured checkpoints)
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
-            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr) {
-        const int id_task = slot.task->id;
+            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr, int id_task_ckpt = -1) {
+        const int id_task = id_task_ckpt >= 0 ? id_task_ckpt : slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3314,7 +3318,7 @@ private:
                     std::vector<uint8_t> data(n);
                     llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
 
-                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft);
+                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft, cap.id_task);
                 }
             }
 
@@ -4003,6 +4007,7 @@ private:
                             }
 
                             slot.ckpt_captures.push_back({ (int64_t) slot.prompt.n_tokens(), pos, (int32_t) batch.size() - 1 });
+                            slot.ckpt_captures.back().id_task = slot.task ? slot.task->id : -1;
 
                             return true;
                         };
