@@ -293,6 +293,11 @@ struct analyze_content : analyze_base {
     // ends at the first of them and the rest of the output is dropped
     std::vector<std::string> stray_ends;
 
+    // same idea as stray_ends, but only checked when the request has no tools (e.g. hallucinated
+    // tool-call markup the model emits despite none being offered). With tools offered, these tags
+    // are real tool-call syntax parsed by analyze_tools instead, so they must never end content here.
+    std::vector<std::string> stray_ends_no_tools;
+
     analyze_content() = default;
     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);
 
