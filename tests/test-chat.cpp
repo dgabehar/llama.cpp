@@ -5020,6 +5020,34 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reasoning("Thinking.")
             .expect_content("The sky is blue.")
             .run();
+
+        // Empty reasoning block (low effort closes immediately), then a formatting newline
+        // before the real answer (seen live, 2026-09-25): the newline must not leak into
+        // content, and the whitespace-only reasoning block reports no reasoning_content.
+        tst.test("</ifm|think_faster>\nbuild-cache-07.example.net")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("")
+            .expect_content("build-cache-07.example.net")
+            .run();
+
+        // Empty reasoning block, then the model's own ": " prefix (real text, not
+        // formatting whitespace) -- must be preserved verbatim at the start of content.
+        tst.test("</ifm|think_faster>: build-cache-07.example.net")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("")
+            .expect_content(": build-cache-07.example.net")
+            .run();
+
+        // Non-empty reasoning followed by a double newline before the answer: same
+        // whitespace-drop applies regardless of whether the reasoning body was empty.
+        tst.test("Reasoning text.</ifm|think_faster>\n\nAnswer text.")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Reasoning text.")
+            .expect_content("Answer text.")
+            .run();
     }
 
     // Kimi-K2-Thinking tests - custom parser
