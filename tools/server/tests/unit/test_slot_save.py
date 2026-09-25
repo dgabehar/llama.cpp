@@ -676,3 +676,43 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+def test_request_pinned_to_busy_slot_does_not_touch_its_context():
+    # a request pinned to a slot that is still generating is deferred. Before it is,
+    # slot selection must not run the prompt cache update on that slot: it would load
+    # another prompt's cached state into the running task mid-generation
+    global server
+    server.n_slots = 2
+    server.n_ctx = 2048
+    server.server_slots = True
+    server.start()
+
+    prompt_a = "Once upon a time there was a little girl named Lily who loved to play in the park"
+    prompt_b = "The old man walked slowly to the harbor to watch the ships"
+    data_a = {"prompt": prompt_a, "id_slot": 1, "n_predict": 1800, "ignore_eos": True, "cache_prompt": True}
+
+    # put prompt_b in the prompt cache: run it on slot 1, then displace it
+    for p in [prompt_b, "Tom had a red ball"]:
+        res = server.make_request("POST", "/completion", data={"prompt": p, "id_slot": 1, "n_predict": 4})
+        assert res.status_code == 200
+
+    solo = server.make_request("POST", "/completion", data={**data_a, "id_slot": 0})
+    assert solo.status_code == 200
+
+    out = {}
+    thread = threading.Thread(target=lambda: out.__setitem__("a", server.make_request("POST", "/completion", data=data_a)))
+    thread.start()
+    busy = False
+    for _ in range(2000):
+        slots = server.make_request("GET", "/slots").body
+        if slots[1]["is_processing"]:
+            busy = True
+            break
+    assert busy
+    res = server.make_request("POST", "/completion", data={"prompt": prompt_b, "id_slot": 1, "n_predict": 4})
+    assert res.status_code == 200
+    thread.join()
+
+    assert out["a"].status_code == 200
+    assert out["a"].body["content"] == solo.body["content"]
