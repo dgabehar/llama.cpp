@@ -418,7 +418,10 @@ where the incident happened and the 2 s default timeout applies.
   `</ifm|...>` tag in `reasoning_content`. The model also sometimes answers,
   emits a second close tag and starts over with a garbled copy. Content ends
   at any close tag after the reasoning (`analyze_content::stray_ends`), and
-  the rest is dropped.
+  generation stops there too. The server gets the same tags as
+  `stop_after_reasoning`: stop strings that count only once one of them has
+  closed the reasoning, so the dropped remainder is never decoded. Neither
+  applies with `reasoning_format: none`, which returns the raw text.
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
