@@ -183,7 +183,10 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
 
     if (is_always_wrapped()) {
         if (ctx.extracting_reasoning) {
-            return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
+            // p.space() drops any whitespace the model leaves between the reasoning end tag
+            // and the content start tag (e.g. an empty K2-Horizon reasoning block followed by
+            // a formatting newline) so it never lands at the front of content.
+            return ctx.reasoning_parser + p.space() + start + p.content(p.until(end)) + end + p.end();
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
     }
@@ -195,8 +198,13 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
         ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
     }
 
-    if (!ends.empty() && ctx.extracting_reasoning) {
-        return ctx.reasoning_parser + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
+    if (ctx.extracting_reasoning) {
+        // Same whitespace-drop as above: only when reasoning was actually parsed out, so a
+        // model with no reasoning tags at all keeps any leading whitespace it genuinely emits.
+        if (!ends.empty()) {
+            return ctx.reasoning_parser + p.space() + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
+        }
+        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }
