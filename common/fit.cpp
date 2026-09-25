@@ -330,7 +330,7 @@ static void common_params_fit_impl(
     dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
+    uint32_t       n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
     const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
 
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
@@ -339,7 +339,29 @@ static void common_params_fit_impl(
         if (n_seq_max > 1) {
             LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_seq_max);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            // a context this large can produce a per-layer KV cache tensor too large for a
+            // device to run an op against (e.g. Vulkan's maxStorageBufferRange) even when it
+            // would otherwise fit in free memory -- llama_init_from_model() catches that and
+            // returns nullptr, which common_get_device_memory_data_impl() turns into this
+            // exception. Back off geometrically until the probe actually succeeds instead of
+            // letting an oversized probe abort llama_params_fit entirely.
+            for (;;) {
+                try {
+                    dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    break;
+                } catch (const std::runtime_error & e) {
+                    if (cparams->n_ctx <= n_ctx_min_total) {
+                        throw;
+                    }
+                    const uint32_t n_ctx_prev = cparams->n_ctx;
+                    cparams->n_ctx = std::max(n_ctx_min_total, cparams->n_ctx / 2);
+                    LOG_WRN("%s: failed to probe device memory at n_ctx = %" PRIu32 ", retrying at %" PRIu32 ": %s\n",
+                        __func__, n_ctx_prev, cparams->n_ctx, e.what());
+                }
+            }
+            // the probe may have had to back off below the originally requested max, use
+            // whatever size actually worked as the new ceiling for the rest of this function:
+            n_ctx_max = cparams->n_ctx;
         }
     }
     add_extra_memory(dmds_full);

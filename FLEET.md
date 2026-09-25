@@ -564,3 +564,45 @@ where the incident happened and the 2 s default timeout applies.
   `ctx.is_lenient()`, so `SEQUENCE`/`REPEAT` correctly stay pending instead
   of hard-failing. Confirmed via the same before/after
   build-and-run-test-chat method as `35e651927`.
+
+- **`-fit`'s own oversized-context probe aborted the whole server on a
+  laptop with an RTX 3080 Ti + an Intel iGPU** (2026-09-25, `fit-abort`
+  branch), on plain default startup (`llama-server -m K2-Horizon-7B...
+  --jinja -c 8192`, no special flags) -- not upstream-tracked. Not actually
+  about having two GPUs: reproduced identically with `--device Vulkan1`
+  alone (still crashed), and this fork's own device-selection code already
+  drops the iGPU whenever a discrete GPU is present (`gpus.empty()` check in
+  `llama_prepare_model_devices`, `src/llama.cpp` -- upstream PR #23897), so
+  K2-Horizon-7B was already running on the 3080 Ti alone either way. Root
+  cause: llama-server's `n_parallel=auto` picked 4, and K2-Horizon-7B's
+  native `n_ctx_train` is 524288, so `-fit`'s own auto-context measurement
+  probed at `524288 * 4 = 2097152`. With `kv_unified`, layer 0's K cache
+  tensor at that size is `1024 * 2097152 * 2 bytes = 4294967296` -- exactly
+  one byte over Vulkan's `maxStorageBufferRange` (`4294967295` on this
+  GPU). `ggml_backend_vk_device_supports_op` correctly rejects the op for
+  being oversized, `ggml_backend_sched_backend_id_from_cur` finds no backend
+  willing to run it, and hits the "pre-allocated tensor ... that cannot run
+  the operation" `GGML_ABORT` (`ggml-backend.cpp:941`) -- a hard process
+  abort, not a catchable error, the first time that KV cache tensor is
+  scheduled (traced live with gdb: `ggml_backend_supports_buft` returns true
+  for the GPU backend, `ggml_backend_supports_op` is what returns false).
+  Same mechanism would hit any backend with a per-op size ceiling and any
+  model whose `n_ctx_train * n_parallel` crosses it; Vulkan/this GPU is just
+  where the numbers lined up. Fixed two places:
+  - `src/llama-kv-cache.cpp`: check `ggml_backend_dev_supports_op` on each
+    layer's K/V tensor right after creating it, before it becomes a
+    pre-allocated leaf the scheduler can hard-abort on. Throws a normal,
+    descriptive `std::runtime_error` instead (already caught by
+    `llama_init_from_model`'s existing try/catch, which logs it and returns
+    `nullptr` -- this alone turns the abort into a clean failed-to-load
+    instead of a crash, for both `--fit`'s probe and a real model load).
+  - `common/fit.cpp`: `common_params_fit_impl`'s auto-context measurement
+    (`n_ctx_auto && n_seq_max > 1`) now catches that failure and backs off
+    geometrically (halving, floored at `n_ctx_min_total`) until the probe
+    succeeds, so `-fit` actually finds a working context size instead of
+    just failing to start. Verified: K2-Horizon-7B and Qwen3.5-4B both start
+    clean on default flags (no `-c`, no `--device`, no `-fit off`) after the
+    fix; K2-Horizon-7B's probe now logs one backoff (2097152 -> 1048576) and
+    settles on a real `n_ctx` sized by the existing free-memory-margin logic
+    (unchanged). `ctest -L main` (59/59) and `ctest -R split-balance` (1/1)
+    both pass.
