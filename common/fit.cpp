@@ -13,6 +13,15 @@
 #include <string>
 #include <vector>
 
+// compute nodes of the graphs reserved by the last memory probe (see common_fit_last_graph_nodes)
+static int32_t g_last_graph_nodes_pp = -1;
+static int32_t g_last_graph_nodes_tg = -1;
+
+void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg) {
+    pp = g_last_graph_nodes_pp;
+    tg = g_last_graph_nodes_tg;
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -146,6 +155,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     common_memory_breakdown_print(ctx);
 
+    g_last_graph_nodes_pp = llama_graph_n_compute_nodes(ctx, false);
+    g_last_graph_nodes_tg = llama_graph_n_compute_nodes(ctx, true);
+
     llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -188,6 +200,9 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
     uint32_t hp_nex = 0;
     std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    // the graph node counts describe the main model, not the extra one probed below
+    const int32_t nodes_pp = g_last_graph_nodes_pp;
+    const int32_t nodes_tg = g_last_graph_nodes_tg;
 
     if (extra != nullptr) {
         std::vector<ggml_backend_dev_t> devs_extra;
@@ -213,6 +228,8 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
             LOG_WRN("%s: failed to measure the memory of the extra model: %s\n", __func__, e.what());
         }
     }
+    g_last_graph_nodes_pp = nodes_pp;
+    g_last_graph_nodes_tg = nodes_tg;
 
     common_device_memory_data_vec ret(main.size());
     for (size_t i = 0; i < main.size(); i++) {
