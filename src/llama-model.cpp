@@ -35,6 +35,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2890,6 +2891,20 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+int32_t llama_model_n_devices_used(const llama_model * model) {
+    std::set<ggml_backend_dev_t> devs;
+    auto add = [&](ggml_backend_dev_t dev) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devs.insert(dev);
+        }
+    };
+    for (int il = 0; il < (int) model->hparams.n_layer(); ++il) {
+        add(model->dev_layer(il));
+    }
+    add(model->dev_output());
+    return (int32_t) devs.size();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
