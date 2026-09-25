@@ -325,10 +325,36 @@ node: the fit probe records the real graph's compute node count
 on each device. The fixed cost of a graph run plus readback is measured and
 subtracted.
 
-A busy node is re-measured: after a warm-up pass each timing runs up to 4
-rounds and keeps the fastest, since other load only slows a node down. A
-spread over 1.25x between rounds is logged. Predicted vs measured on a
-3080 Ti:
+Layers are grouped by structure, not by weight types. Mixed quants vary the
+types per layer: Qwen3.8 UD-Q4_K_XL has 53 type layouts over 3 structures,
+which took 118 s to calibrate on a 780M worker. Each structure is timed on
+its most common type layout, with decode scaled by the structure's mean
+bytes. Graphs over 50 ms are timed once per round.
+
+**Busy nodes:** after a warm-up pass each timing runs up to 4 rounds and
+keeps the fastest. A load that lasts the whole calibration slows every round
+alike, so the check is against the cache instead:
+
+- `ref|<device, model, workload>`: the device's last calibration that didn't
+  look busy. It is not keyed by build, so it survives image bumps.
+- A new calibration more than 1.25x slower than the reference logs "probably
+  busy" and is cached for 1 hour.
+- On a cache hit, a device more than 1.25x faster than cached is calibrated
+  again. So is one more than 1.5x slower, as before.
+- After a build change, a device whose quick check is within 10% of its
+  reference reuses it: about 2 s instead of a full calibration.
+- `--split-calibrate force` re-measures without dropping other cache entries.
+
+The cache is `split-balance.json` under `LLAMA_CACHE` (default
+`~/.cache/llama.cpp`). The home-infrastructure chart mounts it on a node-local
+hostPath (`master.calibrationCache`); in a bare container it's lost on every
+restart.
+
+Round 5 of QA found a use-after-free in `read_model_layers`: the GGUF context
+was freed before the per-layer key reads, and 10 of 17 fleet starts crashed.
+An ASan build with two CPU `rpc-server` workers reproduced it on every start.
+
+Predicted vs measured on a 3080 Ti:
 
 | model | pp | tg |
 |---|---|---|
@@ -389,7 +415,10 @@ where the incident happened and the 2 s default timeout applies.
   it often ends with the "high" tag `</ifm|think>`. The parser workaround in
   `chat-diff-analyzer.cpp` accepts all three close tags (`end_alts`).
   Symptom when it breaks: empty `content`, the whole reply plus a raw
-  `</ifm|...>` tag in `reasoning_content`.
+  `</ifm|...>` tag in `reasoning_content`. The model also sometimes answers,
+  emits a second close tag and starts over with a garbled copy. Content ends
+  at any close tag after the reasoning (`analyze_content::stray_ends`), and
+  the rest is dropped.
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
