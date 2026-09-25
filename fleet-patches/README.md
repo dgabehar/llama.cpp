@@ -118,7 +118,11 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0101 | `a6ded58e6` | common: split-balance: fix the calibration use-after-free, detect busy nodes against a reference |
 | 0102 | `3de07b36f` | chat: K2-Horizon: end content at a close tag after the answer |
 | 0103 | `8294d54c9` | FLEET.md: calibration grouping, busy reference, calibration cache, K2 stray close tag |
-| 0104 | (this commit) | fleet: regenerate patch mirror |
+| 0104 | `1313096f9` | fleet: regenerate patch mirror for the round-5 fixes |
+| 0105 | `34da5e374` | common: split-balance: survive malformed cache entries, log why an entry is not used, merge on write |
+| 0106 | `c725c5d7e` | server, chat: stop generating at a stray K2-Horizon close tag; keep reasoning_format none raw |
+| 0107 | `ede0eed18` | FLEET.md: K2 stop_after_reasoning |
+| 0108 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
