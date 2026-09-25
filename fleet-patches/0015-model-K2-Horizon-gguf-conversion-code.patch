@@ -13,7 +13,7 @@ Subject: [PATCH] model: K2 Horizon gguf conversion code
  create mode 100644 conversion/k2_horizon.py
 
 diff --git a/conversion/__init__.py b/conversion/__init__.py
-index d48861e46..e43b9cec3 100644
+index d48861e46b..e43b9cec3c 100644
 --- a/conversion/__init__.py
 +++ b/conversion/__init__.py
 @@ -136,6 +136,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
@@ -26,7 +26,7 @@ index d48861e46..e43b9cec3 100644
      "KimiK3ForConditionalGeneration": "kimi_k3",
 diff --git a/conversion/k2_horizon.py b/conversion/k2_horizon.py
 new file mode 100644
-index 000000000..d3f5af923
+index 0000000000..d3f5af9236
 --- /dev/null
 +++ b/conversion/k2_horizon.py
 @@ -0,0 +1,196 @@
@@ -227,7 +227,7 @@ index 000000000..d3f5af923
 +
 +
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index 80eb60b40..b86935306 100644
+index 80eb60b408..b869353065 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
 @@ -218,6 +218,8 @@ class Keys:
@@ -317,7 +317,7 @@ index 80eb60b40..b86935306 100644
  
  # tensors that will not be serialized
 diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
-index 56cc65a70..a4fe0989e 100644
+index 56cc65a70a..a4fe0989e9 100644
 --- a/gguf-py/gguf/gguf_writer.py
 +++ b/gguf-py/gguf/gguf_writer.py
 @@ -1585,6 +1585,12 @@ class GGUFWriter:
@@ -334,7 +334,7 @@ index 56cc65a70..a4fe0989e 100644
  
      def add_diffusion_shift_logits(self, value: bool) -> None:
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
-index d2dfeece5..2f24653c5 100644
+index d2dfeece59..2f24653c55 100644
 --- a/gguf-py/gguf/tensor_mapping.py
 +++ b/gguf-py/gguf/tensor_mapping.py
 @@ -394,6 +394,7 @@ class TensorNameMap:

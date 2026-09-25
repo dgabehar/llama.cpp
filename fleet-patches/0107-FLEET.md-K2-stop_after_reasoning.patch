@@ -9,7 +9,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/FLEET.md b/FLEET.md
-index e7cfb574d..8ff0f57d9 100644
+index e7cfb574d1..8ff0f57d97 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -418,7 +418,10 @@ where the incident happened and the 2 s default timeout applies.

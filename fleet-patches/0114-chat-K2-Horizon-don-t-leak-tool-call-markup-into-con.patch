@@ -1,0 +1,161 @@
+From 1b177d4e5fbbc5b3d5805be75c7f262e59b73140 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 15:45:26 -0500
+Subject: [PATCH] chat : K2-Horizon: don't leak tool-call markup into content
+ with no tools
+
+Round 7 QA found K2-Horizon sometimes emits tool-call markup
+(</ifm|arg_value>, </ifm|tool_call>, </ifm|tool_calls>) even when the
+request has no tools. analyze_content::build_parser only runs once tools
+are ruled out for parsing, and the existing K2 workaround's stray_ends
+only listed the reasoning close-tag variants, so this markup landed in
+content verbatim (5 replies in the round-7 batch).
+
+Add stray_ends_no_tools alongside stray_ends: same "end content there,
+drop the rest" and stop_after_reasoning handling, but only folded in
+when the request has no tools, so real tool calls (tools offered) are
+never affected -- analyze_tools still parses the same tags as syntax.
+
+Assisted-by: Claude Sonnet 5
+---
+ common/chat-auto-parser-generator.cpp | 19 ++++++++++--
+ common/chat-auto-parser.h             |  5 ++++
+ common/chat-diff-analyzer.cpp         |  8 +++++
+ tests/test-chat.cpp                   | 42 +++++++++++++++++++++++++++
+ 4 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index 5add993ed8..c86b890002 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -43,6 +43,13 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+     // dropped remainder is not decoded (and waited for) to EOS; only when the parser extracts reasoning
+     if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && autoparser.reasoning.mode != reasoning_mode::NONE) {
+         data.stops_after_reasoning = autoparser.content.stray_ends;
++        // stray_ends_no_tools are real tool-call syntax once tools are offered, so they must never
++        // stop generation in that case -- only fold them in when this request has none.
++        bool request_has_tools = inputs.tools.is_array() && !inputs.tools.empty();
++        if (!request_has_tools) {
++            data.stops_after_reasoning.insert(data.stops_after_reasoning.end(),
++                autoparser.content.stray_ends_no_tools.begin(), autoparser.content.stray_ends_no_tools.end());
++        }
+     }
+ 
+     std::string parser_generation_prompt = data.generation_prompt;
+@@ -180,8 +187,16 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
+-    if (!stray_ends.empty() && ctx.extracting_reasoning) {
+-        return ctx.reasoning_parser + p.content(p.until_one_of(stray_ends)) + p.optional(p.rest()) + p.end();
++    // stray_ends_no_tools only applies when this request has no tools -- with tools offered they're
++    // real tool-call syntax, parsed by analyze_tools instead, so this path never sees them (build_parser
++    // only calls analyze_content::build_parser once tools are ruled out for this request).
++    std::vector<std::string> ends = stray_ends;
++    if (!(ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty())) {
++        ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
++    }
++
++    if (!ends.empty() && ctx.extracting_reasoning) {
++        return ctx.reasoning_parser + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
+     }
+     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
+ }
+diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
+index d193a22536..f5d48172bc 100644
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -293,6 +293,11 @@ struct analyze_content : analyze_base {
+     // ends at the first of them and the rest of the output is dropped
+     std::vector<std::string> stray_ends;
+ 
++    // same idea as stray_ends, but only checked when the request has no tools (e.g. hallucinated
++    // tool-call markup the model emits despite none being offered). With tools offered, these tags
++    // are real tool-call syntax parsed by analyze_tools instead, so they must never end content here.
++    std::vector<std::string> stray_ends_no_tools;
++
+     analyze_content() = default;
+     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);
+ 
+diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
+index 304382fd51..ba71c66cc1 100644
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -227,6 +227,13 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
+       // tags ends the reasoning. It also sometimes answers, emits a second close tag and
+       // starts over with a garbled copy of the answer (Dawn QA round 5: 4/120 replies, all
+       // repeat-back prompts), so a close tag after the reasoning ends the content.
++      //
++      // Round 7 found a second, separate leak: with no tools in the request, the model
++      // sometimes still emits tool-call markup after its answer (e.g. an answer ending
++      // "...ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
++      // of that is a reasoning tag, so it landed in content verbatim. stray_ends_no_tools
++      // ends content at the same three tags whenever the request has no tools -- with
++      // tools offered, they're real tool-call syntax and analyze_tools parses them instead.
+       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
+               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+@@ -234,6 +241,7 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
+               analysis.reasoning.end   = "</ifm|think_faster>";
+               analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
+               analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
++              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>" };
+               analysis.preserved_tokens.push_back("<ifm|think_faster>");
+               analysis.preserved_tokens.push_back("</ifm|think_faster>");
+               // Not the registered start/end pair (see comment above), but still real
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 5ba89e6250..4ab59b5465 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -4978,6 +4978,48 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect_reasoning("Repeat it.")
+             .expect_content("ghe.coxautoinc.com")
+             .run();
++
++        // No tools offered, but the model hallucinates tool-call markup after its answer
++        // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
++        // kept, and the markup itself is dropped like a stray reasoning close tag.
++        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("Reasoning here.")
++            .expect_content("Sure, the address is ghe.coxautoin")
++            .run();
++
++        // Same stray tool-call markup, but content starts after a real reasoning block.
++        tst.test("3:40 + 2:55 = 6:35.</ifm|think_faster>6:35 PM.</ifm|tool_call></ifm|tool_calls>")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("3:40 + 2:55 = 6:35.")
++            .expect_content("6:35 PM.")
++            .run();
++
++        // Same markup, but tools ARE offered this time: it's real tool-call syntax now, not a
++        // stray leak, and must still parse as a tool call rather than getting cut from content.
++        tst.test("Let me look that up.</ifm|think_faster>"
++                 "<ifm|tool_calls>\n<ifm|tool_call>special_function\n"
++                 "<ifm|arg_key>arg1</ifm|arg_key>\n<ifm|arg_value>1</ifm|arg_value>\n"
++                 "</ifm|tool_call>\n</ifm|tool_calls>")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .tools({ special_function_tool })
++            .expect_reasoning("Let me look that up.")
++            .expect_tool_calls({
++                { "special_function", R"({"arg1":1})", "" },
++            })
++            .run();
++
++        // Plain answer, no reasoning close-tag repeat, no tool markup, no tools offered:
++        // unaffected by either stray_ends list.
++        tst.test("Thinking.</ifm|think_faster>The sky is blue.")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("Thinking.")
++            .expect_content("The sky is blue.")
++            .run();
+     }
+ 
+     // Kimi-K2-Thinking tests - custom parser
+-- 
+2.43.0
+

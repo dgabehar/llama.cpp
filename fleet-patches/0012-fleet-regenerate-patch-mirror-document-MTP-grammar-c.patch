@@ -24,7 +24,7 @@ Assisted-by: Claude Sonnet 5
  create mode 100644 fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index 5437dd1be..23779cc6a 100644
+index 5437dd1beb..23779cc6a3 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -52,16 +52,33 @@ discipline by standing convention).
@@ -76,7 +76,7 @@ index 5437dd1be..23779cc6a 100644
 +  `fleet-patches`.
 diff --git a/fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch b/fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
 new file mode 100644
-index 000000000..4b4e7381e
+index 0000000000..4b4e7381e3
 --- /dev/null
 +++ b/fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
 @@ -0,0 +1,7057 @@
@@ -7139,7 +7139,7 @@ index 000000000..4b4e7381e
 +
 diff --git a/fleet-patches/0011-server-disable-speculative-decoding-for-grammar-cons.patch b/fleet-patches/0011-server-disable-speculative-decoding-for-grammar-cons.patch
 new file mode 100644
-index 000000000..d2fde1ac3
+index 0000000000..d2fde1ac3a
 --- /dev/null
 +++ b/fleet-patches/0011-server-disable-speculative-decoding-for-grammar-cons.patch
 @@ -0,0 +1,90 @@
@@ -7235,7 +7235,7 @@ index 000000000..d2fde1ac3
 +
 diff --git a/fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch b/fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 new file mode 100644
-index 000000000..7cdbf27f2
+index 0000000000..7cdbf27f2d
 --- /dev/null
 +++ b/fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 @@ -0,0 +1,68 @@
@@ -7308,7 +7308,7 @@ index 000000000..7cdbf27f2
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index e6959c790..52a0249da 100644
+index e6959c7905..52a0249da4 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -41,6 +41,9 @@ re-derive the equivalent change against the new upstream code, `git am

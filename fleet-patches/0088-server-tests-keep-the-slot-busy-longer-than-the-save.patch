@@ -14,7 +14,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
-index 1240a459e..a36186617 100644
+index 1240a459e2..a361866176 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
 @@ -244,7 +244,11 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():

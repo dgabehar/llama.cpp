@@ -14,7 +14,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0092-fleet-regenerate-patch-mirror-for-the-conv-window-an.patch b/fleet-patches/0092-fleet-regenerate-patch-mirror-for-the-conv-window-an.patch
 new file mode 100644
-index 000000000..8cabd81b8
+index 0000000000..8cabd81b80
 --- /dev/null
 +++ b/fleet-patches/0092-fleet-regenerate-patch-mirror-for-the-conv-window-an.patch
 @@ -0,0 +1,29153 @@
@@ -29173,7 +29173,7 @@ index 000000000..8cabd81b8
 +
 diff --git a/fleet-patches/0093-tests-rpc-server-multiclient-cast-RAND_MAX-to-float.patch b/fleet-patches/0093-tests-rpc-server-multiclient-cast-RAND_MAX-to-float.patch
 new file mode 100644
-index 000000000..053f47841
+index 0000000000..053f478413
 --- /dev/null
 +++ b/fleet-patches/0093-tests-rpc-server-multiclient-cast-RAND_MAX-to-float.patch
 @@ -0,0 +1,34 @@
@@ -29212,7 +29212,7 @@ index 000000000..053f47841
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 4e1b518a5..e4a9149f1 100644
+index 4e1b518a55..e4a9149f18 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -106,7 +106,9 @@ re-derive the equivalent change against the new upstream code, `git am

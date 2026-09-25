@@ -1,0 +1,58 @@
+From 3a15bf975819f161eff8abb4434971bc37f36da1 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 15:57:23 -0500
+Subject: [PATCH] chat : K2-Horizon tests and comment: use a neutral example
+ hostname
+
+Assisted-by: Claude Opus 5.5
+---
+ common/chat-diff-analyzer.cpp | 2 +-
+ tests/test-chat.cpp           | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
+index ba71c66cc1..b31cad4099 100644
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -230,7 +230,7 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
+       //
+       // Round 7 found a second, separate leak: with no tools in the request, the model
+       // sometimes still emits tool-call markup after its answer (e.g. an answer ending
+-      // "...ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
++      // "...answer</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
+       // of that is a reasoning tag, so it landed in content verbatim. stray_ends_no_tools
+       // ends content at the same three tags whenever the request has no tools -- with
+       // tools offered, they're real tool-call syntax and analyze_tools parses them instead.
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 4ab59b5465..80bc3b72ae 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -4972,21 +4972,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+         }
+ 
+         // a second close tag after the answer: the garbled restart after it is dropped
+-        tst.test("Repeat it.</ifm|think>ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry")
++        tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
+             .template_kwarg("reasoning_effort", "\"low\"")
+             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+             .expect_reasoning("Repeat it.")
+-            .expect_content("ghe.coxautoinc.com")
++            .expect_content("git.example.com")
+             .run();
+ 
+         // No tools offered, but the model hallucinates tool-call markup after its answer
+         // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
+         // kept, and the markup itself is dropped like a stray reasoning close tag.
+-        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
++        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+             .template_kwarg("reasoning_effort", "\"low\"")
+             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+             .expect_reasoning("Reasoning here.")
+-            .expect_content("Sure, the address is ghe.coxautoin")
++            .expect_content("Sure, the address is git.example.co")
+             .run();
+ 
+         // Same stray tool-call markup, but content starts after a real reasoning block.
+-- 
+2.43.0
+

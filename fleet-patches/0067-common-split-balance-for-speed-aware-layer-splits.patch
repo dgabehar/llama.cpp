@@ -44,7 +44,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 tests/test-split-balance.cpp
 
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index c738451a0..5cc100aff 100644
+index c738451a01..5cc100afff 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
 @@ -108,6 +108,8 @@ add_library(${TARGET}
@@ -57,7 +57,7 @@ index c738451a0..5cc100aff 100644
      subproc.h
      trie.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index a95d59b35..94fdc76a1 100644
+index a95d59b351..94fdc76a14 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2742,6 +2742,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -106,7 +106,7 @@ index a95d59b35..94fdc76a1 100644
          {"-dev", "--device"}, "<dev1,dev2,..>",
          "comma-separated list of devices to use for offloading (none = don't offload)\n"
 diff --git a/common/common.cpp b/common/common.cpp
-index 32cbb493f..926baf389 100644
+index 32cbb493ff..926baf3899 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -6,6 +6,7 @@
@@ -142,7 +142,7 @@ index 32cbb493f..926baf389 100644
  
      llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
 diff --git a/common/common.h b/common/common.h
-index c15f4b5d7..0f5574cc6 100644
+index c15f4b5d7d..0f5574cc64 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -585,6 +585,12 @@ struct common_params {
@@ -159,7 +159,7 @@ index c15f4b5d7..0f5574cc6 100644
  
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
 diff --git a/common/fit.cpp b/common/fit.cpp
-index faa595f84..31b87b12c 100644
+index faa595f84f..31b87b12c8 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -176,6 +176,55 @@ common_device_memory_data_vec common_get_device_memory_data(
@@ -219,7 +219,7 @@ index faa595f84..31b87b12c 100644
          const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
          float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
 diff --git a/common/fit.h b/common/fit.h
-index 824d386b0..24bcbc7ea 100644
+index 824d386b07..24bcbc7eaf 100644
 --- a/common/fit.h
 +++ b/common/fit.h
 @@ -55,6 +55,17 @@ struct common_device_memory_data {
@@ -242,7 +242,7 @@ index 824d386b0..24bcbc7ea 100644
                           const char * path_model,
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
 new file mode 100644
-index 000000000..aca9f5357
+index 0000000000..aca9f5357e
 --- /dev/null
 +++ b/common/split-balance.cpp
 @@ -0,0 +1,688 @@
@@ -936,7 +936,7 @@ index 000000000..aca9f5357
 +}
 diff --git a/common/split-balance.h b/common/split-balance.h
 new file mode 100644
-index 000000000..70927fe8d
+index 0000000000..70927fe8df
 --- /dev/null
 +++ b/common/split-balance.h
 @@ -0,0 +1,96 @@
@@ -1037,7 +1037,7 @@ index 000000000..70927fe8d
 +        const llama_context_params & cparams,
 +        const common_fit_extra_model * extra);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 01fcf97cd..6582c4499 100644
+index 01fcf97cd4..6582c44993 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -261,6 +261,7 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
@@ -1050,7 +1050,7 @@ index 01fcf97cd..6582c4499 100644
  llama_build_and_test(test-log.cpp)
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
 new file mode 100644
-index 000000000..556cb7272
+index 0000000000..556cb7272b
 --- /dev/null
 +++ b/tests/test-split-balance.cpp
 @@ -0,0 +1,142 @@

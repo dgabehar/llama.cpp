@@ -15,7 +15,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0108-fleet-regenerate-patch-mirror-for-the-round-6-fixes.patch b/fleet-patches/0108-fleet-regenerate-patch-mirror-for-the-round-6-fixes.patch
 new file mode 100644
-index 000000000..ae3db1e28
+index 0000000000..ae3db1e288
 --- /dev/null
 +++ b/fleet-patches/0108-fleet-regenerate-patch-mirror-for-the-round-6-fixes.patch
 @@ -0,0 +1,32079 @@
@@ -32100,7 +32100,7 @@ index 000000000..ae3db1e28
 +
 diff --git a/fleet-patches/0109-server-a-captured-checkpoint-may-outlive-its-task-do.patch b/fleet-patches/0109-server-a-captured-checkpoint-may-outlive-its-task-do.patch
 new file mode 100644
-index 000000000..a1ed956f2
+index 0000000000..a1ed956f2a
 --- /dev/null
 +++ b/fleet-patches/0109-server-a-captured-checkpoint-may-outlive-its-task-do.patch
 @@ -0,0 +1,75 @@
@@ -32180,7 +32180,7 @@ index 000000000..a1ed956f2
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index f5a07f8c6..082ff5a5a 100644
+index f5a07f8c62..082ff5a5a0 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -122,7 +122,9 @@ re-derive the equivalent change against the new upstream code, `git am

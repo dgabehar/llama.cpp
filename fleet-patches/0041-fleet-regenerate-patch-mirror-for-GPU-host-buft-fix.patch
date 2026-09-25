@@ -14,7 +14,7 @@ Assisted-by: Claude Sonnet
 
 diff --git a/fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch b/fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
 new file mode 100644
-index 000000000..c57734dc4
+index 0000000000..c57734dc45
 --- /dev/null
 +++ b/fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
 @@ -0,0 +1,13063 @@
@@ -13083,7 +13083,7 @@ index 000000000..c57734dc4
 +
 diff --git a/fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch b/fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
 new file mode 100644
-index 000000000..845a6ead5
+index 0000000000..845a6ead5d
 --- /dev/null
 +++ b/fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
 @@ -0,0 +1,71 @@
@@ -13159,7 +13159,7 @@ index 000000000..845a6ead5
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 2a8bd1e26..ce14c6065 100644
+index 2a8bd1e26f..ce14c6065f 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -62,6 +62,7 @@ re-derive the equivalent change against the new upstream code, `git am

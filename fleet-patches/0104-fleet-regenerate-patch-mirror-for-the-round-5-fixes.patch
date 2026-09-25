@@ -18,7 +18,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0100-fleet-regenerate-patch-mirror-for-the-FLEET.md-notes.patch b/fleet-patches/0100-fleet-regenerate-patch-mirror-for-the-FLEET.md-notes.patch
 new file mode 100644
-index 000000000..4a7101be4
+index 0000000000..4a7101be4f
 --- /dev/null
 +++ b/fleet-patches/0100-fleet-regenerate-patch-mirror-for-the-FLEET.md-notes.patch
 @@ -0,0 +1,30721 @@
@@ -30745,7 +30745,7 @@ index 000000000..4a7101be4
 +
 diff --git a/fleet-patches/0101-common-split-balance-fix-the-calibration-use-after-f.patch b/fleet-patches/0101-common-split-balance-fix-the-calibration-use-after-f.patch
 new file mode 100644
-index 000000000..905136d18
+index 0000000000..905136d18f
 --- /dev/null
 +++ b/fleet-patches/0101-common-split-balance-fix-the-calibration-use-after-f.patch
 @@ -0,0 +1,661 @@
@@ -31412,7 +31412,7 @@ index 000000000..905136d18
 +
 diff --git a/fleet-patches/0102-chat-K2-Horizon-end-content-at-a-close-tag-after-the.patch b/fleet-patches/0102-chat-K2-Horizon-end-content-at-a-close-tag-after-the.patch
 new file mode 100644
-index 000000000..78f3942bc
+index 0000000000..78f3942bca
 --- /dev/null
 +++ b/fleet-patches/0102-chat-K2-Horizon-end-content-at-a-close-tag-after-the.patch
 @@ -0,0 +1,96 @@
@@ -31514,7 +31514,7 @@ index 000000000..78f3942bc
 +
 diff --git a/fleet-patches/0103-FLEET.md-calibration-grouping-busy-reference-calibra.patch b/fleet-patches/0103-FLEET.md-calibration-grouping-busy-reference-calibra.patch
 new file mode 100644
-index 000000000..b2e0b0ddf
+index 0000000000..b2e0b0ddf6
 --- /dev/null
 +++ b/fleet-patches/0103-FLEET.md-calibration-grouping-busy-reference-calibra.patch
 @@ -0,0 +1,71 @@
@@ -31590,7 +31590,7 @@ index 000000000..b2e0b0ddf
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 0172ab915..2df00e609 100644
+index 0172ab915e..2df00e609d 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -114,7 +114,11 @@ re-derive the equivalent change against the new upstream code, `git am

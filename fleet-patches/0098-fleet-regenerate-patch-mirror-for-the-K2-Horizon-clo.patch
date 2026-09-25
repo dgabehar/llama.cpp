@@ -15,7 +15,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0096-fleet-regenerate-patch-mirror-for-the-per-layer-cali.patch b/fleet-patches/0096-fleet-regenerate-patch-mirror-for-the-per-layer-cali.patch
 new file mode 100644
-index 000000000..9e2054a35
+index 0000000000..9e2054a35f
 --- /dev/null
 +++ b/fleet-patches/0096-fleet-regenerate-patch-mirror-for-the-per-layer-cali.patch
 @@ -0,0 +1,30420 @@
@@ -30441,7 +30441,7 @@ index 000000000..9e2054a35
 +
 diff --git a/fleet-patches/0097-chat-K2-Horizon-accept-any-effort-s-close-tag-as-the.patch b/fleet-patches/0097-chat-K2-Horizon-accept-any-effort-s-close-tag-as-the.patch
 new file mode 100644
-index 000000000..1ec7d379c
+index 0000000000..1ec7d379cb
 --- /dev/null
 +++ b/fleet-patches/0097-chat-K2-Horizon-accept-any-effort-s-close-tag-as-the.patch
 @@ -0,0 +1,122 @@
@@ -30568,7 +30568,7 @@ index 000000000..1ec7d379c
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index d5a4d975d..d40746e4d 100644
+index d5a4d975d6..d40746e4df 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -110,7 +110,9 @@ re-derive the equivalent change against the new upstream code, `git am

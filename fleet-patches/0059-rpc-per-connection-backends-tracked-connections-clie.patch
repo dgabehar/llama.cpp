@@ -61,7 +61,7 @@ Assisted-by: Claude Opus
  5 files changed, 291 insertions(+), 50 deletions(-)
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 05267f1af..6c5cdf61b 100644
+index 05267f1aff..6c5cdf61b5 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -27,6 +27,18 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint,
@@ -84,7 +84,7 @@ index 05267f1af..6c5cdf61b 100644
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index f31ffb310..facec4b62 100644
+index f31ffb3107..facec4b62c 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -22,6 +22,7 @@
@@ -501,7 +501,7 @@ index f31ffb310..facec4b62 100644
  
      GGML_UNUSED(reg);
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index 5ec15dc80..7e86b8af2 100644
+index 5ec15dc80c..7e86b8af28 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
 @@ -8,6 +8,7 @@
@@ -577,7 +577,7 @@ index 5ec15dc80..7e86b8af2 100644
      }
      return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
-index 3f747ecff..2176eebe5 100644
+index 3f747ecffd..2176eebe5b 100644
 --- a/ggml/src/ggml-rpc/transport.h
 +++ b/ggml/src/ggml-rpc/transport.h
 @@ -3,6 +3,7 @@
@@ -601,7 +601,7 @@ index 3f747ecff..2176eebe5 100644
      void update_caps(const uint8_t * remote_caps);
  
 diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
-index 2db5e52ab..31c9abf95 100644
+index 2db5e52ab8..31c9abf955 100644
 --- a/tools/rpc/rpc-server.cpp
 +++ b/tools/rpc/rpc-server.cpp
 @@ -176,6 +176,9 @@ struct rpc_server_params {

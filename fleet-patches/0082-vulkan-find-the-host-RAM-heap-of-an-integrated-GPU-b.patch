@@ -18,7 +18,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
 
 diff --git a/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch b/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
-index e86001926..79e6b07bd 100644
+index e860019263..79e6b07bd1 100644
 --- a/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
 +++ b/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
 @@ -1,4 +1,4 @@
@@ -27785,7 +27785,7 @@ index e86001926..79e6b07bd 100644
  
 diff --git a/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch b/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
 new file mode 100644
-index 000000000..ab2565bb2
+index 0000000000..ab2565bb20
 --- /dev/null
 +++ b/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
 @@ -0,0 +1,63 @@
@@ -27853,7 +27853,7 @@ index 000000000..ab2565bb2
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 548883075..6ba0a184d 100644
+index 548883075b..6ba0a184d7 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -95,7 +95,8 @@ re-derive the equivalent change against the new upstream code, `git am
@@ -27867,7 +27867,7 @@ index 548883075..6ba0a184d 100644
  0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
  (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 6ccaefe8c..a1ad9aa0d 100644
+index 6ccaefe8c1..a1ad9aa0d5 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -14857,7 +14857,18 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total

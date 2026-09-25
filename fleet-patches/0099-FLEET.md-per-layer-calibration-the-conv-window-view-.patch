@@ -10,7 +10,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 48 insertions(+), 3 deletions(-)
 
 diff --git a/FLEET.md b/FLEET.md
-index cf5cc5dc5..03f8c87ea 100644
+index cf5cc5dc53..03f8c87eac 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -236,9 +236,9 @@ Patches (see `fleet-patches/README.md`):

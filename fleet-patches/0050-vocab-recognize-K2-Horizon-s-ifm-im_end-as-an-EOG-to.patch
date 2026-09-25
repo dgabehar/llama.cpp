@@ -39,7 +39,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 1 insertion(+)
 
 diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
-index 80892e1c9..853e7ba8d 100644
+index 80892e1c98..853e7ba8d5 100644
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -2915,6 +2915,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {

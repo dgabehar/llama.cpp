@@ -10,7 +10,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 31 insertions(+)
 
 diff --git a/FLEET.md b/FLEET.md
-index 1b9201f92..0045a190c 100644
+index 1b9201f925..0045a190cb 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -157,6 +157,37 @@ whether the TODO is needed at all.

@@ -48,7 +48,7 @@ Assisted-by: Claude Sonnet 5
  create mode 100755 fleet-patches/regenerate.sh
 
 diff --git a/CLAUDE.md b/CLAUDE.md
-index 302cdeab9..2f2e0c802 100644
+index 302cdeab99..2f2e0c8023 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -1 +1,3 @@
@@ -57,7 +57,7 @@ index 302cdeab9..2f2e0c802 100644
 +If this checkout is the `dgabehar/llama.cpp` fork (not upstream), also read [FLEET.md](FLEET.md) -- fork-only notes (fleet patch maintenance, known-fragile areas) that don't apply to upstream contributors and don't live in this file to avoid rebase conflicts.
 diff --git a/FLEET.md b/FLEET.md
 new file mode 100644
-index 000000000..5437dd1be
+index 0000000000..5437dd1beb
 --- /dev/null
 +++ b/FLEET.md
 @@ -0,0 +1,67 @@
@@ -130,7 +130,7 @@ index 000000000..5437dd1be
 +  gabesrv06 as a stopgap pending a real patch.
 diff --git a/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch b/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch
 new file mode 100644
-index 000000000..5999b381b
+index 0000000000..5999b381ba
 --- /dev/null
 +++ b/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch
 @@ -0,0 +1,196 @@
@@ -332,7 +332,7 @@ index 000000000..5999b381b
 +
 diff --git a/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch b/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch
 new file mode 100644
-index 000000000..7fc88e999
+index 0000000000..7fc88e9994
 --- /dev/null
 +++ b/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch
 @@ -0,0 +1,323 @@
@@ -661,7 +661,7 @@ index 000000000..7fc88e999
 +
 diff --git a/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch b/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch
 new file mode 100644
-index 000000000..df35cc33b
+index 0000000000..df35cc33bb
 --- /dev/null
 +++ b/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch
 @@ -0,0 +1,105 @@
@@ -772,7 +772,7 @@ index 000000000..df35cc33b
 +
 diff --git a/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch b/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch
 new file mode 100644
-index 000000000..4bf0fbad2
+index 0000000000..4bf0fbad23
 --- /dev/null
 +++ b/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch
 @@ -0,0 +1,159 @@
@@ -937,7 +937,7 @@ index 000000000..4bf0fbad2
 +
 diff --git a/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch b/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch
 new file mode 100644
-index 000000000..36d24f778
+index 0000000000..36d24f7788
 --- /dev/null
 +++ b/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch
 @@ -0,0 +1,131 @@
@@ -1074,7 +1074,7 @@ index 000000000..36d24f778
 +
 diff --git a/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch b/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch
 new file mode 100644
-index 000000000..310859aa4
+index 0000000000..310859aa40
 --- /dev/null
 +++ b/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch
 @@ -0,0 +1,47 @@
@@ -1127,7 +1127,7 @@ index 000000000..310859aa4
 +
 diff --git a/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch b/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch
 new file mode 100644
-index 000000000..448248972
+index 0000000000..4482489723
 --- /dev/null
 +++ b/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch
 @@ -0,0 +1,47 @@
@@ -1180,7 +1180,7 @@ index 000000000..448248972
 +
 diff --git a/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch b/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch
 new file mode 100644
-index 000000000..53c4e1b4f
+index 0000000000..53c4e1b4f8
 --- /dev/null
 +++ b/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch
 @@ -0,0 +1,870 @@
@@ -2056,7 +2056,7 @@ index 000000000..53c4e1b4f
 +
 diff --git a/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch b/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch
 new file mode 100644
-index 000000000..bbaae9340
+index 0000000000..bbaae9340e
 --- /dev/null
 +++ b/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch
 @@ -0,0 +1,4917 @@
@@ -6979,7 +6979,7 @@ index 000000000..bbaae9340
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
 new file mode 100644
-index 000000000..e6959c790
+index 0000000000..e6959c7905
 --- /dev/null
 +++ b/fleet-patches/README.md
 @@ -0,0 +1,47 @@
@@ -7032,7 +7032,7 @@ index 000000000..e6959c790
 +patch vs. amend an existing one, the `sync-with-upstream` CI workflow).
 diff --git a/fleet-patches/regenerate.sh b/fleet-patches/regenerate.sh
 new file mode 100755
-index 000000000..7636587db
+index 0000000000..7636587db4
 --- /dev/null
 +++ b/fleet-patches/regenerate.sh
 @@ -0,0 +1,16 @@

@@ -75,7 +75,7 @@ Assisted-by: Claude Sonnet 5
  6 files changed, 110 insertions(+), 3 deletions(-)
 
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 6c8099cf2..f4d704b51 100644
+index 6c8099cf29..f4d704b51b 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -294,7 +294,7 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
@@ -88,7 +88,7 @@ index 6c8099cf2..f4d704b51 100644
  
      if (!msg_prv.tool_calls.empty()) {
 diff --git a/common/chat.h b/common/chat.h
-index 0e1423a5a..5cfe78c73 100644
+index 0e1423a5a3..5cfe78c73c 100644
 --- a/common/chat.h
 +++ b/common/chat.h
 @@ -13,6 +13,7 @@
@@ -117,7 +117,7 @@ index 0e1423a5a..5cfe78c73 100644
      std::string           reasoning_content_delta;
      std::string           content_delta;
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index 13733c1d9..69bcc1289 100644
+index 13733c1d9c..69bcc12892 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
 @@ -7546,6 +7546,41 @@ static void test_msg_diffs_compute() {
@@ -163,7 +163,7 @@ index 13733c1d9..69bcc1289 100644
  
  int main(int argc, char ** argv) {
 diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
-index 78169e9a5..ec3b436d5 100644
+index 78169e9a5d..ec3b436d54 100644
 --- a/tools/server/server-queue.cpp
 +++ b/tools/server/server-queue.cpp
 @@ -566,6 +566,19 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()>
@@ -187,7 +187,7 @@ index 78169e9a5..ec3b436d5 100644
              if (result->is_stop()) {
                  received_count++;
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 5beb79ea0..f81dab42b 100644
+index 5beb79ea0b..f81dab42b4 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -174,7 +174,23 @@ common_chat_msg task_result_state::update_chat_msg(
@@ -242,7 +242,7 @@ index 5beb79ea0..f81dab42b 100644
          auto & last_json = deltas[deltas.size() - 1];
          GGML_ASSERT(last_json.at("choices").size() >= 1);
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143f8..6a8f616f9 100644
+index 9c99143f8e..6a8f616f9d 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -111,6 +111,12 @@ struct task_result_state {

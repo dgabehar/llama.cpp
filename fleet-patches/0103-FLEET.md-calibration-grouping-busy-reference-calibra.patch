@@ -10,7 +10,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 34 insertions(+), 5 deletions(-)
 
 diff --git a/FLEET.md b/FLEET.md
-index 03f8c87ea..e7cfb574d 100644
+index 03f8c87eac..e7cfb574d1 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -325,10 +325,36 @@ node: the fit probe records the real graph's compute node count

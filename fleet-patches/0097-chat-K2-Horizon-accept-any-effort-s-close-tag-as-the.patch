@@ -25,7 +25,7 @@ Assisted-by: Claude Opus 5.5
  4 files changed, 37 insertions(+)
 
 diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
-index b78789d8c..e4a877db6 100644
+index b78789d8c0..e4a877db66 100644
 --- a/common/chat-auto-parser-generator.cpp
 +++ b/common/chat-auto-parser-generator.cpp
 @@ -143,6 +143,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
@@ -46,7 +46,7 @@ index b78789d8c..e4a877db6 100644
              if (!start.empty()) {
                  // Standard tag-based: optional(<think>reasoning</think>)
 diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
-index 8ae15c91e..0b7cc67bb 100644
+index 8ae15c91e1..0b7cc67bbd 100644
 --- a/common/chat-auto-parser.h
 +++ b/common/chat-auto-parser.h
 @@ -258,6 +258,7 @@ struct analyze_reasoning : analyze_base {
@@ -58,7 +58,7 @@ index 8ae15c91e..0b7cc67bb 100644
      analyze_reasoning() = default;
      analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
 diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
-index e2e20fda0..e03924b69 100644
+index e2e20fda03..e03924b695 100644
 --- a/common/chat-diff-analyzer.cpp
 +++ b/common/chat-diff-analyzer.cpp
 @@ -220,11 +220,17 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
@@ -80,7 +80,7 @@ index e2e20fda0..e03924b69 100644
                analysis.preserved_tokens.push_back("</ifm|think_faster>");
                // Not the registered start/end pair (see comment above), but still real
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index 69bcc1289..7642a059b 100644
+index 69bcc12892..7642a059b6 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
 @@ -1507,6 +1507,11 @@ class peg_test_builder {

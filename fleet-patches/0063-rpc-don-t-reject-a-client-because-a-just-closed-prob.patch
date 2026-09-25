@@ -29,7 +29,7 @@ Assisted-by: Claude Opus 5.5
  3 files changed, 49 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e55d1c3c1..0b2f672aa 100644
+index e55d1c3c15..0b2f672aaf 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -23,6 +23,7 @@
@@ -75,7 +75,7 @@ index e55d1c3c1..0b2f672aa 100644
              printf("Rejected client %s: %zu of %u connections in use\n", peer.c_str(), conns.size(), sparams.max_clients);
              fflush(stdout);
 diff --git a/tests/test-rpc-server-multiclient.cpp b/tests/test-rpc-server-multiclient.cpp
-index e95efd3c9..9612986e6 100644
+index e95efd3c9d..9612986e69 100644
 --- a/tests/test-rpc-server-multiclient.cpp
 +++ b/tests/test-rpc-server-multiclient.cpp
 @@ -190,6 +190,30 @@ static int mode_hello(const std::string & ep) {
@@ -118,7 +118,7 @@ index e95efd3c9..9612986e6 100644
      if (mode == "hold")           { return mode_hold(ep, arg(3, 2.0)); }
      if (mode == "malformed")      { return mode_malformed(ep); }
 diff --git a/tests/test-rpc-server-multiclient.sh b/tests/test-rpc-server-multiclient.sh
-index 80c4a3422..94e2eabc2 100755
+index 80c4a3422f..94e2eabc21 100755
 --- a/tests/test-rpc-server-multiclient.sh
 +++ b/tests/test-rpc-server-multiclient.sh
 @@ -99,6 +99,11 @@ sleep 0.5

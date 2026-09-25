@@ -33,7 +33,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0072-fleet-document-speed-aware-split-and-pipeline-fixes.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index d330b9eb9..a8a2537f1 100644
+index d330b9eb9a..a8a2537f18 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -197,6 +197,95 @@ Thunderbolt, hostNetwork raw pods, test image
@@ -134,7 +134,7 @@ index d330b9eb9..a8a2537f1 100644
  - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
 diff --git a/fleet-patches/0064-fleet-regenerate-patch-mirror-record-rpc-multi-clien.patch b/fleet-patches/0064-fleet-regenerate-patch-mirror-record-rpc-multi-clien.patch
 new file mode 100644
-index 000000000..5a22420a1
+index 0000000000..5a22420a1b
 --- /dev/null
 +++ b/fleet-patches/0064-fleet-regenerate-patch-mirror-record-rpc-multi-clien.patch
 @@ -0,0 +1,23338 @@
@@ -23478,7 +23478,7 @@ index 000000000..5a22420a1
 +
 diff --git a/fleet-patches/0065-vulkan-size-submit-batches-from-the-current-graph-s-.patch b/fleet-patches/0065-vulkan-size-submit-batches-from-the-current-graph-s-.patch
 new file mode 100644
-index 000000000..3ed430d08
+index 0000000000..3ed430d087
 --- /dev/null
 +++ b/fleet-patches/0065-vulkan-size-submit-batches-from-the-current-graph-s-.patch
 @@ -0,0 +1,82 @@
@@ -23566,7 +23566,7 @@ index 000000000..3ed430d08
 +
 diff --git a/fleet-patches/0066-llama-restore-the-worst-case-sched-plan-before-large.patch b/fleet-patches/0066-llama-restore-the-worst-case-sched-plan-before-large.patch
 new file mode 100644
-index 000000000..f8a4670a0
+index 0000000000..f8a4670a07
 --- /dev/null
 +++ b/fleet-patches/0066-llama-restore-the-worst-case-sched-plan-before-large.patch
 @@ -0,0 +1,140 @@
@@ -23712,7 +23712,7 @@ index 000000000..f8a4670a0
 +
 diff --git a/fleet-patches/0067-common-split-balance-for-speed-aware-layer-splits.patch b/fleet-patches/0067-common-split-balance-for-speed-aware-layer-splits.patch
 new file mode 100644
-index 000000000..ab59fdae1
+index 0000000000..ab59fdae19
 --- /dev/null
 +++ b/fleet-patches/0067-common-split-balance-for-speed-aware-layer-splits.patch
 @@ -0,0 +1,1201 @@
@@ -24919,7 +24919,7 @@ index 000000000..ab59fdae1
 +
 diff --git a/fleet-patches/0068-llama-server-capture-context-checkpoints-inside-a-ba.patch b/fleet-patches/0068-llama-server-capture-context-checkpoints-inside-a-ba.patch
 new file mode 100644
-index 000000000..43980e53f
+index 0000000000..43980e53fd
 --- /dev/null
 +++ b/fleet-patches/0068-llama-server-capture-context-checkpoints-inside-a-ba.patch
 @@ -0,0 +1,1232 @@
@@ -26157,7 +26157,7 @@ index 000000000..43980e53f
 +
 diff --git a/fleet-patches/0069-common-split-balance-time-the-dominant-weight-type-m.patch b/fleet-patches/0069-common-split-balance-time-the-dominant-weight-type-m.patch
 new file mode 100644
-index 000000000..ffd3d40f7
+index 0000000000..ffd3d40f77
 --- /dev/null
 +++ b/fleet-patches/0069-common-split-balance-time-the-dominant-weight-type-m.patch
 @@ -0,0 +1,154 @@
@@ -26317,7 +26317,7 @@ index 000000000..ffd3d40f7
 +
 diff --git a/fleet-patches/0070-vulkan-keep-the-flop-sized-submits-of-a-graph-below-.patch b/fleet-patches/0070-vulkan-keep-the-flop-sized-submits-of-a-graph-below-.patch
 new file mode 100644
-index 000000000..dbfe67277
+index 0000000000..dbfe67277e
 --- /dev/null
 +++ b/fleet-patches/0070-vulkan-keep-the-flop-sized-submits-of-a-graph-below-.patch
 @@ -0,0 +1,62 @@
@@ -26385,7 +26385,7 @@ index 000000000..dbfe67277
 +
 diff --git a/fleet-patches/0071-common-split-balance-model-imperfect-stage-overlap-i.patch b/fleet-patches/0071-common-split-balance-model-imperfect-stage-overlap-i.patch
 new file mode 100644
-index 000000000..7f734ae22
+index 0000000000..7f734ae22e
 --- /dev/null
 +++ b/fleet-patches/0071-common-split-balance-model-imperfect-stage-overlap-i.patch
 @@ -0,0 +1,42 @@
@@ -26433,7 +26433,7 @@ index 000000000..7f734ae22
 +
 diff --git a/fleet-patches/0072-fleet-document-speed-aware-split-and-pipeline-fixes.patch b/fleet-patches/0072-fleet-document-speed-aware-split-and-pipeline-fixes.patch
 new file mode 100644
-index 000000000..e7ca21522
+index 0000000000..e7ca215223
 --- /dev/null
 +++ b/fleet-patches/0072-fleet-document-speed-aware-split-and-pipeline-fixes.patch
 @@ -0,0 +1,148 @@
@@ -26586,7 +26586,7 @@ index 000000000..e7ca21522
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 2dc6083a7..c90d844bc 100644
+index 2dc6083a7a..c90d844bc0 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -82,6 +82,13 @@ re-derive the equivalent change against the new upstream code, `git am

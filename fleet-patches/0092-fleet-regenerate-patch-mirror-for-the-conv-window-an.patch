@@ -15,7 +15,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0091-vulkan-cap-an-integrated-GPU-s-total-free-memory-at-.patch
 
 diff --git a/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch b/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
-index 141dcf1c4..b725d9669 100644
+index 141dcf1c47..b725d96693 100644
 --- a/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
 +++ b/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
 @@ -1,4 +1,4 @@
@@ -28961,7 +28961,7 @@ index 141dcf1c4..b725d9669 100644
  
 diff --git a/fleet-patches/0090-models-fix-the-conv-state-window-over-the-transposed.patch b/fleet-patches/0090-models-fix-the-conv-state-window-over-the-transposed.patch
 new file mode 100644
-index 000000000..242b76946
+index 0000000000..242b76946f
 --- /dev/null
 +++ b/fleet-patches/0090-models-fix-the-conv-state-window-over-the-transposed.patch
 @@ -0,0 +1,90 @@
@@ -29057,7 +29057,7 @@ index 000000000..242b76946
 +
 diff --git a/fleet-patches/0091-vulkan-cap-an-integrated-GPU-s-total-free-memory-at-.patch b/fleet-patches/0091-vulkan-cap-an-integrated-GPU-s-total-free-memory-at-.patch
 new file mode 100644
-index 000000000..3a009da1a
+index 0000000000..3a009da1ae
 --- /dev/null
 +++ b/fleet-patches/0091-vulkan-cap-an-integrated-GPU-s-total-free-memory-at-.patch
 @@ -0,0 +1,71 @@
@@ -29133,7 +29133,7 @@ index 000000000..3a009da1a
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 131144ff1..4e1b518a5 100644
+index 131144ff1e..4e1b518a55 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -103,7 +103,10 @@ re-derive the equivalent change against the new upstream code, `git am

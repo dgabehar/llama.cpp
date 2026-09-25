@@ -58,7 +58,7 @@ Assisted-by: Claude Sonnet 5
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 1f8cb7906..05267f1af 100644
+index 1f8cb7906c..05267f1aff 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
@@ -75,7 +75,7 @@ index 1f8cb7906..05267f1af 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef92..94a5377ee 100644
+index 224bdef927..94a5377eed 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -601,6 +601,15 @@ extern "C" {
@@ -113,7 +113,7 @@ index 224bdef92..94a5377ee 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * s,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 3ec40fb1a..199cf7d48 100644
+index 3ec40fb1af..199cf7d484 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -810,6 +810,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -158,7 +158,7 @@ index 3ec40fb1a..199cf7d48 100644
                  GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
                  split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..604388cd9 100644
+index 8bb0ff7bc3..604388cd99 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2045,6 +2045,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -181,7 +181,7 @@ index 8bb0ff7bc..604388cd9 100644
          case GGML_OP_LIGHTNING_INDEXER:
              {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a73..3351fc605 100644
+index ba00a0a73e..3351fc605c 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -9768,6 +9768,98 @@ void ggml_compute_forward_ssm_conv(
@@ -284,7 +284,7 @@ index ba00a0a73..3351fc605 100644
  
  static void ggml_compute_forward_ssm_scan_f32(
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 2728b08b6..3f374659e 100644
+index 2728b08b6c..3f374659ea 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
 @@ -92,6 +92,7 @@ void ggml_compute_forward_flash_attn_back(
@@ -296,7 +296,7 @@ index 2728b08b6..3f374659e 100644
  void ggml_compute_forward_win_part(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
-index 4ae5fea7a..961141b53 100644
+index 4ae5fea7a8..961141b536 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
 @@ -128,6 +128,7 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
@@ -308,7 +308,7 @@ index 4ae5fea7a..961141b53 100644
  void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst);
  void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-index 15abd5468..58db41219 100644
+index 15abd54681..58db41219e 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 @@ -1336,6 +1336,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
@@ -321,7 +321,7 @@ index 15abd5468..58db41219 100644
              const int32_t s0 = tensor->op_params[0];
              const int32_t s1 = tensor->op_params[1];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
-index 68b3200b3..b1c6707a2 100644
+index 68b3200b3e..b1c6707a20 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
 @@ -699,6 +699,14 @@ struct vk_op_ssm_conv_push_constants {
@@ -340,7 +340,7 @@ index 68b3200b3..b1c6707a2 100644
      uint32_t Cout;
      uint32_t Cin;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
-index 67e3361ed..ad7f7b718 100644
+index 67e3361ed3..ad7f7b7181 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 @@ -976,6 +976,7 @@ struct vk_device_struct {
@@ -352,7 +352,7 @@ index 67e3361ed..ad7f7b718 100644
      vk_pipeline pipeline_opt_step_sgd_f32;
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index da0e24fcd..e0084ebfa 100644
+index da0e24fcd9..e0084ebfaf 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3494,6 +3494,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -440,7 +440,7 @@ index da0e24fcd..e0084ebfa 100644
          case GGML_OP_COL2IM_1D:
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
 new file mode 100644
-index 000000000..1a693d902
+index 0000000000..1a693d9022
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
 @@ -0,0 +1,67 @@
@@ -512,7 +512,7 @@ index 000000000..1a693d902
 +    dst[dst_idx] = sum;
 +}
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 73cef00b0..b6e9be68b 100644
+index 73cef00b02..b6e9be68b1 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 @@ -1221,6 +1221,8 @@ void process_shaders() {
@@ -525,7 +525,7 @@ index 73cef00b0..b6e9be68b 100644
  
      for (auto &c : compiles) {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index a286083b9..ed2f9df35 100644
+index a286083b93..ed2f9df35b 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -600,7 +600,7 @@ index a286083b9..ed2f9df35 100644
  
  struct ggml_tensor * ggml_ssm_scan(
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ad6612647..93866b61d 100644
+index ad66126477..93866b61df 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -446,7 +446,53 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
@@ -726,7 +726,7 @@ index ad6612647..93866b61d 100644
  
  ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 diff --git a/src/models/models.h b/src/models/models.h
-index 3f9c67c63..7bde13530 100644
+index 3f9c67c63c..7bde13530c 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -76,9 +76,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
@@ -747,7 +747,7 @@ index 3f9c67c63..7bde13530 100644
              ggml_tensor *        conv_states_all,
              ggml_tensor *        qkv_mixed,
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index a1e263500..6f3592325 100644
+index a1e263500e..6f35923258 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -382,13 +382,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
@@ -767,7 +767,7 @@ index a1e263500..6f3592325 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index bdf772625..af4894f60 100644
+index bdf7726250..af4894f600 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -406,13 +406,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
@@ -787,7 +787,7 @@ index bdf772625..af4894f60 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
-index b63fc9c6a..1f7ad9742 100644
+index b63fc9c6a1..1f7ad97423 100644
 --- a/src/models/qwen3next.cpp
 +++ b/src/models/qwen3next.cpp
 @@ -462,13 +462,13 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
@@ -807,7 +807,7 @@ index b63fc9c6a..1f7ad9742 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e4d04f13b..1e241457d 100644
+index e4d04f13b4..1e241457d3 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4393,6 +4393,49 @@ struct test_ssm_conv : public test_case {

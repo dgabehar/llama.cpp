@@ -48,7 +48,7 @@ Assisted-by: Claude Sonnet 5
  2 files changed, 42 insertions(+), 16 deletions(-)
 
 diff --git a/FLEET.md b/FLEET.md
-index 0a284655b..dd0024e57 100644
+index 0a284655b8..dd0024e57c 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -83,21 +83,32 @@ discipline by standing convention).
@@ -100,7 +100,7 @@ index 0a284655b..dd0024e57 100644
 +  of hard-failing. Confirmed via the same before/after
 +  build-and-run-test-chat method as `35e651927`.
 diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
-index 75a908a28..5c8214845 100644
+index 75a908a281..5c8214845c 100644
 --- a/common/peg-parser.cpp
 +++ b/common/peg-parser.cpp
 @@ -716,7 +716,22 @@ struct parser_executor {

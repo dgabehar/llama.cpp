@@ -19,7 +19,7 @@ Assisted-by: Claude Sonnet 5
  1 file changed, 19 insertions(+)
 
 diff --git a/FLEET.md b/FLEET.md
-index 23779cc6a..0a284655b 100644
+index 23779cc6a3..0a284655b8 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -82,3 +82,22 @@ discipline by standing convention).

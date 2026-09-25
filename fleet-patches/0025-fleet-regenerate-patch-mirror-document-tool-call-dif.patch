@@ -28,7 +28,7 @@ Assisted-by: Claude Sonnet 5
 
 diff --git a/fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch b/fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
 new file mode 100644
-index 000000000..43dca6b5d
+index 0000000000..43dca6b5d2
 --- /dev/null
 +++ b/fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
 @@ -0,0 +1,10060 @@
@@ -10094,7 +10094,7 @@ index 000000000..43dca6b5d
 +
 diff --git a/fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-for-.patch b/fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-for-.patch
 new file mode 100644
-index 000000000..46d56f9f9
+index 0000000000..46d56f9f91
 --- /dev/null
 +++ b/fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-for-.patch
 @@ -0,0 +1,42 @@
@@ -10142,7 +10142,7 @@ index 000000000..46d56f9f9
 +
 diff --git a/fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-diff-in.patch b/fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
 new file mode 100644
-index 000000000..0ea01c846
+index 0000000000..0ea01c846d
 --- /dev/null
 +++ b/fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
 @@ -0,0 +1,280 @@
@@ -10428,7 +10428,7 @@ index 000000000..0ea01c846
 +
 diff --git a/fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch b/fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
 new file mode 100644
-index 000000000..2012830a3
+index 0000000000..2012830a36
 --- /dev/null
 +++ b/fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
 @@ -0,0 +1,50 @@
@@ -10483,7 +10483,7 @@ index 000000000..2012830a3
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 108c762ad..56742d951 100644
+index 108c762adb..56742d9512 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,

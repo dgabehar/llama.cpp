@@ -37,7 +37,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/tests/test-json-schema-to-grammar.cpp b/tests/test-json-schema-to-grammar.cpp
-index d5873c19d..6a745629c 100755
+index d5873c19d0..6a745629ca 100755
 --- a/tests/test-json-schema-to-grammar.cpp
 +++ b/tests/test-json-schema-to-grammar.cpp
 @@ -1460,13 +1460,19 @@ static void test_all(const std::string & title, std::function<void(const TestCas

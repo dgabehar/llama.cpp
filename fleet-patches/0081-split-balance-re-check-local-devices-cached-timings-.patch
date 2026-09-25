@@ -18,7 +18,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 417a9fd74..adef60500 100644
+index 417a9fd74b..adef605000 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -387,8 +387,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_f
@@ -54,7 +54,7 @@ index 417a9fd74..adef60500 100644
          }
          LOG_INF("%s: calibrated %s in %.1f s\n", __func__, ggml_backend_dev_name(devs[i]), (ggml_time_us() - t0) * 1e-6);
 diff --git a/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch b/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
-index ea7791c86..c1703bce7 100644
+index ea7791c863..c1703bce77 100644
 --- a/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
 +++ b/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
 @@ -1,4 +1,4 @@
@@ -27621,7 +27621,7 @@ index ea7791c86..c1703bce7 100644
  --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 diff --git a/fleet-patches/0080-vulkan-on-integrated-GPUs-cap-the-free-memory-of-hos.patch b/fleet-patches/0080-vulkan-on-integrated-GPUs-cap-the-free-memory-of-hos.patch
 new file mode 100644
-index 000000000..60a6abfc0
+index 0000000000..60a6abfc0d
 --- /dev/null
 +++ b/fleet-patches/0080-vulkan-on-integrated-GPUs-cap-the-free-memory-of-hos.patch
 @@ -0,0 +1,87 @@
@@ -27714,7 +27714,7 @@ index 000000000..60a6abfc0
 +
 diff --git a/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch b/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
 new file mode 100644
-index 000000000..e86001926
+index 0000000000..e860019263
 --- /dev/null
 +++ b/fleet-patches/0081-split-balance-re-check-local-devices-cached-timings-.patch
 @@ -0,0 +1,52 @@
@@ -27771,7 +27771,7 @@ index 000000000..e86001926
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 8a10098fa..548883075 100644
+index 8a10098fa1..548883075b 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -93,7 +93,9 @@ re-derive the equivalent change against the new upstream code, `git am

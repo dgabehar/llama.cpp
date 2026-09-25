@@ -56,7 +56,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 tests/test-state-capture.cpp
 
 diff --git a/include/llama.h b/include/llama.h
-index 5af3be4c6..cd456c364 100644
+index 5af3be4c67..cd456c3648 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -953,6 +953,33 @@ extern "C" {
@@ -94,7 +94,7 @@ index 5af3be4c6..cd456c364 100644
      // Decoding
      //
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index 2b98a552f..ba8c062f9 100644
+index 2b98a552f4..ba8c062f96 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
 @@ -502,6 +502,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
@@ -190,7 +190,7 @@ index 2b98a552f..ba8c062f9 100644
  
      pos       .clear();
 diff --git a/src/llama-batch.h b/src/llama-batch.h
-index a3d1889d4..88a03fd4e 100644
+index a3d1889d4a..88a03fd4e2 100644
 --- a/src/llama-batch.h
 +++ b/src/llama-batch.h
 @@ -110,6 +110,11 @@ public:
@@ -225,7 +225,7 @@ index a3d1889d4..88a03fd4e 100644
      using seq_cpl_t = std::vector<bool>;
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4d7d2cf9c..53f1bf163 100644
+index 4d7d2cf9c6..53f1bf163e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1903,6 +1903,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
@@ -600,7 +600,7 @@ index 4d7d2cf9c..53f1bf163 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 1bce28841..5a77022d2 100644
+index 1bce28841f..5a77022d29 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -157,6 +157,10 @@ struct llama_context {
@@ -656,7 +656,7 @@ index 1bce28841..5a77022d2 100644
  
      // env: LLAMA_GRAPH_REUSE_DISABLE
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 6582c4499..eeae6ec67 100644
+index 6582c44993..eeae6ec67a 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -207,6 +207,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -689,7 +689,7 @@ index 6582c4499..eeae6ec67 100644
          LABEL main
 diff --git a/tests/test-state-capture.cpp b/tests/test-state-capture.cpp
 new file mode 100644
-index 000000000..126c33828
+index 0000000000..126c338282
 --- /dev/null
 +++ b/tests/test-state-capture.cpp
 @@ -0,0 +1,226 @@
@@ -920,7 +920,7 @@ index 000000000..126c33828
 +    return n_fail == 0 ? 0 : 1;
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 8efeb6e66..bd8b4dc6e 100644
+index 8efeb6e661..bd8b4dc6e1 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -256,6 +256,15 @@ struct server_slot {

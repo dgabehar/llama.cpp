@@ -87,7 +87,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 25 insertions(+), 16 deletions(-)
 
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index a71838eaf..96f4c463c 100644
+index a71838eafc..96f4c463c1 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
 @@ -1124,6 +1124,20 @@ static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buff

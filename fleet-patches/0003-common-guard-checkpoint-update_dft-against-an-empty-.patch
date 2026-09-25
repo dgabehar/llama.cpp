@@ -73,7 +73,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 17 insertions(+)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index d8319cd9a..c7d1295c9 100644
+index d8319cd9ac..c7d1295c95 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -2305,6 +2305,23 @@ void common_prompt_checkpoint::update_dft(

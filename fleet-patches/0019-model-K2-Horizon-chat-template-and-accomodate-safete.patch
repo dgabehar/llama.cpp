@@ -12,7 +12,7 @@ Subject: [PATCH] model: K2 Horizon chat template and accomodate safetensors
  create mode 100644 models/templates/k2-horizon.jinja
 
 diff --git a/conversion/base.py b/conversion/base.py
-index 3df437929..b3389bf7a 100644
+index 3df437929f..b3389bf7a6 100644
 --- a/conversion/base.py
 +++ b/conversion/base.py
 @@ -231,6 +231,8 @@ class ModelBase:
@@ -25,7 +25,7 @@ index 3df437929..b3389bf7a 100644
          if not is_safetensors:
              part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 diff --git a/conversion/k2_horizon.py b/conversion/k2_horizon.py
-index 6ceb30b29..2d7722209 100644
+index 6ceb30b29f..2d77222095 100644
 --- a/conversion/k2_horizon.py
 +++ b/conversion/k2_horizon.py
 @@ -1,6 +1,7 @@
@@ -63,7 +63,7 @@ index 6ceb30b29..2d7722209 100644
 -
 diff --git a/models/templates/k2-horizon.jinja b/models/templates/k2-horizon.jinja
 new file mode 100644
-index 000000000..9dc680f7a
+index 0000000000..9dc680f7a7
 --- /dev/null
 +++ b/models/templates/k2-horizon.jinja
 @@ -0,0 +1,883 @@

@@ -41,7 +41,7 @@ Assisted-by: Claude Opus 5.5
  3 files changed, 323 insertions(+), 74 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 25518fcca..0d2bb4652 100644
+index 25518fcca5..0d2bb46526 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -19,6 +19,7 @@
@@ -485,7 +485,7 @@ index 25518fcca..0d2bb4652 100644
          cm.n_expert      = n_expert;
          cm.n_expert_used = n_expert_used;
 diff --git a/common/split-balance.h b/common/split-balance.h
-index 377e11eab..6ee75fe4c 100644
+index 377e11eab5..6ee75fe4c4 100644
 --- a/common/split-balance.h
 +++ b/common/split-balance.h
 @@ -84,6 +84,9 @@ struct common_split_calib_weight {
@@ -499,7 +499,7 @@ index 377e11eab..6ee75fe4c 100644
      uint32_t n_head_kv  = 0;
      uint32_t head_dim_k = 0;
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index 1c76c8c0a..ba385e0ec 100644
+index 1c76c8c0a3..ba385e0ec2 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -2,9 +2,15 @@

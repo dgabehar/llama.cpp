@@ -29,7 +29,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 50 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 20ba6c806..a17a28446 100644
+index 20ba6c806f..a17a284467 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1664,6 +1664,13 @@ private:
@@ -57,7 +57,7 @@ index 20ba6c806..a17a28446 100644
                  SRV_TRC("%s", "updating prompt cache\n");
  
 diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
-index a36186617..ba64808af 100644
+index a361866176..ba64808af6 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
 @@ -676,3 +676,43 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):

@@ -18,7 +18,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0104-fleet-regenerate-patch-mirror-for-the-round-5-fixes.patch b/fleet-patches/0104-fleet-regenerate-patch-mirror-for-the-round-5-fixes.patch
 new file mode 100644
-index 000000000..8f1fe36c1
+index 0000000000..8f1fe36c13
 --- /dev/null
 +++ b/fleet-patches/0104-fleet-regenerate-patch-mirror-for-the-round-5-fixes.patch
 @@ -0,0 +1,31611 @@
@@ -31635,7 +31635,7 @@ index 000000000..8f1fe36c1
 +
 diff --git a/fleet-patches/0105-common-split-balance-survive-malformed-cache-entries.patch b/fleet-patches/0105-common-split-balance-survive-malformed-cache-entries.patch
 new file mode 100644
-index 000000000..1ae29f927
+index 0000000000..1ae29f9271
 --- /dev/null
 +++ b/fleet-patches/0105-common-split-balance-survive-malformed-cache-entries.patch
 @@ -0,0 +1,203 @@
@@ -31844,7 +31844,7 @@ index 000000000..1ae29f927
 +
 diff --git a/fleet-patches/0106-server-chat-stop-generating-at-a-stray-K2-Horizon-cl.patch b/fleet-patches/0106-server-chat-stop-generating-at-a-stray-K2-Horizon-cl.patch
 new file mode 100644
-index 000000000..8079f387d
+index 0000000000..8079f387d0
 --- /dev/null
 +++ b/fleet-patches/0106-server-chat-stop-generating-at-a-stray-K2-Horizon-cl.patch
 @@ -0,0 +1,174 @@
@@ -32024,7 +32024,7 @@ index 000000000..8079f387d
 +
 diff --git a/fleet-patches/0107-FLEET.md-K2-stop_after_reasoning.patch b/fleet-patches/0107-FLEET.md-K2-stop_after_reasoning.patch
 new file mode 100644
-index 000000000..191dbc71e
+index 0000000000..191dbc71ee
 --- /dev/null
 +++ b/fleet-patches/0107-FLEET.md-K2-stop_after_reasoning.patch
 @@ -0,0 +1,29 @@
@@ -32058,7 +32058,7 @@ index 000000000..191dbc71e
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 2df00e609..f5a07f8c6 100644
+index 2df00e609d..f5a07f8c62 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -118,7 +118,11 @@ re-derive the equivalent change against the new upstream code, `git am

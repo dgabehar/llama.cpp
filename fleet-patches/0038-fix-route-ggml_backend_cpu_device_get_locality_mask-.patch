@@ -31,7 +31,7 @@ Assisted-by: Claude Sonnet
  3 files changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index f0af5c04b..178c8da44 100644
+index f0af5c04bc..178c8da446 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1819,9 +1819,13 @@ std::vector<float> common_cpu_split_calibrate() {
@@ -58,7 +58,7 @@ index f0af5c04b..178c8da44 100644
          auto * threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
          auto * set_threadpool_fn  = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index e2db18ac7..d6d4c3e62 100644
+index e2db18ac7e..d6d4c3e62a 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -861,6 +861,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
@@ -72,7 +72,7 @@ index e2db18ac7..d6d4c3e62 100644
      // threadpool - TODO:  move to ggml-base
      if (strcmp(name, "ggml_threadpool_new") == 0) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 175101737..df4bca517 100644
+index 1751017372..df4bca5172 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -392,9 +392,13 @@ llama_context::llama_context(

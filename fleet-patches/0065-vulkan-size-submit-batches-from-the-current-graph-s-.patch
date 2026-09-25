@@ -21,7 +21,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 9 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
-index ad7f7b718..11ebc1219 100644
+index ad7f7b7181..11ebc12190 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 @@ -1239,7 +1239,6 @@ struct ggml_backend_vk_context {
@@ -33,7 +33,7 @@ index ad7f7b718..11ebc1219 100644
      // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
      vk_pipeline_struct * prealloc_y_last_pipeline_used {};
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index fa2f12229..fa56a0772 100644
+index fa2f122295..fa56a07720 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -13893,7 +13893,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg

@@ -25,7 +25,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 24 insertions(+), 1 deletion(-)
 
 diff --git a/tests/test-cpu-device-split.cpp b/tests/test-cpu-device-split.cpp
-index 5b374d4dd..001533364 100644
+index 5b374d4dd9..0015333646 100644
 --- a/tests/test-cpu-device-split.cpp
 +++ b/tests/test-cpu-device-split.cpp
 @@ -11,8 +11,20 @@

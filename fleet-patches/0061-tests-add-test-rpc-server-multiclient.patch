@@ -32,7 +32,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/tests/test-rpc-server-multiclient.cpp b/tests/test-rpc-server-multiclient.cpp
 new file mode 100644
-index 000000000..e95efd3c9
+index 0000000000..e95efd3c9d
 --- /dev/null
 +++ b/tests/test-rpc-server-multiclient.cpp
 @@ -0,0 +1,356 @@
@@ -394,7 +394,7 @@ index 000000000..e95efd3c9
 +}
 diff --git a/tests/test-rpc-server-multiclient.sh b/tests/test-rpc-server-multiclient.sh
 new file mode 100755
-index 000000000..80c4a3422
+index 0000000000..80c4a3422f
 --- /dev/null
 +++ b/tests/test-rpc-server-multiclient.sh
 @@ -0,0 +1,121 @@
@@ -520,7 +520,7 @@ index 000000000..80c4a3422
 +
 +echo "OK"
 diff --git a/tools/rpc/CMakeLists.txt b/tools/rpc/CMakeLists.txt
-index 2891c7d03..1ed0487c8 100644
+index 2891c7d034..1ed0487c88 100644
 --- a/tools/rpc/CMakeLists.txt
 +++ b/tools/rpc/CMakeLists.txt
 @@ -13,6 +13,16 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)

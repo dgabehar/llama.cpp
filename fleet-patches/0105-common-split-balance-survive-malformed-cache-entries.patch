@@ -25,7 +25,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 56 insertions(+), 28 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 0d2bb4652..1b24cf59e 100644
+index 0d2bb46526..1b24cf59e8 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -847,19 +847,24 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
@@ -176,7 +176,7 @@ index 0d2bb4652..1b24cf59e 100644
              }
          }
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index ba385e0ec..044a30ec0 100644
+index ba385e0ec2..044a30ec0d 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -158,8 +158,9 @@ static void test_calibrate_cpu() {

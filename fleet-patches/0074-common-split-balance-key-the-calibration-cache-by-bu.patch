@@ -21,7 +21,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index a8a2537f1..574404faa 100644
+index a8a2537f18..574404faae 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -239,8 +239,9 @@ Patches (see `fleet-patches/README.md`):
@@ -37,7 +37,7 @@ index a8a2537f1..574404faa 100644
      `--split-workload P:G` request (default 4096:256), capped by the fit
      memory projection.
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 0877f7ebf..3f465bc7f 100644
+index 0877f7ebf9..3f465bc7f4 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -1,4 +1,5 @@
@@ -98,7 +98,7 @@ index 0877f7ebf..3f465bc7f 100644
          dirty = true;
      }
 diff --git a/fleet-patches/0073-fleet-patch-table-0065-0071-are-fork-only.patch b/fleet-patches/0073-fleet-patch-table-0065-0071-are-fork-only.patch
-index 0a0a7c8f2..8439efb23 100644
+index 0a0a7c8f2d..8439efb233 100644
 --- a/fleet-patches/0073-fleet-patch-table-0065-0071-are-fork-only.patch
 +++ b/fleet-patches/0073-fleet-patch-table-0065-0071-are-fork-only.patch
 @@ -1,13 +1,26550 @@
@@ -26657,7 +26657,7 @@ index 0a0a7c8f2..8439efb23 100644
  --- a/fleet-patches/README.md
 diff --git a/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch b/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
 new file mode 100644
-index 000000000..243dc0c07
+index 0000000000..243dc0c077
 --- /dev/null
 +++ b/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
 @@ -0,0 +1,98 @@
@@ -26760,7 +26760,7 @@ index 000000000..243dc0c07
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 6b77b5464..edc8681ef 100644
+index 6b77b54643..edc8681ef4 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -89,6 +89,7 @@ re-derive the equivalent change against the new upstream code, `git am

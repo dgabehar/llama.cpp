@@ -28,7 +28,7 @@ Assisted-by: Claude Opus 5.5
  7 files changed, 57 insertions(+), 1 deletion(-)
 
 diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
-index b98957e36..5add993ed 100644
+index b98957e36f..5add993ed8 100644
 --- a/common/chat-auto-parser-generator.cpp
 +++ b/common/chat-auto-parser-generator.cpp
 @@ -39,6 +39,11 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
@@ -53,7 +53,7 @@ index b98957e36..5add993ed 100644
      }
      return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 diff --git a/common/chat.h b/common/chat.h
-index 5cfe78c73..c48e286fa 100644
+index 5cfe78c73c..c48e286faa 100644
 --- a/common/chat.h
 +++ b/common/chat.h
 @@ -289,6 +289,7 @@ struct common_chat_params {
@@ -65,7 +65,7 @@ index 5cfe78c73..c48e286fa 100644
      common_chat_msg_delimiters          message_delimiters;
  };
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 7bf1138c8..ef0ed18ad 100644
+index 7bf1138c8a..ef0ed18ad0 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -1377,6 +1377,9 @@ json oaicompat_chat_params_parse(
@@ -79,7 +79,7 @@ index 7bf1138c8..ef0ed18ad 100644
          llama_params["chat_parser"] = chat_params.parser;
      }
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 880c18f74..35b05694c 100644
+index 880c18f74a..35b05694ce 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -633,6 +633,37 @@ struct server_slot {
@@ -121,7 +121,7 @@ index 880c18f74..35b05694c 100644
      }
  
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index 27ecafb7a..38f1617e6 100644
+index 27ecafb7a5..38f1617e64 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -502,6 +502,20 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
@@ -146,7 +146,7 @@ index 27ecafb7a..38f1617e6 100644
          ->set_desc("The order in which samplers are applied. An array of sampler type names, or a single string of sampler chars")
          ->set_handler([&](field_eval_context & ctx, const json & data) {
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 4c7e5c256..51ec1f798 100644
+index 4c7e5c256f..51ec1f7981 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -119,6 +119,7 @@ json task_params::to_json(bool only_metrics) const {
@@ -158,7 +158,7 @@ index 4c7e5c256..51ec1f798 100644
          {"n_predict",                 n_predict}, // TODO: deduplicate?
          {"n_keep",                    n_keep},
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 715aafef7..11e520175 100644
+index 715aafef7d..11e5201750 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -70,6 +70,7 @@ struct task_params {

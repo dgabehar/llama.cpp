@@ -93,7 +93,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 179 insertions(+), 2 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b6835e434..c4a533825 100644
+index b6835e4345..c4a533825b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -2371,6 +2371,128 @@ private:

@@ -35,7 +35,7 @@ Assisted-by: Claude Opus 5.5
  7 files changed, 676 insertions(+), 106 deletions(-)
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 31b87b12c..3ea865256 100644
+index 31b87b12c8..3ea865256e 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -13,6 +13,15 @@
@@ -84,7 +84,7 @@ index 31b87b12c..3ea865256 100644
      common_device_memory_data_vec ret(main.size());
      for (size_t i = 0; i < main.size(); i++) {
 diff --git a/common/fit.h b/common/fit.h
-index 24bcbc7ea..1a6785ae3 100644
+index 24bcbc7eaf..1a6785ae35 100644
 --- a/common/fit.h
 +++ b/common/fit.h
 @@ -55,6 +55,10 @@ struct common_device_memory_data {
@@ -99,7 +99,7 @@ index 24bcbc7ea..1a6785ae3 100644
  // main model's devices the way common_fit_params accounts for it. extra may be nullptr.
  common_device_memory_data_vec common_get_device_memory_data_with_extra(
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 2e363bc39..25518fcca 100644
+index 2e363bc396..25518fcca5 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -20,7 +20,9 @@
@@ -972,7 +972,7 @@ index 2e363bc39..25518fcca 100644
      // that would overflow and try again
      std::vector<uint32_t> n;
 diff --git a/common/split-balance.h b/common/split-balance.h
-index cf6332a09..377e11eab 100644
+index cf6332a091..377e11eab5 100644
 --- a/common/split-balance.h
 +++ b/common/split-balance.h
 @@ -31,6 +31,7 @@ struct common_split_device_perf {
@@ -1046,7 +1046,7 @@ index cf6332a09..377e11eab 100644
  const char * common_split_balance_mode_name(common_split_balance_mode mode);
  
 diff --git a/include/llama.h b/include/llama.h
-index b62c0a5e4..4bf5d0486 100644
+index b62c0a5e48..4bf5d0486a 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -583,6 +583,10 @@ extern "C" {
@@ -1061,7 +1061,7 @@ index b62c0a5e4..4bf5d0486 100644
      DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
      DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index cbd04a1cf..6c6f5eafb 100644
+index cbd04a1cf7..6c6f5eafbc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -652,6 +652,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
@@ -1116,7 +1116,7 @@ index cbd04a1cf..6c6f5eafb 100644
      return &ctx->get_model();
  }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 0cd1cf860..f7a3b0442 100644
+index 0cd1cf8607..f7a3b04429 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -68,6 +68,9 @@ struct llama_context {

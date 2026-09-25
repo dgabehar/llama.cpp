@@ -14,7 +14,7 @@ Assisted-by: Claude Opus 5.5
 
 diff --git a/fleet-patches/0098-fleet-regenerate-patch-mirror-for-the-K2-Horizon-clo.patch b/fleet-patches/0098-fleet-regenerate-patch-mirror-for-the-K2-Horizon-clo.patch
 new file mode 100644
-index 000000000..75f09ed56
+index 0000000000..75f09ed56e
 --- /dev/null
 +++ b/fleet-patches/0098-fleet-regenerate-patch-mirror-for-the-K2-Horizon-clo.patch
 @@ -0,0 +1,30587 @@
@@ -30607,7 +30607,7 @@ index 000000000..75f09ed56
 +
 diff --git a/fleet-patches/0099-FLEET.md-per-layer-calibration-the-conv-window-view-.patch b/fleet-patches/0099-FLEET.md-per-layer-calibration-the-conv-window-view-.patch
 new file mode 100644
-index 000000000..2a547b8d5
+index 0000000000..2a547b8d52
 --- /dev/null
 +++ b/fleet-patches/0099-FLEET.md-per-layer-calibration-the-conv-window-view-.patch
 @@ -0,0 +1,90 @@
@@ -30702,7 +30702,7 @@ index 000000000..2a547b8d5
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index d40746e4d..0172ab915 100644
+index d40746e4df..0172ab915e 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -112,7 +112,9 @@ re-derive the equivalent change against the new upstream code, `git am
