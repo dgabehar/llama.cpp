@@ -114,7 +114,11 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0097 | `8519f34e6` | chat: K2-Horizon: accept any effort's close tag as the end of reasoning |
 | 0098 | `a7293a5a4` | fleet: regenerate patch mirror for the K2-Horizon close-tag fix |
 | 0099 | `f418ade54` | FLEET.md: per-layer calibration, the conv-window view bug and K2-Horizon close tags |
-| 0100 | (this commit) | fleet: regenerate patch mirror |
+| 0100 | `6828d7429` | fleet: regenerate patch mirror for the FLEET.md notes |
+| 0101 | `a6ded58e6` | common: split-balance: fix the calibration use-after-free, detect busy nodes against a reference |
+| 0102 | `3de07b36f` | chat: K2-Horizon: end content at a close tag after the answer |
+| 0103 | `8294d54c9` | FLEET.md: calibration grouping, busy reference, calibration cache, K2 stray close tag |
+| 0104 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
