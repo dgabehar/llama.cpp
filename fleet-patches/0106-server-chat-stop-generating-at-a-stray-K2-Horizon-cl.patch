@@ -1,0 +1,174 @@
+From c725c5d7ea8926af96e5f64e79f58ebfdc311600 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 10:52:39 -0500
+Subject: [PATCH] server, chat : stop generating at a stray K2-Horizon close
+ tag; keep reasoning_format none raw
+
+Fleet QA round 6 (Dawn):
+- Content ended at a stray close tag, but decoding went on to EOS or
+  max_tokens: one reply was "The marker " for 300 completion tokens, with the
+  client waiting and the slot busy. Chat params carry the tags as
+  stops_after_reasoning, sent to the server as stop_after_reasoning: stop
+  strings that count only once one of them already occurred (closed the
+  reasoning). Checked with /completion: the first marker passes, generation
+  stops at the second, streamed and not (9 tokens instead of the limit).
+- With reasoning_format none, stray_ends cut the raw output at the first
+  close tag, so the reply was just "<ifm|think_faster>\n". It now applies only
+  when reasoning is extracted, and so does the stop.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/chat-auto-parser-generator.cpp |  7 +++++-
+ common/chat.h                         |  1 +
+ tools/server/server-common.cpp        |  3 +++
+ tools/server/server-context.cpp       | 31 +++++++++++++++++++++++++++
+ tools/server/server-schema.cpp        | 14 ++++++++++++
+ tools/server/server-task.cpp          |  1 +
+ tools/server/server-task.h            |  1 +
+ 7 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index b98957e36..5add993ed 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -39,6 +39,11 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+     data.preserved_tokens  = autoparser.preserved_tokens;
+     data.additional_stops.insert(data.additional_stops.end(),
+         autoparser.additional_stops.begin(), autoparser.additional_stops.end());
++    // the tags that end the content once the reasoning is closed also stop the generation there, so the
++    // dropped remainder is not decoded (and waited for) to EOS; only when the parser extracts reasoning
++    if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && autoparser.reasoning.mode != reasoning_mode::NONE) {
++        data.stops_after_reasoning = autoparser.content.stray_ends;
++    }
+ 
+     std::string parser_generation_prompt = data.generation_prompt;
+ 
+@@ -175,7 +180,7 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
+-    if (!stray_ends.empty()) {
++    if (!stray_ends.empty() && ctx.extracting_reasoning) {
+         return ctx.reasoning_parser + p.content(p.until_one_of(stray_ends)) + p.optional(p.rest()) + p.end();
+     }
+     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
+diff --git a/common/chat.h b/common/chat.h
+index 5cfe78c73..c48e286fa 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -289,6 +289,7 @@ struct common_chat_params {
+     std::vector<common_grammar_trigger> grammar_triggers;
+     std::vector<std::string>            preserved_tokens;
+     std::vector<std::string>            additional_stops;
++    std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
+     std::string                         parser;
+     common_chat_msg_delimiters          message_delimiters;
+ };
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 7bf1138c8..ef0ed18ad 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1377,6 +1377,9 @@ json oaicompat_chat_params_parse(
+     for (const auto & stop : chat_params.additional_stops) {
+         llama_params["stop"].push_back(stop);
+     }
++    if (!chat_params.stops_after_reasoning.empty()) {
++        llama_params["stop_after_reasoning"] = chat_params.stops_after_reasoning;
++    }
+     if (!chat_params.parser.empty()) {
+         llama_params["chat_parser"] = chat_params.parser;
+     }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 880c18f74..35b05694c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -633,6 +633,37 @@ struct server_slot {
+             }
+         }
+ 
++        // these count only after one of them already closed the reasoning (text is the unsent tail of
++        // generated_text, so its offset there locates the earlier output)
++        const size_t offset = generated_text.size() >= text.size() ? generated_text.size() - text.size() : 0;
++        for (const std::string & word : task->params.antiprompt_after_reasoning) {
++            size_t pos;
++            if (is_full_stop) {
++                const size_t tmp      = word.size() + last_token_size;
++                const size_t from_pos = text.size() > tmp ? text.size() - tmp : 0;
++                pos = text.find(word, from_pos);
++            } else {
++                pos = string_find_partial_stop(text, word);
++            }
++            if (pos == std::string::npos || (stop_pos != std::string::npos && pos >= stop_pos)) {
++                continue;
++            }
++            const std::string before = generated_text.substr(0, std::min(generated_text.size(), offset + pos));
++            bool closed = false;
++            for (const std::string & w : task->params.antiprompt_after_reasoning) {
++                closed = closed || before.find(w) != std::string::npos;
++            }
++            if (!closed) {
++                continue;
++            }
++            if (is_full_stop) {
++                stop           = STOP_TYPE_WORD;
++                stopping_word  = word;
++                has_next_token = false;
++            }
++            stop_pos = pos;
++        }
++
+         return stop_pos;
+     }
+ 
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 27ecafb7a..38f1617e6 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -502,6 +502,20 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+             }
+         }));
+ 
++    add((new field_json("stop_after_reasoning"))
++        ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            ctx.params.antiprompt_after_reasoning.clear();
++            const auto & stop = data.at("stop_after_reasoning");
++            if (stop.is_array()) {
++                for (const auto & word : stop) {
++                    if (word.is_string() && !word.get<std::string>().empty()) {
++                        ctx.params.antiprompt_after_reasoning.push_back(word.get<std::string>());
++                    }
++                }
++            }
++        }));
++
+     add((new field_json("samplers"))
+         ->set_desc("The order in which samplers are applied. An array of sampler type names, or a single string of sampler chars")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 4c7e5c256..51ec1f798 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -119,6 +119,7 @@ json task_params::to_json(bool only_metrics) const {
+         {"adaptive_target",           sampling.adaptive_target},
+         {"adaptive_decay",            sampling.adaptive_decay},
+         {"stop",                      antiprompt},
++        {"stop_after_reasoning",      antiprompt_after_reasoning},
+         {"max_tokens",                n_predict},
+         {"n_predict",                 n_predict}, // TODO: deduplicate?
+         {"n_keep",                    n_keep},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 715aafef7..11e520175 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -70,6 +70,7 @@ struct task_params {
+     std::map<int, float> lora; // mapping adapter ID -> scale
+ 
+     std::vector<std::string> antiprompt;
++    std::vector<std::string> antiprompt_after_reasoning; // stop only at a second occurrence (the first closes the reasoning)
+     std::vector<std::string> response_fields;
+ 
+     bool timings_per_token   = false;
+-- 
+2.43.0
+

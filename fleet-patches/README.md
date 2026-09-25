@@ -108,7 +108,26 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0091 | `c0f21d0b1` | vulkan: cap an integrated GPU's total free memory at MemAvailable |
 | 0092 | `f2a024139` | fleet: regenerate patch mirror for the conv-window and UMA memory fixes |
 | 0093 | `adb26194f` | tests: rpc-server multiclient: cast RAND_MAX to float |
-| 0094 | (this commit) | fleet: regenerate patch mirror |
+| 0094 | `2510ec358` | fleet: regenerate patch mirror for the macOS test build fix |
+| 0095 | `773e1bef6` | common: split-balance: calibrate on the model's own layers |
+| 0096 | `2e3f93153` | fleet: regenerate patch mirror for the per-layer calibration |
+| 0097 | `8519f34e6` | chat: K2-Horizon: accept any effort's close tag as the end of reasoning |
+| 0098 | `a7293a5a4` | fleet: regenerate patch mirror for the K2-Horizon close-tag fix |
+| 0099 | `f418ade54` | FLEET.md: per-layer calibration, the conv-window view bug and K2-Horizon close tags |
+| 0100 | `6828d7429` | fleet: regenerate patch mirror for the FLEET.md notes |
+| 0101 | `a6ded58e6` | common: split-balance: fix the calibration use-after-free, detect busy nodes against a reference |
+| 0102 | `3de07b36f` | chat: K2-Horizon: end content at a close tag after the answer |
+| 0103 | `8294d54c9` | FLEET.md: calibration grouping, busy reference, calibration cache, K2 stray close tag |
+| 0104 | `1313096f9` | fleet: regenerate patch mirror for the round-5 fixes |
+| 0105 | `34da5e374` | common: split-balance: survive malformed cache entries, log why an entry is not used, merge on write |
+| 0106 | `c725c5d7e` | server, chat: stop generating at a stray K2-Horizon close tag; keep reasoning_format none raw |
+| 0107 | `ede0eed18` | FLEET.md: K2 stop_after_reasoning |
+| 0108 | `44e8d0714` | fleet: regenerate patch mirror for the round-6 fixes |
+| 0109 | `649e5e50a` | server: a captured checkpoint may outlive its task: don't read slot.task for it |
+| 0110 | `24e4d819b` | fleet: regenerate patch mirror for the captured-checkpoint fix |
+| 0111 | `0ab13d2bb` | server: don't update the prompt cache of a busy slot picked by id_slot |
+| 0112 | `c4234d605` | FLEET.md: record the busy-slot prompt cache fix |
+| 0110 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

@@ -289,6 +289,7 @@ struct common_chat_params {
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
+    std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
 };

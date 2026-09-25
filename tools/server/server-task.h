@@ -70,6 +70,7 @@ struct task_params {
     std::map<int, float> lora; // mapping adapter ID -> scale
 
     std::vector<std::string> antiprompt;
+    std::vector<std::string> antiprompt_after_reasoning; // stop only at a second occurrence (the first closes the reasoning)
     std::vector<std::string> response_fields;
 
     bool timings_per_token   = false;

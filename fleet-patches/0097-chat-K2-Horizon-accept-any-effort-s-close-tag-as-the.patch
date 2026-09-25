@@ -1,0 +1,122 @@
+From 8519f34e663ae3ba1d9d9c3fc0c0f458f1fc235c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 08:15:05 -0500
+Subject: [PATCH] chat : K2-Horizon: accept any effort's close tag as the end
+ of reasoning
+
+K2-Horizon's template opens the reasoning with the tag for the request's
+reasoning_effort (the fleet pins "low": <ifm|think_faster>), and the parser
+workaround registered only the matching close tag. The model often closes a
+"low" reasoning block with the "high" tag </ifm|think> instead, so the parser
+never found the end: the whole reply went to reasoning_content, with the raw
+tag in it, and content came back empty (live on gabesrv06/10, 2026-09-25, in
+5/5 requests through LiteLLM and direct).
+
+analyze_reasoning gains end_alts, extra tags that also close the reasoning;
+the K2-Horizon workaround lists the other two effort tags there. The test
+covers all three close tags at "low" and fails without the change.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/chat-auto-parser-generator.cpp | 10 ++++++++++
+ common/chat-auto-parser.h             |  1 +
+ common/chat-diff-analyzer.cpp         |  6 ++++++
+ tests/test-chat.cpp                   | 20 ++++++++++++++++++++
+ 4 files changed, 37 insertions(+)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index b78789d8c..e4a877db6 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -143,6 +143,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
+     }
+ 
+     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
++        if (!end.empty() && !end_alts.empty()) {
++            std::vector<std::string>       ends = { trim_whitespace(end) };
++            std::vector<common_peg_parser> closers = { p.optspace(end) };
++            for (const auto & alt : end_alts) {
++                ends.push_back(trim_whitespace(alt));
++                closers.push_back(p.optspace(alt));
++            }
++            auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
++            return p.optional(start.empty() ? body : p.optspace(start) + body);
++        }
+         if (!end.empty()) {
+             if (!start.empty()) {
+                 // Standard tag-based: optional(<think>reasoning</think>)
+diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
+index 8ae15c91e..0b7cc67bb 100644
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -258,6 +258,7 @@ struct analyze_reasoning : analyze_base {
+ 
+     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
+     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
++    std::vector<std::string> end_alts; // other tags that also close the reasoning (the model may emit any of them)
+ 
+     analyze_reasoning() = default;
+     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
+diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
+index e2e20fda0..e03924b69 100644
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -220,11 +220,17 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
+       // start/end tag pair per template (no per-request alternation), so if a deployment
+       // ever switches reasoning_effort away from "low" fleet-wide, this workaround needs
+       // updating to match -- it will not silently adapt.
++      //
++      // The model does not always close with the tag it opened: at "low" it often ends
++      // its thinking with the "high" tag "</ifm|think>" (seen live, 2026-09-25), which left
++      // the whole reply in reasoning_content and content empty. Any of the three close
++      // tags ends the reasoning.
+       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
+               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+               analysis.reasoning.start = "<ifm|think_faster>";
+               analysis.reasoning.end   = "</ifm|think_faster>";
++              analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
+               analysis.preserved_tokens.push_back("<ifm|think_faster>");
+               analysis.preserved_tokens.push_back("</ifm|think_faster>");
+               // Not the registered start/end pair (see comment above), but still real
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 69bcc1289..7642a059b 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -1507,6 +1507,11 @@ class peg_test_builder {
+         return *this;
+     }
+ 
++    peg_test_builder & template_kwarg(const std::string & key, const std::string & json_value) {
++        tc_.params.chat_template_kwargs[key] = json_value;
++        return *this;
++    }
++
+     peg_test_builder & parallel_tool_calls(bool val) {
+         tc_.params.parallel_tool_calls = val;
+         return *this;
+@@ -4952,6 +4957,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .run();
+     }
+ 
++    // K2-Horizon: reasoning tags depend on reasoning_effort; at "low" the model may close
++    // its thinking with any of the three effort tags
++    {
++        auto tst = peg_tester("models/templates/k2-horizon.jinja", detailed_debug);
++
++        for (const char * close : { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" }) {
++            tst.test(std::string("3:40 + 2:55 = 6:35.") + close + "6:35 PM.")
++                .template_kwarg("reasoning_effort", "\"low\"")
++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                .expect_reasoning("3:40 + 2:55 = 6:35.")
++                .expect_content("6:35 PM.")
++                .run();
++        }
++    }
++
+     // Kimi-K2-Thinking tests - custom parser
+     // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
+     {
+-- 
+2.43.0
+

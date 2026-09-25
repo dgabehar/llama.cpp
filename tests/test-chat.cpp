@@ -1507,6 +1507,11 @@ class peg_test_builder {
         return *this;
     }
 
+    peg_test_builder & template_kwarg(const std::string & key, const std::string & json_value) {
+        tc_.params.chat_template_kwargs[key] = json_value;
+        return *this;
+    }
+
     peg_test_builder & parallel_tool_calls(bool val) {
         tc_.params.parallel_tool_calls = val;
         return *this;
@@ -4949,6 +4954,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 // custom delimiter: the payload itself contains )"
                 { "python", R"JSON({"code":"print('hey')"})JSON", "" },
             })
+            .run();
+    }
+
+    // K2-Horizon: reasoning tags depend on reasoning_effort; at "low" the model may close
+    // its thinking with any of the three effort tags
+    {
+        auto tst = peg_tester("models/templates/k2-horizon.jinja", detailed_debug);
+
+        for (const char * close : { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" }) {
+            tst.test(std::string("3:40 + 2:55 = 6:35.") + close + "6:35 PM.")
+                .template_kwarg("reasoning_effort", "\"low\"")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("3:40 + 2:55 = 6:35.")
+                .expect_content("6:35 PM.")
+                .run();
+        }
+
+        // a second close tag after the answer: the garbled restart after it is dropped
+        tst.test("Repeat it.</ifm|think>ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Repeat it.")
+            .expect_content("ghe.coxautoinc.com")
             .run();
     }
 

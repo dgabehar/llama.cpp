@@ -502,6 +502,20 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("stop_after_reasoning"))
+        ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.antiprompt_after_reasoning.clear();
+            const auto & stop = data.at("stop_after_reasoning");
+            if (stop.is_array()) {
+                for (const auto & word : stop) {
+                    if (word.is_string() && !word.get<std::string>().empty()) {
+                        ctx.params.antiprompt_after_reasoning.push_back(word.get<std::string>());
+                    }
+                }
+            }
+        }));
+
     add((new field_json("samplers"))
         ->set_desc("The order in which samplers are applied. An array of sampler type names, or a single string of sampler chars")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

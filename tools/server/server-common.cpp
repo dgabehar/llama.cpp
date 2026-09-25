@@ -1377,6 +1377,9 @@ json oaicompat_chat_params_parse(
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }
+    if (!chat_params.stops_after_reasoning.empty()) {
+        llama_params["stop_after_reasoning"] = chat_params.stops_after_reasoning;
+    }
     if (!chat_params.parser.empty()) {
         llama_params["chat_parser"] = chat_params.parser;
     }

@@ -236,9 +236,9 @@ Patches (see `fleet-patches/README.md`):
   - `LLAMA_SERVER_CKPT_CAPTURE=0` restores the old behavior.
   - eagle3 still splits.
 - **common: `--split-balance auto|decode|prefill|memory`**, default `auto`.
-  - At startup it times each device with synthetic matmuls shaped like the
-    model's layers (RPC devices over the normal protocol, so the worker
-    needs no change) and caches the result in
+  - At startup it times each device on the model's own layers (RPC devices
+    over the normal protocol, so the worker needs no change; see
+    "Per-layer calibration" below) and caches the result in
     `~/.cache/llama.cpp/split-balance.json`, keyed by device, model shape
     and build and re-measured after 7 days (`--split-calibrate force` to
     redo it now).
@@ -314,6 +314,58 @@ shape. gpt-oss-20b on a 3080 Ti:
 
 The dense matmul used before was off by about 2x.
 
+**Per-layer calibration (added 2026-09-25):** the calibration times every
+repeating layer kind the model has (hybrid models have several), with the
+real weight shapes and types, the real expert count, flash attention at the
+workload's context, and GDN (`ssm_conv` + `gated_delta_net`). It also times
+a slice of the output layer, which decode runs once per token on the last
+device. The layer's other ops (norms, RoPE, elementwise) are charged per
+node: the fit probe records the real graph's compute node count
+(`llama_graph_n_compute_nodes`) and a chain of small ops measures their cost
+on each device. The fixed cost of a graph run plus readback is measured and
+subtracted.
+
+Layers are grouped by structure, not by weight types. Mixed quants vary the
+types per layer: Qwen3.8 UD-Q4_K_XL has 53 type layouts over 3 structures,
+which took 118 s to calibrate on a 780M worker. Each structure is timed on
+its most common type layout, with decode scaled by the structure's mean
+bytes. Graphs over 50 ms are timed once per round.
+
+**Busy nodes:** after a warm-up pass each timing runs up to 4 rounds and
+keeps the fastest. A load that lasts the whole calibration slows every round
+alike, so the check is against the cache instead:
+
+- `ref|<device, model, workload>`: the device's last calibration that didn't
+  look busy. It is not keyed by build, so it survives image bumps.
+- A new calibration more than 1.25x slower than the reference logs "probably
+  busy" and is cached for 1 hour.
+- On a cache hit, a device more than 1.25x faster than cached is calibrated
+  again. So is one more than 1.5x slower, as before.
+- After a build change, a device whose quick check is within 10% of its
+  reference reuses it: about 2 s instead of a full calibration.
+- `--split-calibrate force` re-measures without dropping other cache entries.
+
+The cache is `split-balance.json` under `LLAMA_CACHE` (default
+`~/.cache/llama.cpp`). The home-infrastructure chart mounts it on a node-local
+hostPath (`master.calibrationCache`); in a bare container it's lost on every
+restart.
+
+Round 5 of QA found a use-after-free in `read_model_layers`: the GGUF context
+was freed before the per-layer key reads, and 10 of 17 fleet starts crashed.
+An ASan build with two CPU `rpc-server` workers reproduced it on every start.
+
+Predicted vs measured on a 3080 Ti:
+
+| model | pp | tg |
+|---|---|---|
+| gpt-oss-20b | 1745/1915 | 89/103 |
+| Qwen3-1.7B | 8918/7088 | 209/192 |
+| K2-Horizon-7B | 2305/1734 | 60/56 (was 153/56) |
+| Qwen3.5-4B (hybrid) | 3960/2867 | 85/100 (was 232/96) |
+
+pp still reads 20-40% high on three of the four; the error is similar
+across devices, so the chosen split is affected less than the numbers.
+
 **rpc-server admission:** a connection takes a `--max-clients` slot only
 once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
 slot. At most 64 connections wait for their HELLO; the oldest is closed to
@@ -345,6 +397,45 @@ where the incident happened and the 2 s default timeout applies.
   all-reduce per layer over RPC.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+
+- **Views over transposed tensors** (2026-09-24, `41b2ad40d`): `ggml_view_*`
+  always gives dim 0 the element stride, so slicing a transposed tensor
+  along dim 0 with more than one element reads the wrong memory. The
+  SSM_CONV_SPLIT patch's `build_conv_window` did this, and saved a garbage
+  conv state after every multi-token ubatch. draft-mtp verification (a
+  3-token ubatch) hit it on every step: Qwen3.8 leaked repeated `</think>`
+  and draft acceptance fell to ~0.37. To slice one, view the untransposed
+  tensor and transpose the view. A useful check for any speculative
+  decoding change: re-score its output with the plain target model and
+  count emitted tokens the target gives p < 0.002 (22 broken, 0 fixed).
+
+- **Prompt cache update on a busy slot** (2026-09-25, `0ab13d2bb`, upstream
+  bug, still in upstream master): a request pinned with `id_slot` to a slot
+  that is still generating is deferred, but slot selection first ran the
+  prompt cache update on that slot, loading the cached prompt that best
+  matches the pinned request into the running task. The running task then
+  finished on another conversation's context. Any model, any
+  `--cache-ram` > 0 (the default), triggered by the LiteLLM slot-persistence
+  hook's `id_slot` pins. Symptom: a reply that quotes another client's
+  conversation, and a slot whose `n_tokens` at release does not equal its
+  prompt plus generated tokens. When testing a server fix against an
+  unfixed binary, copy the whole `bin/` directory: `llama-server` loads
+  `libllama-server-impl.so` through its build-tree RUNPATH, so a copied
+  binary alone runs whatever library is currently built.
+
+- **K2-Horizon reasoning tags** (2026-09-25, `8519f34e6`): the template
+  opens the reasoning with the tag for the request's `reasoning_effort`, but
+  the model does not always close with the same one. At the fleet's "low"
+  it often ends with the "high" tag `</ifm|think>`. The parser workaround in
+  `chat-diff-analyzer.cpp` accepts all three close tags (`end_alts`).
+  Symptom when it breaks: empty `content`, the whole reply plus a raw
+  `</ifm|...>` tag in `reasoning_content`. The model also sometimes answers,
+  emits a second close tag and starts over with a garbled copy. Content ends
+  at any close tag after the reasoning (`analyze_content::stray_ends`), and
+  generation stops there too. The server gets the same tags as
+  `stop_after_reasoning`: stop strings that count only once one of them has
+  closed the reasoning, so the dropped remainder is never decoded. Neither
+  applies with `reasoning_format: none`, which returns the raw text.
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's

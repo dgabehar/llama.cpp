@@ -39,6 +39,11 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     data.preserved_tokens  = autoparser.preserved_tokens;
     data.additional_stops.insert(data.additional_stops.end(),
         autoparser.additional_stops.begin(), autoparser.additional_stops.end());
+    // the tags that end the content once the reasoning is closed also stop the generation there, so the
+    // dropped remainder is not decoded (and waited for) to EOS; only when the parser extracts reasoning
+    if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && autoparser.reasoning.mode != reasoning_mode::NONE) {
+        data.stops_after_reasoning = autoparser.content.stray_ends;
+    }
 
     std::string parser_generation_prompt = data.generation_prompt;
 
@@ -143,6 +148,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     }
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+        if (!end.empty() && !end_alts.empty()) {
+            std::vector<std::string>       ends = { trim_whitespace(end) };
+            std::vector<common_peg_parser> closers = { p.optspace(end) };
+            for (const auto & alt : end_alts) {
+                ends.push_back(trim_whitespace(alt));
+                closers.push_back(p.optspace(alt));
+            }
+            auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
+            return p.optional(start.empty() ? body : p.optspace(start) + body);
+        }
         if (!end.empty()) {
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
@@ -164,6 +179,9 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
             return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+    }
+    if (!stray_ends.empty() && ctx.extracting_reasoning) {
+        return ctx.reasoning_parser + p.content(p.until_one_of(stray_ends)) + p.optional(p.rest()) + p.end();
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }

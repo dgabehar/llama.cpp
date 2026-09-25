@@ -652,6 +652,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+static int32_t graph_count_compute_nodes(ggml_cgraph * gf) {
+    int32_t n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        switch (ggml_graph_node(gf, i)->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            default:
+                n++;
+        }
+    }
+    return n;
+}
+
 static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -785,6 +802,7 @@ void llama_context::sched_reserve() {
 
         n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp         = ggml_graph_n_nodes(gf);
+        n_compute_nodes_pp = graph_count_compute_nodes(gf);
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_pp = this->n_input_tensors;
     }
@@ -798,6 +816,7 @@ void llama_context::sched_reserve() {
 
         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg         = ggml_graph_n_nodes(gf);
+        n_compute_nodes_tg = graph_count_compute_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
     }
@@ -4346,6 +4365,10 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+int32_t llama_graph_n_compute_nodes(const llama_context * ctx, bool single_token) {
+    return ctx->graph_n_compute_nodes(single_token);
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
