@@ -1664,6 +1664,13 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // the slot is still running another task: the caller defers this one. Return before
+                // the prompt cache update below, which would swap the running task's context for
+                // another prompt's cached state
+                if (ret->is_processing()) {
+                    return ret;
+                }
             }
         }
 
@@ -1748,6 +1755,9 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // never touch the context of a slot that is still processing
+            update_cache = update_cache && !ret->is_processing();
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
