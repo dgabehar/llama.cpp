@@ -4972,21 +4972,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         }
 
         // a second close tag after the answer: the garbled restart after it is dropped
-        tst.test("Repeat it.</ifm|think>ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry")
+        tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
             .template_kwarg("reasoning_effort", "\"low\"")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect_reasoning("Repeat it.")
-            .expect_content("ghe.coxautoinc.com")
+            .expect_content("git.example.com")
             .run();
 
         // No tools offered, but the model hallucinates tool-call markup after its answer
         // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
         // kept, and the markup itself is dropped like a stray reasoning close tag.
-        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
             .template_kwarg("reasoning_effort", "\"low\"")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect_reasoning("Reasoning here.")
-            .expect_content("Sure, the address is ghe.coxautoin")
+            .expect_content("Sure, the address is git.example.co")
             .run();
 
         // Same stray tool-call markup, but content starts after a real reasoning block.
