@@ -1,0 +1,1145 @@
+From 773e1bef6073a52d91b27eb7e660afcf54d95c0c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 08:07:23 -0500
+Subject: [PATCH] common : split-balance: calibrate on the model's own layers
+
+The synthetic calibration (one dense matmul of the dominant shape) mis-predicted MoE
+and small models badly, e.g. tg 153 predicted vs 56 measured on K2-Horizon-7B.
+Time the real layer kinds instead:
+
+- every repeating layer kind the model has (hybrid models have several), with its
+  real weight shapes and types, the real expert count via mul_mat_id, flash
+  attention at the workload's context, and GDN (ssm_conv + gated_delta_net)
+- a slice of the output layer, which decode runs once per token on the last device
+- the layer's other ops (norms, RoPE, elementwise) charged per node, using the
+  compute node count of the real graphs from the fit probe
+  (new llama_graph_n_compute_nodes) and a measured per-op cost
+- the fixed cost of a graph run + readback is measured and subtracted
+
+Busy nodes: after a warm-up pass each timing is repeated up to 4 rounds and the
+fastest kept (other load only slows a node down); a large spread is logged.
+quick_check takes the best of 3 tries.
+
+Predicted vs measured on an RTX 3080 Ti, tg: gpt-oss-20b 89/103, Qwen3-1.7B
+209/192, K2-Horizon-7B 60/56, Qwen3.5-4B 85/100.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/fit.cpp           |  17 +
+ common/fit.h             |   4 +
+ common/split-balance.cpp | 673 +++++++++++++++++++++++++++++++++------
+ common/split-balance.h   |  54 +++-
+ include/llama.h          |   4 +
+ src/llama-context.cpp    |  23 ++
+ src/llama-context.h      |   7 +
+ 7 files changed, 676 insertions(+), 106 deletions(-)
+
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 31b87b12c..3ea865256 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -13,6 +13,15 @@
+ #include <string>
+ #include <vector>
+ 
++// compute nodes of the graphs reserved by the last memory probe (see common_fit_last_graph_nodes)
++static int32_t g_last_graph_nodes_pp = -1;
++static int32_t g_last_graph_nodes_tg = -1;
++
++void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg) {
++    pp = g_last_graph_nodes_pp;
++    tg = g_last_graph_nodes_tg;
++}
++
+ // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
+ // enum to identify part of a layer for distributing its tensors:
+ enum common_layer_fraction_t {
+@@ -146,6 +155,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+ 
+     common_memory_breakdown_print(ctx);
+ 
++    g_last_graph_nodes_pp = llama_graph_n_compute_nodes(ctx, false);
++    g_last_graph_nodes_tg = llama_graph_n_compute_nodes(ctx, true);
++
+     llama_free(ctx);
+     llama_model_free(model);
+     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+@@ -188,6 +200,9 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
+     uint32_t hp_nex = 0;
+     std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
+             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++    // the graph node counts describe the main model, not the extra one probed below
++    const int32_t nodes_pp = g_last_graph_nodes_pp;
++    const int32_t nodes_tg = g_last_graph_nodes_tg;
+ 
+     if (extra != nullptr) {
+         std::vector<ggml_backend_dev_t> devs_extra;
+@@ -213,6 +228,8 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
+             LOG_WRN("%s: failed to measure the memory of the extra model: %s\n", __func__, e.what());
+         }
+     }
++    g_last_graph_nodes_pp = nodes_pp;
++    g_last_graph_nodes_tg = nodes_tg;
+ 
+     common_device_memory_data_vec ret(main.size());
+     for (size_t i = 0; i < main.size(); i++) {
+diff --git a/common/fit.h b/common/fit.h
+index 24bcbc7ea..1a6785ae3 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -55,6 +55,10 @@ struct common_device_memory_data {
+ 
+ using common_device_memory_data_vec = std::vector<common_device_memory_data>;
+ 
++// compute nodes (views/reshapes excluded) of the prompt and single-token graphs reserved by the most recent
++// memory probe of the main model, -1 if none ran
++void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg);
++
+ // Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
+ // main model's devices the way common_fit_params accounts for it. extra may be nullptr.
+ common_device_memory_data_vec common_get_device_memory_data_with_extra(
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+index 2e363bc39..25518fcca 100644
+--- a/common/split-balance.cpp
++++ b/common/split-balance.cpp
+@@ -20,7 +20,9 @@
+ #include <functional>
+ #include <limits>
+ #include <regex>
++#include <map>
+ #include <sstream>
++#include <thread>
+ 
+ const char * common_split_balance_mode_name(common_split_balance_mode mode) {
+     switch (mode) {
+@@ -32,12 +34,10 @@ const char * common_split_balance_mode_name(common_split_balance_mode mode) {
+     return "?";
+ }
+ 
+-// Calibration times only the weight matmuls; attention, norms, SSM scans and the host side of each
+-// graph are not in layer_flops/layer_bytes. Against measured llama-server runs of Qwen3.8-27B
+-// (8060S + 780M over RPC, 0-23 layers on the 780M) the matmul-only model was 25-31% optimistic for
+-// prompt processing and 11-15% for generation.
+-static constexpr double k_prefill_overhead = 1.28;
+-static constexpr double k_decode_overhead  = 1.13;
++// Calibration times a layer's weight matmuls and attention; norms, RoPE, SSM scans and the host side
++// of each graph are not timed. These factors cover them (fitted against measured llama-server runs).
++static constexpr double k_prefill_overhead = 1.0;
++static constexpr double k_decode_overhead  = 1.0;
+ 
+ double common_split_predict_decode(
+         const common_split_model_shape & shape,
+@@ -51,12 +51,12 @@ double common_split_predict_decode(
+             continue;
+         }
+         const auto & p = perf[i];
+-        double bytes = n_layers[i] * shape.layer_bytes;
++        double t_dev = n_layers[i] * shape.layer_bytes * p.s_decode_byte;
+         if ((int) i == last) {
+-            bytes += shape.output_bytes;
++            t_dev += shape.output_bytes * (p.s_output_byte > 0.0 ? p.s_output_byte : p.s_decode_byte);
+         }
+         // a remote stage costs a round trip per token: activations in, activations out
+-        t += bytes * p.s_decode_byte * k_decode_overhead + 2.0 * (p.t_hop + shape.act_bytes * p.s_hop_byte);
++        t += t_dev * k_decode_overhead + 2.0 * (p.t_hop + shape.act_bytes * p.s_hop_byte);
+     }
+     return t;
+ }
+@@ -239,20 +239,29 @@ static bool dev_is_remote(ggml_backend_dev_t dev) {
+     return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+ }
+ 
+-static std::string cache_key(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
+-                             uint32_t n_expert_used) {
++static std::string cache_key(ggml_backend_dev_t dev, const common_split_calib_model & m, const common_split_workload & wl) {
+     size_t free = 0;
+     size_t total = 0;
+     ggml_backend_dev_memory(dev, &free, &total);
++    // the model part of the key: every timed layer kind with its shapes and types
++    std::ostringstream ms;
++    for (const auto & l : m.layers) {
++        ms << l.share << ':' << l.n_head << '/' << l.n_head_kv << '/' << l.head_dim_k << '/' << l.head_dim_v
++           << "|gdn" << l.gdn_state << '/' << l.gdn_h_k << '/' << l.gdn_h_v << '/' << l.conv_k << '/' << l.conv_ch;
++        for (const auto & w : l.weights) {
++            ms << ',' << w.ne[0] << 'x' << w.ne[1] << 'x' << w.ne[2] << ggml_type_name(w.type);
++        }
++        ms << ';';
++    }
++    ms << "nodes" << (int) m.nodes_tg_layer << '/' << (int) m.nodes_pp_layer;
++    ms << "moe" << m.n_expert_used << "of" << m.n_expert << "|out" << m.output.ne[0] << 'x' << m.output.ne[1]
++       << ggml_type_name(m.output.type);
+     std::ostringstream ss;
+     // the build is part of the key: kernels change between builds (the remote worker's build is not visible
+     // from here, driver/kernel upgrades neither, hence also the age limit on entries)
+-    ss << ggml_backend_dev_name(dev) << "|" << ggml_backend_dev_description(dev) << "|" << (total >> 20) << "MiB|"
+-       << n_embd << "x" << n_ff << "|" << ggml_type_name(wtype) << "|ub" << n_ubatch;
+-    if (n_expert_used > 0) {
+-        ss << "|moe" << n_expert_used;
+-    }
+-    ss << "|" << llama_commit();
++    ss << ggml_backend_dev_name(dev) << "|" << ggml_backend_dev_description(dev) << "|" << (total >> 20) << "MiB|layers"
++       << std::hex << std::hash<std::string>{}(ms.str()) << std::dec << "|ub" << wl.n_ubatch << "|p" << wl.n_prompt
++       << "g" << wl.n_gen << "|" << llama_commit();
+     return ss.str();
+ }
+ 
+@@ -319,110 +328,407 @@ static void fill_ids(ggml_tensor * ids, int n_e, int offset) {
+     ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+ }
+ 
+-static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
+-                             uint32_t n_expert, uint32_t n_expert_used, common_split_device_perf & out) {
++// graphs timed for one layer kind: a single token through every weight (and the attention of one
++// query over the reference context), and one ubatch through them, experts in a graph of their own
++struct calib_layer_graphs {
++    ggml_cgraph * decode      = nullptr;
++    ggml_cgraph * prefill     = nullptr;
++    ggml_cgraph * prefill_exp = nullptr; // null without experts
++    double        share       = 0.0;
++};
++
++// Adds `out` to the graph through a one-element copy: the op's own output then has a consumer, so
++// the graph allocator can reuse its memory for the next op instead of keeping every output alive.
++static void add_timed_op(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * out) {
++    ggml_build_forward_expand(gf, ggml_cont(ctx, ggml_view_1d(ctx, out, 1, 0)));
++}
++
++static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_model & m, const common_split_workload & wl,
++                             int64_t n_embd, common_split_device_perf & out) {
+     ggml_backend_ptr backend { ggml_backend_dev_init(dev, nullptr) };
+     if (!backend) {
+         return false;
+     }
++    const bool remote = dev_is_remote(dev);
+ 
+-    // MoE layers multiply with the routed experts only (mul_mat_id), which runs at a different speed
+-    // than a dense matmul of the same size
+-    const bool moe = n_expert > 0 && n_expert_used > 0 && n_expert_used <= n_expert;
+-    const int  n_e = moe ? (int) std::min<uint32_t>(n_expert, std::max<uint32_t>(2 * n_expert_used, 8)) : 1;
+-    const int  n_used = moe ? (int) n_expert_used : 1;
++    const int64_t ub     = std::max<uint32_t>(1, std::min(wl.n_ubatch, std::max<uint32_t>(1, wl.n_prompt)));
++    // attention runs over the context seen by the reference request: on average half the prompt while it
++    // is processed, the prompt plus half the generated tokens while decoding
++    const int64_t n_kv_pp = GGML_PAD(std::max<int64_t>(256, wl.n_prompt / 2 + ub / 2), 256);
++    const int64_t n_kv_tg = GGML_PAD(std::max<int64_t>(256, (int64_t) wl.n_prompt + wl.n_gen / 2), 256);
+ 
+-    // several distinct weights so the decode timing streams from memory instead of a cache
+-    const int n_w = moe ? 2 : 3;
+-    const int n_decode  = 12; // single-token matmuls per timed graph
+-    const int n_prefill = 3;  // n_ubatch-token matmuls per timed graph
++    const bool    moe    = m.n_expert > 0 && m.n_expert_used > 0 && m.n_expert_used <= m.n_expert;
++    const int64_t n_used = moe ? m.n_expert_used : 1;
+ 
+-    ggml_init_params params = {
+-        /* .mem_size   = */ ggml_tensor_overhead() * (n_w + 4 + 2 * n_decode + n_prefill + 8) + 2 * ggml_graph_overhead(),
++    // one layer of every kind is uploaded; a stack of experts larger than the budget is timed with fewer
++    // experts and a proportionally smaller batch, so every expert still gets the model's number of rows
++    size_t free = 0;
++    size_t total = 0;
++    ggml_backend_dev_memory(dev, &free, &total);
++    const size_t budget = std::min<size_t>(size_t(1536) << 20, std::max<size_t>(size_t(256) << 20, free / 4));
++    size_t bytes_all = 0;
++    size_t bytes_exp = 0;
++    for (const auto & l : m.layers) {
++        for (const auto & w : l.weights) {
++            const size_t b = ggml_row_size(w.type, w.ne[0]) * w.ne[1] * w.ne[2];
++            bytes_all += b;
++            bytes_exp += w.ne[2] > 1 ? b : 0;
++        }
++    }
++    int64_t n_e = moe ? m.n_expert : 1;
++    if (moe && bytes_all > budget && bytes_exp > 0) {
++        const double keep = std::max(0.0, (double) budget - (double) (bytes_all - bytes_exp)) / (double) bytes_exp;
++        n_e = std::clamp<int64_t>((int64_t) (m.n_expert * keep), std::min<int64_t>(m.n_expert, std::max<int64_t>(2 * n_used, 8)), m.n_expert);
++    }
++    const double  exp_scale = (double) n_e / std::max<uint32_t>(1, m.n_expert);
++    const int64_t ub_exp    = std::max<int64_t>(1, (int64_t) std::llround(ub * exp_scale));
++
++    size_t n_tensors = 16;
++    for (const auto & l : m.layers) {
++        n_tensors += 6 * l.weights.size() + 32;
++    }
++    ggml_init_params wparams = {
++        /* .mem_size   = */ ggml_tensor_overhead() * n_tensors,
+         /* .mem_buffer = */ nullptr,
+         /* .no_alloc   = */ true,
+     };
+-    ggml_context_ptr ctx { ggml_init(params) };
+-    ggml_tensor * w[3];
+-    for (int i = 0; i < n_w; i++) {
+-        w[i] = moe ? ggml_new_tensor_3d(ctx.get(), wtype, n_embd, n_ff, n_e) : ggml_new_tensor_2d(ctx.get(), wtype, n_embd, n_ff);
+-    }
+-    ggml_tensor * x1 = moe ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, 1)        : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, 1);
+-    ggml_tensor * xb = moe ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, n_ubatch) : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_ubatch);
+-    ggml_tensor * ids1[2] = { nullptr, nullptr };
+-    ggml_tensor * idsb    = nullptr;
+-    if (moe) {
+-        ids1[0] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, 1);
+-        ids1[1] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, 1);
+-        idsb    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_used, n_ubatch);
++    ggml_context_ptr wctx { ggml_init(wparams) };          // weights and inputs, allocated once
++    ggml_init_params gparams = {
++        /* .mem_size   = */ ggml_tensor_overhead() * n_tensors * 4 + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
++        /* .mem_buffer = */ nullptr,
++        /* .no_alloc   = */ true,
++    };
++    ggml_context_ptr gctx { ggml_init(gparams) };          // ops, placed by a graph allocator per graph
++
++    // inputs, one per distinct input width and token count
++    std::map<std::pair<int64_t, int64_t>, ggml_tensor *> inputs;
++    auto input = [&](int64_t ne0, int64_t n_tok, bool exp) {
++        const auto key = std::make_pair(ne0, exp ? -n_tok : n_tok);
++        auto it = inputs.find(key);
++        if (it != inputs.end()) {
++            return it->second;
++        }
++        ggml_tensor * t = exp ? ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F32, ne0, 1, n_tok)
++                              : ggml_new_tensor_2d(wctx.get(), GGML_TYPE_F32, ne0, n_tok);
++        inputs[key] = t;
++        return t;
++    };
++    ggml_tensor * ids_tg = moe ? ggml_new_tensor_2d(wctx.get(), GGML_TYPE_I32, n_used, 1)      : nullptr;
++    ggml_tensor * ids_pp = moe ? ggml_new_tensor_2d(wctx.get(), GGML_TYPE_I32, n_used, ub_exp) : nullptr;
++    ggml_tensor * x_hop  = ggml_new_tensor_2d(wctx.get(), GGML_TYPE_F32, n_embd, ub);
++    ggml_tensor * out_w  = nullptr;
++    if (m.output.ne[1] > 0) {
++        const ggml_type ot = ggml_quantize_requires_imatrix(m.output.type) ? GGML_TYPE_Q4_K : m.output.type;
++        const int64_t rows_budget = std::max<int64_t>(256, (int64_t) ((size_t(128) << 20) / ggml_row_size(ot, m.output.ne[0])));
++        out_w = ggml_new_tensor_2d(wctx.get(), ot, m.output.ne[0], std::min<int64_t>(m.output.ne[1], rows_budget));
++        ggml_tensor * x_out = ggml_new_tensor_2d(wctx.get(), GGML_TYPE_F32, m.output.ne[0], 1);
++        ggml_set_name(x_out, "calib_out_x");
+     }
+ 
+-    ggml_cgraph * gd = ggml_new_graph(ctx.get());
+-    for (int i = 0; i < n_decode; i++) {
+-        ggml_build_forward_expand(gd, moe ? ggml_mul_mat_id(ctx.get(), w[i % n_w], x1, ids1[(i / n_w) % 2])
+-                                          : ggml_mul_mat(ctx.get(), w[i % n_w], x1));
++    struct attn_io { ggml_tensor * q_tg, * q_pp, * k_tg, * v_tg, * k_pp, * v_pp; };
++    // gated delta net inputs for 1 and ub tokens: q, k, v, g, beta, the state, and the conv input and kernel
++    struct gdn_io { ggml_tensor * q[2], * k[2], * v[2], * g[2], * b[2], * sx[2], * s, * c; };
++    std::vector<gdn_io> gdn(m.layers.size(), gdn_io{});
++    std::vector<std::vector<ggml_tensor *>> weights(m.layers.size());
++    std::vector<attn_io> attn(m.layers.size(), attn_io{});
++    for (size_t li = 0; li < m.layers.size(); li++) {
++        const auto & l = m.layers[li];
++        for (const auto & w : l.weights) {
++            const bool exp = w.ne[2] > 1;
++            weights[li].push_back(exp ? ggml_new_tensor_3d(wctx.get(), w.type, w.ne[0], w.ne[1], std::min<int64_t>(w.ne[2], n_e))
++                                      : ggml_new_tensor_2d(wctx.get(), w.type, w.ne[0], w.ne[1]));
++            input(w.ne[0], 1, exp);
++            input(w.ne[0], exp ? ub_exp : ub, exp);
++        }
++        if (l.gdn_state > 0) {
++            auto & d = gdn[li];
++            const int64_t S = l.gdn_state;
++            for (int j = 0; j < 2; j++) {
++                const int64_t T = j == 0 ? 1 : ub;
++                d.q[j]  = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, S, l.gdn_h_k, T, 1);
++                d.k[j]  = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, S, l.gdn_h_k, T, 1);
++                d.v[j]  = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, S, l.gdn_h_v, T, 1);
++                d.g[j]  = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, 1, l.gdn_h_v, T, 1);
++                d.b[j]  = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, 1, l.gdn_h_v, T, 1);
++                d.sx[j] = ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F32, l.conv_k - 1 + T, l.conv_ch, 1);
++            }
++            d.s = ggml_new_tensor_4d(wctx.get(), GGML_TYPE_F32, S, S, l.gdn_h_v, 1);
++            d.c = ggml_new_tensor_2d(wctx.get(), GGML_TYPE_F32, l.conv_k, l.conv_ch);
++        }
++        if (l.n_head > 0) {
++            auto & a = attn[li];
++            a.q_tg = ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F32, l.head_dim_k, 1,  l.n_head);
++            a.q_pp = ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F32, l.head_dim_k, ub, l.n_head);
++            a.k_tg = ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F16, l.head_dim_k, n_kv_tg, l.n_head_kv);
++            a.v_tg = ggml_new_tensor_3d(wctx.get(), GGML_TYPE_F16, l.head_dim_v, n_kv_tg, l.n_head_kv);
++            a.k_pp = ggml_view_3d(wctx.get(), a.k_tg, l.head_dim_k, n_kv_pp, l.n_head_kv, a.k_tg->nb[1], a.k_tg->nb[2], 0);
++            a.v_pp = ggml_view_3d(wctx.get(), a.v_tg, l.head_dim_v, n_kv_pp, l.n_head_kv, a.v_tg->nb[1], a.v_tg->nb[2], 0);
++        }
+     }
+-    ggml_cgraph * gp = ggml_new_graph(ctx.get());
+-    for (int i = 0; i < n_prefill; i++) {
+-        ggml_build_forward_expand(gp, moe ? ggml_mul_mat_id(ctx.get(), w[i % n_w], xb, idsb)
+-                                          : ggml_mul_mat(ctx.get(), w[i % n_w], xb));
++
++    // the graphs
++    std::vector<calib_layer_graphs> graphs(m.layers.size());
++    bool attn_ok = true;
++    for (size_t li = 0; li < m.layers.size(); li++) {
++        const auto & l = m.layers[li];
++        auto & g = graphs[li];
++        g.share   = l.share;
++        g.decode  = ggml_new_graph(gctx.get());
++        g.prefill = ggml_new_graph(gctx.get());
++        bool has_exp = false;
++        for (size_t wi = 0; wi < l.weights.size(); wi++) {
++            has_exp = has_exp || l.weights[wi].ne[2] > 1;
++        }
++        if (has_exp) {
++            g.prefill_exp = ggml_new_graph(gctx.get());
++        }
++        for (size_t wi = 0; wi < l.weights.size(); wi++) {
++            ggml_tensor * w  = weights[li][wi];
++            const bool   exp = l.weights[wi].ne[2] > 1;
++            if (exp) {
++                add_timed_op(gctx.get(), g.decode,      ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], 1, true), ids_tg));
++                add_timed_op(gctx.get(), g.prefill_exp, ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], ub_exp, true), ids_pp));
++            } else {
++                add_timed_op(gctx.get(), g.decode,  ggml_mul_mat(gctx.get(), w, input(w->ne[0], 1, false)));
++                add_timed_op(gctx.get(), g.prefill, ggml_mul_mat(gctx.get(), w, input(w->ne[0], ub, false)));
++            }
++        }
++        if (l.gdn_state > 0) {
++            const auto & d = gdn[li];
++            ggml_cgraph * gfs[2] = { g.decode, g.prefill };
++            for (int j = 0; j < 2; j++) {
++                add_timed_op(gctx.get(), gfs[j], ggml_ssm_conv(gctx.get(), d.sx[j], d.c));
++                add_timed_op(gctx.get(), gfs[j], ggml_gated_delta_net(gctx.get(), d.q[j], d.k[j], d.v[j], d.g[j], d.b[j], d.s, 1));
++            }
++        }
++        if (l.n_head > 0) {
++            const auto & a = attn[li];
++            const float scale = 1.0f / std::sqrt((float) l.head_dim_k);
++            ggml_tensor * fa_tg = ggml_flash_attn_ext(gctx.get(), a.q_tg, a.k_tg, a.v_tg, nullptr, scale, 0.0f, 0.0f);
++            ggml_tensor * fa_pp = ggml_flash_attn_ext(gctx.get(), a.q_pp, a.k_pp, a.v_pp, nullptr, scale, 0.0f, 0.0f);
++            if (ggml_backend_supports_op(backend.get(), fa_tg) && ggml_backend_supports_op(backend.get(), fa_pp)) {
++                add_timed_op(gctx.get(), g.decode,  fa_tg);
++                add_timed_op(gctx.get(), g.prefill, fa_pp);
++            } else {
++                attn_ok = false;
++            }
++        }
++        for (ggml_cgraph * gf : { g.decode, g.prefill, g.prefill_exp }) {
++            if (gf == nullptr) {
++                continue;
++            }
++            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
++                if (!ggml_backend_supports_op(backend.get(), ggml_graph_node(gf, i))) {
++                    LOG_WRN("%s: %s cannot run %s, not calibrating it\n", __func__, ggml_backend_dev_name(dev),
++                            ggml_op_desc(ggml_graph_node(gf, i)));
++                    return false;
++                }
++            }
++        }
+     }
+-    if (!ggml_backend_supports_op(backend.get(), ggml_graph_node(gd, 0)) ||
+-        !ggml_backend_supports_op(backend.get(), ggml_graph_node(gp, 0))) {
+-        return false;
++    if (!attn_ok) {
++        LOG_WRN("%s: %s cannot run the attention op of the calibration, timing the matmuls only\n", __func__,
++                ggml_backend_dev_name(dev));
+     }
+ 
+-    // weights, inputs and every matmul result in one buffer; both graphs stay allocated
+-    ggml_backend_buffer_ptr wbuf { ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()) };
++    ggml_backend_buffer_ptr wbuf { ggml_backend_alloc_ctx_tensors(wctx.get(), backend.get()) };
+     if (!wbuf) {
+         return false;
+     }
+-    for (int i = 0; i < n_w; i++) {
+-        fill_weight(w[i]);
++    for (size_t li = 0; li < m.layers.size(); li++) {
++        for (ggml_tensor * w : weights[li]) {
++            fill_weight(w);
++        }
++        const auto & d = gdn[li];
++        if (d.s != nullptr) {
++            for (int j = 0; j < 2; j++) {
++                for (ggml_tensor * t : { d.q[j], d.k[j], d.v[j], d.g[j], d.b[j], d.sx[j] }) {
++                    fill_f32(t);
++                }
++            }
++            fill_f32(d.s);
++            fill_f32(d.c);
++        }
++        const auto & a = attn[li];
++        if (a.k_tg != nullptr) {
++            // f16 weights fill: fill_weight quantizes to the tensor's type
++            fill_weight(a.k_tg);
++            fill_weight(a.v_tg);
++            fill_f32(a.q_tg);
++            fill_f32(a.q_pp);
++        }
++    }
++    for (auto & [key, t] : inputs) {
++        fill_f32(t);
+     }
+-    fill_f32(x1);
+-    fill_f32(xb);
+     if (moe) {
+-        // the two decode id sets pick disjoint experts where possible, so consecutive ops read other weights
+-        fill_ids(ids1[0], n_e, 0);
+-        fill_ids(ids1[1], n_e, n_used);
+-        fill_ids(idsb, n_e, 0);
++        // the decode token and the prompt tokens spread over all timed experts, as uniform routing would
++        fill_ids(ids_tg, (int) n_e, 0);
++        fill_ids(ids_pp, (int) n_e, 0);
++    }
++    fill_f32(x_hop);
++    if (out_w != nullptr) {
++        fill_weight(out_w);
++        fill_f32(ggml_get_tensor(wctx.get(), "calib_out_x"));
+     }
+ 
+-    // decode: bytes streamed per second (a token reads the weights of its n_used experts)
+-    const double bytes_per_op = (double) ggml_nbytes(w[0]) / n_e * n_used;
+-    const double t_decode = time_graph(backend.get(), gd, 5);
+-    out.s_decode_byte = t_decode / (n_decode * bytes_per_op);
+-
+-    const double t_prefill = time_graph(backend.get(), gp, 3);
+-    out.s_prefill_flop = t_prefill / (n_prefill * 2.0 * n_embd * n_ff * n_ubatch * n_used);
+-
++    // round trip: a small write and a read back
+     out.t_hop      = 0.0;
+     out.s_hop_byte = 0.0;
+-    if (dev_is_remote(dev)) {
+-        // round trip: small write + read back
++    if (remote) {
+         float v = 1.0f;
+         std::vector<double> rt;
+         for (int i = 0; i < 20; i++) {
+             const int64_t t0 = ggml_time_us();
+-            ggml_backend_tensor_set(x1, &v, 0, sizeof(v));
+-            ggml_backend_tensor_get(x1, &v, 0, sizeof(v));
++            ggml_backend_tensor_set(x_hop, &v, 0, sizeof(v));
++            ggml_backend_tensor_get(x_hop, &v, 0, sizeof(v));
+             rt.push_back((ggml_time_us() - t0) * 1e-6);
+         }
+         std::nth_element(rt.begin(), rt.begin() + rt.size() / 2, rt.end());
+         out.t_hop = rt[rt.size() / 2] / 2.0;
+ 
+         // bandwidth: one ubatch of activations
+-        std::vector<uint8_t> buf(ggml_nbytes(xb));
++        std::vector<uint8_t> buf(ggml_nbytes(x_hop));
+         std::vector<double> bw;
+         for (int i = 0; i < 3; i++) {
+             const int64_t t0 = ggml_time_us();
+-            ggml_backend_tensor_set(xb, buf.data(), 0, buf.size());
++            ggml_backend_tensor_set(x_hop, buf.data(), 0, buf.size());
+             bw.push_back((ggml_time_us() - t0) * 1e-6);
+         }
+         std::nth_element(bw.begin(), bw.begin() + bw.size() / 2, bw.end());
+         out.s_hop_byte = std::max(0.0, bw[bw.size() / 2] - out.t_hop) / (double) buf.size();
+     }
++
++    // every graph gets its own allocation of the op outputs; they are timed one after another
++    // kind: 0 decode, 1 prefill, 2 prefill of the experts
++    struct timed { ggml_cgraph * gf; ggml_gallocr_t alloc; double best; double share; int kind; };
++    std::vector<timed> all;
++    for (auto & g : graphs) {
++        int kind = 0;
++        for (ggml_cgraph * gf : { g.decode, g.prefill, g.prefill_exp }) {
++            if (gf != nullptr && ggml_graph_n_nodes(gf) > 0) {
++                all.push_back({ gf, nullptr, std::numeric_limits<double>::infinity(), g.share, kind });
++            }
++            kind++;
++        }
++    }
++    // the output layer: memory bound like decode, but a single wide matrix (often another weight type); a slice
++    // of it keeps the upload small
++    if (m.output.ne[1] > 0) {
++        ggml_cgraph * g_out = ggml_new_graph(gctx.get());
++        ggml_tensor * x_out = ggml_get_tensor(wctx.get(), "calib_out_x");
++        add_timed_op(gctx.get(), g_out, ggml_mul_mat(gctx.get(), out_w, x_out));
++        if (ggml_backend_supports_op(backend.get(), ggml_graph_node(g_out, 0))) {
++            all.push_back({ g_out, nullptr, std::numeric_limits<double>::infinity(), 0.0, 3 });
++        }
++    }
++
++    // what one of the untimed small ops costs: a chain of scales over one token's activations (dispatch bound)
++    // and over a ubatch of them (memory bound)
++    constexpr int n_chain = 64;
++    for (int j = 0; j < 2; j++) {
++        ggml_cgraph * g_ops = ggml_new_graph(gctx.get());
++        ggml_tensor * y = j == 0 ? ggml_view_1d(gctx.get(), x_hop, n_embd, 0) : x_hop;
++        for (int i = 0; i < n_chain; i++) {
++            y = ggml_scale(gctx.get(), y, 1.0f);
++        }
++        ggml_build_forward_expand(g_ops, y);
++        all.push_back({ g_ops, nullptr, std::numeric_limits<double>::infinity(), 0.0, j == 0 ? 4 : 5 });
++    }
++
++    // the fixed cost of running a graph and reading a value back (submit, fence, and for a remote device the
++    // round trip): a real model pays it once per token or ubatch, not per layer, so it comes off every timing
++    ggml_cgraph * g_sync = ggml_new_graph(gctx.get());
++    ggml_build_forward_expand(g_sync, ggml_cont(gctx.get(), ggml_view_1d(gctx.get(), x_hop, 1, 0)));
++    all.push_back({ g_sync, nullptr, std::numeric_limits<double>::infinity(), 0.0, -1 });
++
++    struct gallocr_guard {
++        std::vector<timed> & v;
++        ~gallocr_guard() { for (auto & t : v) { if (t.alloc) { ggml_gallocr_free(t.alloc); } } }
++    } guard { all };
++    for (auto & t : all) {
++        t.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get()));
++        if (!ggml_gallocr_alloc_graph(t.alloc, t.gf)) {
++            return false;
++        }
++    }
++
++    // Other load on the node (compiles, other models) only ever slows a timing down, so each graph keeps its
++    // fastest round. Rounds repeat until the last one agrees with the best within 10%, at most 4.
++    // one untimed pass first: an idle GPU needs a moment to raise its clocks
++    for (auto & t : all) {
++        compute_and_wait(backend.get(), t.gf);
++    }
++    double worst_spread = 1.0;
++    std::vector<double> first(all.size());
++    for (int round = 0; round < 4; round++) {
++        bool settled = round > 0;
++        for (size_t i = 0; i < all.size(); i++) {
++            const double t = time_graph(backend.get(), all[i].gf, 3);
++            if (round == 0) {
++                first[i] = t;
++            }
++            settled = settled && t <= 1.1 * all[i].best;
++            all[i].best = std::min(all[i].best, t);
++            if (all[i].kind >= 0) {
++                worst_spread = std::max(worst_spread, first[i] / all[i].best);
++            }
++        }
++        if (settled) {
++            break;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    }
++    if (worst_spread > 1.25) {
++        LOG_INF("%s: %s timed %.2fx slower in its first round than its best, the node was probably busy; kept the best\n",
++                __func__, ggml_backend_dev_name(dev), worst_spread);
++    }
++
++    // per mean layer, turned into the rates the cost model multiplies with layer_bytes / layer_flops
++    double t_sync = 0.0;
++    for (const auto & t : all) {
++        if (t.kind == -1) {
++            t_sync = t.best;
++        }
++    }
++    double t_decode  = 0.0;
++    double t_prefill = 0.0;
++    double t_op_tg   = 0.0;
++    double t_op_pp   = 0.0;
++    for (auto & t : all) {
++        t.best = std::max(t.best - t_sync, 0.1 * t.best);
++        switch (t.kind) {
++            case 3: out.s_output_byte = t.best / (double) ggml_nbytes(out_w); break;
++            case 4: t_op_tg = t.best / n_chain; break;
++            case 5: t_op_pp = t.best / n_chain; break;
++            case 0: t_decode  += t.share * t.best;             break;
++            case 1: t_prefill += t.share * t.best;             break;
++            case 2: t_prefill += t.share * t.best / exp_scale; break;
++        }
++    }
++    // the layer's other ops: its real node count minus the ops timed above (their helper copies excluded)
++    double timed_tg = 0.0;
++    double timed_pp = 0.0;
++    for (const auto & t : all) {
++        if (t.kind < 0 || t.kind > 2) {
++            continue;
++        }
++        int n = 0;
++        for (int i = 0; i < ggml_graph_n_nodes(t.gf); i++) {
++            const ggml_op op = ggml_graph_node(t.gf, i)->op;
++            n += op != GGML_OP_VIEW && op != GGML_OP_CONT;
++        }
++        (t.kind == 0 ? timed_tg : timed_pp) += t.share * n;
++    }
++    if (m.nodes_tg_layer > 0.0) {
++        t_decode  += std::max(0.0, m.nodes_tg_layer - timed_tg) * t_op_tg;
++    }
++    if (m.nodes_pp_layer > 0.0) {
++        t_prefill += std::max(0.0, m.nodes_pp_layer - timed_pp) * t_op_pp;
++    }
++
++    out.s_decode_byte  = t_decode  / std::max(1.0, m.layer_bytes);
++    out.s_prefill_flop = t_prefill / std::max(1.0, m.layer_flops * (double) ub);
+     return true;
+ }
+ 
+@@ -460,24 +766,66 @@ static bool quick_check(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_ff, gg
+     }
+     fill_weight(w);
+     fill_f32(x1);
+-    s_byte = time_graph(backend.get(), gd, 7) / (double) (n_decode * ggml_nbytes(w));
++    // best of a few spaced tries: a busy moment on the node must not look like different hardware
++    double best = std::numeric_limits<double>::infinity();
++    for (int i = 0; i < 3; i++) {
++        if (i > 0) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(150));
++        }
++        best = std::min(best, time_graph(backend.get(), gd, 7));
++    }
++    s_byte = best / (double) (n_decode * ggml_nbytes(w));
+     return true;
+ }
+ 
+ static bool perf_valid(const common_split_device_perf & p) {
+     auto pos = [](double v) { return std::isfinite(v) && v > 0.0; };
+     auto nonneg = [](double v) { return std::isfinite(v) && v >= 0.0; };
+-    return pos(p.s_decode_byte) && pos(p.s_prefill_flop) && nonneg(p.t_hop) && nonneg(p.s_hop_byte);
++    return pos(p.s_decode_byte) && pos(p.s_prefill_flop) && nonneg(p.t_hop) && nonneg(p.s_hop_byte) && nonneg(p.s_output_byte);
++}
++
++// the widest weight of the timed layers, used for the quick re-check of cached entries
++static bool check_shape(const common_split_calib_model & m, int64_t & n_embd, int64_t & n_rows, ggml_type & type) {
++    size_t best = 0;
++    for (const auto & l : m.layers) {
++        for (const auto & w : l.weights) {
++            const size_t b = ggml_row_size(w.type, w.ne[0]) * w.ne[1];
++            if (b > best) {
++                best   = b;
++                n_embd = w.ne[0];
++                n_rows = w.ne[1];
++                type   = w.type;
++            }
++        }
++    }
++    return best > 0;
++}
++
++// weight types that can't be quantized without an importance matrix are timed as a similar type
++static common_split_calib_model timing_types(common_split_calib_model m) {
++    for (auto & l : m.layers) {
++        for (auto & w : l.weights) {
++            if (ggml_quantize_requires_imatrix(w.type)) {
++                w.type = GGML_TYPE_Q4_K;
++            }
++        }
++    }
++    return m;
+ }
+ 
+ std::vector<common_split_device_perf> common_split_balance_calibrate(
+         const std::vector<ggml_backend_dev_t> & devs,
+-        int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
+-        const std::string & cache_path, bool force,
+-        uint32_t n_expert, uint32_t n_expert_used) {
+-    if (ggml_quantize_requires_imatrix(wtype)) {
+-        wtype = GGML_TYPE_Q4_K; // timing only needs a similar type, not the exact one
++        const common_split_calib_model & model_in,
++        const common_split_workload & wl,
++        const std::string & cache_path, bool force) {
++    const common_split_calib_model model = timing_types(model_in);
++    int64_t   n_embd = 0;
++    int64_t   n_ff   = 0;
++    ggml_type wtype  = GGML_TYPE_COUNT;
++    if (model.layers.empty() || !check_shape(model, n_embd, n_ff, wtype)) {
++        return {};
+     }
++    const int64_t n_embd_act = model.n_embd > 0 ? model.n_embd : n_embd;
+ 
+     common_json cache = common_json::object();
+     if (!cache_path.empty() && !force) {
+@@ -500,7 +848,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
+     std::vector<common_split_device_perf> perf(devs.size());
+     bool dirty = false;
+     for (size_t i = 0; i < devs.size(); i++) {
+-        const std::string key = cache_key(devs[i], n_embd, n_ff, wtype, n_ubatch, n_expert_used);
++        const std::string key = cache_key(devs[i], model, wl);
+         if (cache.contains(key)) {
+             try {
+                 const common_json & e = cache.at(key);
+@@ -512,6 +860,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
+                 perf[i].s_prefill_flop = e.at("s_prefill_flop").get<double>();
+                 perf[i].t_hop          = e.at("t_hop").get<double>();
+                 perf[i].s_hop_byte     = e.at("s_hop_byte").get<double>();
++                perf[i].s_output_byte  = e.value("s_output_byte", 0.0);
+                 if (!perf_valid(perf[i])) {
+                     throw std::runtime_error("invalid");
+                 }
+@@ -543,7 +892,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
+             }
+         }
+         const int64_t t0 = ggml_time_us();
+-        if (!calibrate_device(devs[i], n_embd, n_ff, wtype, n_ubatch, n_expert, n_expert_used, perf[i])) {
++        if (!calibrate_device(devs[i], model, wl, n_embd_act, perf[i])) {
+             LOG_WRN("%s: could not calibrate %s, not balancing by speed\n", __func__, ggml_backend_dev_name(devs[i]));
+             return {};
+         }
+@@ -562,6 +911,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
+             {"s_prefill_flop", perf[i].s_prefill_flop},
+             {"t_hop",          perf[i].t_hop},
+             {"s_hop_byte",     perf[i].s_hop_byte},
++            {"s_output_byte",  perf[i].s_output_byte},
+             {"measured_at",    now_s},
+         });
+         dirty = true;
+@@ -618,6 +968,7 @@ struct model_layer_info {
+     uint32_t  n_expert_used = 0;
+     ggml_type wtype  = GGML_TYPE_COUNT;
+     bool      overridden = false; // a tensor buffer override matches a tensor of this model
++    common_split_calib_model calib;
+ };
+ 
+ // layer sizes, compute and the dominant FFN matmul shape from the GGUF metadata
+@@ -655,6 +1006,25 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
+             default:               return def;
+         }
+     };
++    // a per-layer value: either one number for all layers or an array with one per layer
++    auto get_u32_layer = [&](const std::string & key, uint32_t il, uint32_t def) {
++        const int64_t kid = gguf_find_key(gctx, (arch + "." + key).c_str());
++        if (kid < 0) {
++            return def;
++        }
++        if (gguf_get_kv_type(gctx, kid) == GGUF_TYPE_ARRAY) {
++            if (il >= gguf_get_arr_n(gctx, kid)) {
++                return def;
++            }
++            const void * data = gguf_get_arr_data(gctx, kid);
++            switch (gguf_get_arr_type(gctx, kid)) {
++                case GGUF_TYPE_UINT32: return ((const uint32_t *) data)[il];
++                case GGUF_TYPE_INT32:  return (uint32_t) ((const int32_t *) data)[il];
++                default:               return def;
++            }
++        }
++        return get_u32(key, def);
++    };
+     const uint32_t n_expert      = get_u32("expert_count", 0);
+     const uint32_t n_expert_used = get_u32("expert_used_count", 0);
+     // a token only reads (and multiplies with) the experts it is routed to
+@@ -670,6 +1040,17 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
+     int64_t dense_embd = 0;
+     int64_t dense_ff   = 0;
+ 
++    // per layer: the weight matrices (name after "blk.N.", shape, type) and whether it has a recurrent block
++    struct layer_weights {
++        std::vector<std::pair<std::string, common_split_calib_weight>> w;
++        bool attn = false;
++        bool ssm  = false;
++        bool gdn  = false; // gated delta net gating tensors
++        int64_t conv_k  = 0;
++        int64_t conv_ch = 0;
++    };
++    std::vector<layer_weights> per_layer(n_layer);
++
+     const int64_t n_tensors = gguf_get_n_tensors(gctx);
+     for (int64_t i = 0; i < n_tensors; i++) {
+         const std::string name = gguf_get_tensor_name(gctx, i);
+@@ -689,6 +1070,32 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
+             if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0 || (uint32_t) il >= n_layer) {
+                 continue; // e.g. nextn/MTP layers that are not part of the repeating split
+             }
++            {
++                const std::string suffix = name.substr(name.find('.', 4) + 1);
++                auto & lw = per_layer[il];
++                if (suffix.rfind("ssm_", 0) == 0) {
++                    lw.ssm = true;
++                }
++                if (suffix.rfind("ssm_beta.", 0) == 0 || suffix.rfind("ssm_alpha.", 0) == 0 || suffix.rfind("ssm_ba.", 0) == 0) {
++                    lw.gdn = true;
++                }
++                if (suffix.rfind("ssm_conv1d.", 0) == 0) {
++                    lw.conv_k  = t->ne[0];
++                    lw.conv_ch = t->ne[1];
++                }
++                if (suffix.rfind("attn_q.", 0) == 0 || suffix.rfind("attn_k.", 0) == 0 || suffix.rfind("attn_qkv.", 0) == 0) {
++                    lw.attn = true;
++                }
++                // matrices a token is multiplied with; conv kernels and other small ones are left to the overhead
++                if (t->ne[1] > 1 && t->ne[0] >= 64 && ggml_n_dims(t) <= 3) {
++                    common_split_calib_weight cw;
++                    cw.ne[0] = t->ne[0];
++                    cw.ne[1] = t->ne[1];
++                    cw.ne[2] = t->ne[2];
++                    cw.type  = t->type;
++                    lw.w.emplace_back(suffix, cw);
++                }
++            }
+             layer_bytes += ggml_nbytes(t) * frac;
+             if (t->ne[1] > 1) {
+                 layer_flops += 2.0 * ggml_nelements(t) * frac;
+@@ -710,11 +1117,21 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
+                 info.n_expert      = n_expert;
+                 info.n_expert_used = n_expert_used;
+             }
+-        } else if (name == "output.weight") {
+-            output_bytes = ggml_nbytes(t);
+-            has_output = true;
+-        } else if (name == "token_embd.weight") {
+-            tok_embd_bytes = ggml_nbytes(t);
++        } else if (name == "output.weight" || name == "token_embd.weight") {
++            common_split_calib_weight cw;
++            cw.ne[0] = t->ne[0];
++            cw.ne[1] = t->ne[1];
++            cw.type  = t->type;
++            if (name == "output.weight") {
++                output_bytes = ggml_nbytes(t);
++                has_output = true;
++                info.calib.output = cw;
++            } else {
++                tok_embd_bytes = ggml_nbytes(t);
++                if (!has_output) {
++                    info.calib.output = cw; // tied embeddings, replaced if an output.weight follows
++                }
++            }
+         }
+     }
+     gguf_free(gctx);
+@@ -741,6 +1158,57 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
+     info.shape.layer_flops  = layer_flops / n_layer;
+     info.shape.act_bytes    = (double) info.n_embd * sizeof(float);
+     info.shape.output_bytes = has_output ? output_bytes : tok_embd_bytes; // tied embeddings
++
++    // the layer kinds to time: layers with the same weights (names, shapes, types) and attention shape
++    // are the same kind; the first layer of each kind stands in for all of them
++    {
++        const uint32_t n_embd_model = get_u32("embedding_length", (uint32_t) info.n_embd);
++        std::map<std::string, size_t> kinds;
++        auto & cm = info.calib;
++        for (uint32_t il = 0; il < n_layer; il++) {
++            auto & lw = per_layer[il];
++            std::sort(lw.w.begin(), lw.w.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
++            common_split_calib_layer l;
++            const uint32_t n_head    = get_u32_layer("attention.head_count",    il, 0);
++            const uint32_t n_head_kv = get_u32_layer("attention.head_count_kv", il, n_head);
++            if (lw.attn && !lw.ssm && n_head > 0 && n_head_kv > 0) {
++                l.n_head     = n_head;
++                l.n_head_kv  = n_head_kv;
++                l.head_dim_k = get_u32("attention.key_length",   n_embd_model / n_head);
++                l.head_dim_v = get_u32("attention.value_length", l.head_dim_k);
++            }
++            if (lw.gdn && lw.conv_k > 1) {
++                l.gdn_state = get_u32("ssm.state_size",    0);
++                l.gdn_h_k   = get_u32("ssm.group_count",   0);
++                l.gdn_h_v   = get_u32("ssm.time_step_rank", 0);
++                l.conv_k    = (uint32_t) lw.conv_k;
++                l.conv_ch   = (uint32_t) lw.conv_ch;
++                if (l.gdn_state == 0 || l.gdn_h_k == 0 || l.gdn_h_v == 0 || l.gdn_h_v % l.gdn_h_k != 0) {
++                    l.gdn_state = l.gdn_h_k = l.gdn_h_v = l.conv_k = l.conv_ch = 0;
++                }
++            }
++            std::ostringstream sig;
++            sig << l.n_head << '/' << l.n_head_kv << '/' << l.head_dim_k << '/' << l.head_dim_v << "|gdn" << l.gdn_state
++                << '/' << l.gdn_h_k << '/' << l.gdn_h_v << '/' << l.conv_k << '/' << l.conv_ch;
++            for (const auto & [suffix, w] : lw.w) {
++                sig << ';' << suffix << ':' << w.ne[0] << 'x' << w.ne[1] << 'x' << w.ne[2] << ggml_type_name(w.type);
++                l.weights.push_back(w);
++            }
++            auto it = kinds.find(sig.str());
++            if (it == kinds.end()) {
++                l.share = 0.0;
++                kinds[sig.str()] = cm.layers.size();
++                cm.layers.push_back(std::move(l));
++                it = kinds.find(sig.str());
++            }
++            cm.layers[it->second].share += 1.0 / n_layer;
++        }
++        cm.n_expert      = n_expert;
++        cm.n_expert_used = n_expert_used;
++        cm.n_embd        = n_embd_model > 0 ? n_embd_model : info.n_embd;
++        cm.layer_bytes   = info.shape.layer_bytes;
++        cm.layer_flops   = info.shape.layer_flops;
++    }
+     return true;
+ }
+ 
+@@ -794,6 +1262,15 @@ void common_split_balance_apply(
+         LOG_WRN("%s: could not read the layer shapes, keeping the memory split\n", __func__);
+         return;
+     }
++    {
++        int32_t nodes_pp = -1;
++        int32_t nodes_tg = -1;
++        common_fit_last_graph_nodes(nodes_pp, nodes_tg);
++        if (nodes_pp > 0 && nodes_tg > 0 && n_layer > 0) {
++            info.calib.nodes_pp_layer = (double) nodes_pp / n_layer;
++            info.calib.nodes_tg_layer = (double) nodes_tg / n_layer;
++        }
++    }
+     if (info.overridden) {
+         LOG_INF("%s: tensor buffer overrides move weights of this model off the split, keeping the memory split\n", __func__);
+         return;
+@@ -830,19 +1307,17 @@ void common_split_balance_apply(
+     };
+ 
+     const std::string cache_path = fs_get_cache_directory() + "split-balance.json";
+-    const auto perf = common_split_balance_calibrate(devs, info.n_embd, info.n_ff, info.wtype,
+-                                                      cparams.n_ubatch, cache_path, params.split_calibrate_force,
+-                                                      info.n_expert, info.n_expert_used);
+-    if (perf.size() != nd) {
+-        return;
+-    }
+-
+     common_split_workload wl;
+     wl.n_prompt = params.split_workload_prompt;
+     wl.n_gen    = params.split_workload_gen;
+     wl.n_ubatch = cparams.n_ubatch;
+     wl.n_batch  = cparams.n_batch;
+ 
++    const auto perf = common_split_balance_calibrate(devs, info.calib, wl, cache_path, params.split_calibrate_force);
++    if (perf.size() != nd) {
++        return;
++    }
++
+     // optimize, then check the choice against real buffer sizes; shrink the cap of any device
+     // that would overflow and try again
+     std::vector<uint32_t> n;
+diff --git a/common/split-balance.h b/common/split-balance.h
+index cf6332a09..377e11eab 100644
+--- a/common/split-balance.h
++++ b/common/split-balance.h
+@@ -31,6 +31,7 @@ struct common_split_device_perf {
+     double s_prefill_flop  = 0.0; // seconds per flop in an n_ubatch-token matmul (compute bound)
+     double t_hop           = 0.0; // fixed seconds per hand-off into/out of this device (0 = local)
+     double s_hop_byte      = 0.0; // seconds per activation byte moved into/out of this device
++    double s_output_byte   = 0.0; // seconds per output-layer weight byte per token (0 = s_decode_byte)
+ };
+ 
+ // what the cost model needs to know about the model
+@@ -73,15 +74,54 @@ std::vector<uint32_t> common_split_balance_optimize(
+         const std::vector<uint32_t> & max_layers,
+         const common_split_workload & wl);
+ 
+-// Times each device with synthetic matmuls shaped like the model's layers
+-// (n_embd x n_ff weights of type wtype). Remote (RPC) devices are timed over
+-// their normal protocol, so nothing changes on the worker. Results are cached
+-// in cache_path (empty = no cache) keyed by device, shape and type.
++// one weight matrix of a layer; ne[2] > 1 is a stack of experts (multiplied with mul_mat_id)
++struct common_split_calib_weight {
++    int64_t   ne[3] = { 0, 0, 1 };
++    ggml_type type  = GGML_TYPE_F16;
++};
++
++// one kind of repeating layer (hybrid models have several) and the share of the layers like it
++struct common_split_calib_layer {
++    std::vector<common_split_calib_weight> weights;
++    double   share      = 1.0;
++    uint32_t n_head     = 0; // 0: no attention op in this layer
++    uint32_t n_head_kv  = 0;
++    uint32_t head_dim_k = 0;
++    uint32_t head_dim_v = 0;
++    // gated delta net (qwen35/qwen3next linear attention): conv + recurrence; 0 = none
++    uint32_t gdn_state  = 0; // S: head size of the recurrent state
++    uint32_t gdn_h_k    = 0;
++    uint32_t gdn_h_v    = 0;
++    uint32_t conv_k     = 0; // conv kernel width
++    uint32_t conv_ch    = 0; // conv channels
++};
++
++// what the calibration times: the model's own layers with its real shapes, types and expert count
++struct common_split_calib_model {
++    std::vector<common_split_calib_layer> layers;
++    uint32_t n_expert      = 0;
++    uint32_t n_expert_used = 0;
++    int64_t  n_embd        = 0;   // width of the activations handed between devices
++    common_split_calib_weight output; // the output layer (token_embd when tied); ne[1] == 0: none
++    // compute nodes per repeating layer in the model's real graphs (0 = unknown): the calibration times the
++    // heavy ops of a layer, the rest (norms, RoPE, elementwise, copies) is charged per node
++    double nodes_tg_layer = 0.0;
++    double nodes_pp_layer = 0.0;
++    double   layer_bytes   = 0.0; // as in common_split_model_shape, to turn layer times into rates
++    double   layer_flops   = 0.0;
++};
++
++// Times each device on one layer of every kind the model has (real weight shapes and types,
++// flash attention at the workload's context), weighted by how many layers of each kind there
++// are, and expresses the result as the per-byte / per-flop rates the cost model uses. Remote
++// (RPC) devices are timed over their normal protocol, so nothing changes on the worker. Each
++// timing is repeated and the fastest kept, since other load on a node only slows it down.
++// Results are cached in cache_path (empty = no cache) keyed by device, model layers and build.
+ std::vector<common_split_device_perf> common_split_balance_calibrate(
+         const std::vector<ggml_backend_dev_t> & devs,
+-        int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
+-        const std::string & cache_path, bool force,
+-        uint32_t n_expert = 0, uint32_t n_expert_used = 0); // MoE: time the routed expert matmuls
++        const common_split_calib_model & model,
++        const common_split_workload & wl,
++        const std::string & cache_path, bool force);
+ 
+ const char * common_split_balance_mode_name(common_split_balance_mode mode);
+ 
+diff --git a/include/llama.h b/include/llama.h
+index b62c0a5e4..4bf5d0486 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -583,6 +583,10 @@ extern "C" {
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+ 
++    // Nodes that do work (views and reshapes excluded) in the graph reserved at context creation, for a
++    // single token (single_token = true) or a full ubatch; -1 if no graph was reserved
++    LLAMA_API int32_t llama_graph_n_compute_nodes(const struct llama_context * ctx, bool single_token);
++
+     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
+     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
+     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cbd04a1cf..6c6f5eafb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -652,6 +652,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++static int32_t graph_count_compute_nodes(ggml_cgraph * gf) {
++    int32_t n = 0;
++    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++        switch (ggml_graph_node(gf, i)->op) {
++            case GGML_OP_NONE:
++            case GGML_OP_VIEW:
++            case GGML_OP_RESHAPE:
++            case GGML_OP_PERMUTE:
++            case GGML_OP_TRANSPOSE:
++                break;
++            default:
++                n++;
++        }
++    }
++    return n;
++}
++
+ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
+     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+@@ -785,6 +802,7 @@ void llama_context::sched_reserve() {
+ 
+         n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
+         n_nodes_pp         = ggml_graph_n_nodes(gf);
++        n_compute_nodes_pp = graph_count_compute_nodes(gf);
+         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
+         n_input_tensors_pp = this->n_input_tensors;
+     }
+@@ -798,6 +816,7 @@ void llama_context::sched_reserve() {
+ 
+         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
+         n_nodes_tg         = ggml_graph_n_nodes(gf);
++        n_compute_nodes_tg = graph_count_compute_nodes(gf);
+         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
+         n_input_tensors_tg = this->n_input_tensors;
+     }
+@@ -4348,6 +4367,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
+     return ctx->get_cparams().n_rs_seq;
+ }
+ 
++int32_t llama_graph_n_compute_nodes(const llama_context * ctx, bool single_token) {
++    return ctx->graph_n_compute_nodes(single_token);
++}
++
+ const llama_model * llama_get_model(const llama_context * ctx) {
+     return &ctx->get_model();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0cd1cf860..f7a3b0442 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -68,6 +68,9 @@ struct llama_context {
+     const llama_model   & get_model()   const;
+     const llama_cparams & get_cparams() const;
+ 
++    // compute nodes of the last reserved single-token (tg) or prompt (pp) graph, -1 before the first reserve
++    int32_t graph_n_compute_nodes(bool single_token) const { return single_token ? n_compute_nodes_tg : n_compute_nodes_pp; }
++
+     ggml_backend_sched_t get_sched() const;
+ 
+     uint32_t n_ctx()     const;
+@@ -348,6 +351,10 @@ private:
+     std::unique_ptr<llama_batch_allocr> balloc;
+ 
+     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
++
++    // nodes that do work (not views/reshapes) in the reserved prompt (pp) and single-token (tg) graphs
++    int32_t n_compute_nodes_pp = -1;
++    int32_t n_compute_nodes_tg = -1;
+     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+ 
+     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+-- 
+2.43.0
+
