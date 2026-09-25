@@ -122,7 +122,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0105 | `34da5e374` | common: split-balance: survive malformed cache entries, log why an entry is not used, merge on write |
 | 0106 | `c725c5d7e` | server, chat: stop generating at a stray K2-Horizon close tag; keep reasoning_format none raw |
 | 0107 | `ede0eed18` | FLEET.md: K2 stop_after_reasoning |
-| 0108 | (this commit) | fleet: regenerate patch mirror |
+| 0108 | `44e8d0714` | fleet: regenerate patch mirror for the round-6 fixes |
+| 0109 | `649e5e50a` | server: a captured checkpoint may outlive its task: don't read slot.task for it |
+| 0110 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
