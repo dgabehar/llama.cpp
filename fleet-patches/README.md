@@ -103,7 +103,10 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0086 | `571d2f523` | llama: direct I/O into memory that refuses DMA goes through a bounce buffer |
 | 0087 | `280a0f95f` | split-balance: time MoE models with routed expert matmuls, reject inconsistent entries |
 | 0088 | `32a4c4aa5` | server tests: keep the slot busy longer than the save timeout on fast hardware |
-| 0089 | (this commit) | FLEET: capture policy, direct I/O bounce buffer, MoE calibration |
+| 0089 | `139c960bc` | FLEET: capture policy, direct I/O bounce buffer, MoE calibration |
+| 0090 | `41b2ad40d` | models: fix the conv-state window over the transposed new tokens (draft-mtp corruption on qwen35) |
+| 0091 | `c0f21d0b1` | vulkan: cap an integrated GPU's total free memory at MemAvailable |
+| 0092 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
