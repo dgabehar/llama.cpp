@@ -124,6 +124,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0107 | `ede0eed18` | FLEET.md: K2 stop_after_reasoning |
 | 0108 | `44e8d0714` | fleet: regenerate patch mirror for the round-6 fixes |
 | 0109 | `649e5e50a` | server: a captured checkpoint may outlive its task: don't read slot.task for it |
+| 0110 | `24e4d819b` | fleet: regenerate patch mirror for the captured-checkpoint fix |
+| 0111 | `0ab13d2bb` | server: don't update the prompt cache of a busy slot picked by id_slot |
+| 0112 | `c4234d605` | FLEET.md: record the busy-slot prompt cache fix |
 | 0110 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
