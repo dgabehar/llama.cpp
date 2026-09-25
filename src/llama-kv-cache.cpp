@@ -212,9 +212,10 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_dev_t dev = nullptr;
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -235,6 +236,25 @@ llama_kv_cache::llama_kv_cache(
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+
+        // a KV cache tensor this large is pre-allocated (its buffer is set below), so if the
+        // device can't actually run an op against it (e.g. it exceeds a Vulkan device's
+        // maxStorageBufferRange), ggml_backend_sched would otherwise hard-abort deep inside
+        // graph_reserve() the first time this layer's cache is scheduled. Catch it here instead,
+        // as a normal exception the caller (e.g. --fit's own oversized context probe) can recover
+        // from by trying a smaller context size.
+        if (dev != nullptr) {
+            if (k != nullptr && !ggml_backend_dev_supports_op(dev, k)) {
+                throw std::runtime_error(format(
+                        "kv cache: layer %d K cache (%s, %zu MiB) is too large for device %s to operate on -- try a smaller context size",
+                        il, ggml_type_name(type_k), ggml_nbytes(k)/1024/1024, dev_name));
+            }
+            if (v != nullptr && !ggml_backend_dev_supports_op(dev, v)) {
+                throw std::runtime_error(format(
+                        "kv cache: layer %d V cache (%s, %zu MiB) is too large for device %s to operate on -- try a smaller context size",
+                        il, ggml_type_name(type_v), ggml_nbytes(v)/1024/1024, dev_name));
+            }
+        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
