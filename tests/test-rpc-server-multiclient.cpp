@@ -349,11 +349,11 @@ static int mode_compute(const std::string & ep, int iters, int seed) {
     };
     std::vector<float> w(n * n), x(n), y_ref(n), y(n);
     srand(seed);
-    for (auto & v : w) { v = (float) rand() / RAND_MAX - 0.5f; }
+    for (auto & v : w) { v = (float) rand() / (float) RAND_MAX - 0.5f; }
 
     int failures = 0;
     for (int it = 0; it < iters; it++) {
-        for (auto & v : x) { v = (float) rand() / RAND_MAX - 0.5f; }
+        for (auto & v : x) { v = (float) rand() / (float) RAND_MAX - 0.5f; }
         for (int pass = 0; pass < 2; pass++) {
             ggml_backend_t backend = pass == 0 ? cpu : rpc;
             ggml_context * ctx = ggml_init(params);
