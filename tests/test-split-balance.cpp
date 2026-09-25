@@ -158,8 +158,9 @@ static void test_calibrate_cpu() {
     const std::string cache = (std::filesystem::temp_directory_path() / "test-split-balance-cache.json").string();
     std::filesystem::remove(cache);
     {
+        // an unrelated entry, and a malformed one (a string where a number belongs): neither may break a start
         std::ofstream f(cache);
-        f << R"({"ref|some other device": {"measured_at": 0}})";
+        f << R"({"ref|some other device": {"measured_at": 0}, "ref|broken": {"measured_at": "yesterday", "ttl": "x"}})";
     }
 
     auto p1 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
@@ -170,6 +171,7 @@ static void test_calibrate_cpu() {
     }
     std::string c = read_file(cache);
     CHECK(c.find("\"ref|CPU") != std::string::npos, "no reference entry written");
+    CHECK(c.find("ref|broken") == std::string::npos, "the malformed entry was not dropped");
 
     // a cache hit gives the same numbers (unless the quick re-check found the CPU at another speed)
     auto p2 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
