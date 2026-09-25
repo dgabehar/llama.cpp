@@ -193,6 +193,49 @@ static void test_calibrate_cpu() {
     std::filesystem::remove(cache);
 }
 
+// Regression test: grouped layer kinds are timed on one representative weight-type layout, and
+// byte_scale corrects for the kind's real mean bytes when its layers mix quant types. Decode
+// (memory-bound) applied this scale from the start; prefill (compute-bound) silently didn't, so a
+// kind whose untimed types were the heavier ones had its prefill rate under-measured -- this is what
+// made the fork's pp prediction read high after grouping landed. Prefill must react to byte_scale too.
+static void test_byte_scale_affects_prefill() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the byte_scale/prefill test\n");
+        return;
+    }
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto m_base = tiny_model();
+    auto p_base = common_split_balance_calibrate({ cpu }, m_base, wl, "", false);
+    CHECK(p_base.size() == 1 && p_base[0].s_prefill_flop > 0, "baseline calibration failed");
+    if (p_base.size() != 1) {
+        return;
+    }
+
+    // the gdn kind is half the model's layers (share 0.5); scaling its byte_scale up a lot must move
+    // the aggregate calibrated rate by a clearly-measurable amount if prefill reacts to it at all
+    auto m_scaled = m_base;
+    m_scaled.layers[1].byte_scale = 3.0;
+    auto p_scaled = common_split_balance_calibrate({ cpu }, m_scaled, wl, "", false);
+    CHECK(p_scaled.size() == 1 && p_scaled[0].s_prefill_flop > 0, "scaled-model calibration failed");
+    if (p_scaled.size() != 1) {
+        return;
+    }
+
+    CHECK(p_scaled[0].s_prefill_flop > p_base[0].s_prefill_flop * 1.2,
+          "byte_scale must raise the calibrated prefill rate too, not just decode (got %.6g vs %.6g)",
+          p_scaled[0].s_prefill_flop, p_base[0].s_prefill_flop);
+    // sanity check: decode should react to the same knob (this direction already worked pre-fix)
+    CHECK(p_scaled[0].s_decode_byte > p_base[0].s_decode_byte * 1.2,
+          "sanity: byte_scale should also raise the decode rate (got %.6g vs %.6g)",
+          p_scaled[0].s_decode_byte, p_base[0].s_decode_byte);
+}
+
 int main() {
     const auto shape = qwen27b();
     // device order as llama.cpp lists them: RPC first, then the local GPU
@@ -281,6 +324,7 @@ int main() {
     }
 
     test_calibrate_cpu();
+    test_byte_scale_affects_prefill();
 
     if (n_fail == 0) {
         printf("test-split-balance: OK\n");
