@@ -40,6 +40,13 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// a piece of the host part of a captured sequence state
+struct llama_state_capture_host_seg {
+    size_t dst;  // offset in the state
+    size_t src;  // offset in the host bytes
+    size_t size;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -408,7 +415,12 @@ private:
         llama_pos pos_min = -1;
         llama_pos pos_max = -1;
 
-        std::vector<uint8_t> data;
+        std::vector<uint8_t> data; // the assembled state, once read
+
+        // the host part of the state (small), placed into data at dst when it is assembled
+        std::vector<uint8_t> host;
+        std::vector<llama_state_capture_host_seg> host_segs;
+        size_t n_bytes = 0; // size of the state
 
         // on-device copies of the tensor ranges, read into data at dst on first access
         struct range {
@@ -420,6 +432,10 @@ private:
 
         std::vector<ggml_context_ptr>        ctxs;
         std::vector<ggml_backend_buffer_ptr> bufs;
+
+        // recorded after the copies on each device: reading waits for these, not for the whole context
+        std::vector<ggml_backend_event_ptr> events;
+        bool need_sync = false; // a device without events: reading synchronizes the context
     };
 
     std::vector<state_capture> state_captures;

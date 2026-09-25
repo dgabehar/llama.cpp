@@ -3321,37 +3321,36 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
-// records the host part of a sequence state and the tensor ranges it references
+// records the host part of a sequence state and the tensor ranges it references, without
+// materializing the (large) tensor data
 class llama_io_write_capture : public llama_io_write_i {
 public:
     struct range {
         ggml_tensor * tensor;
         size_t        offset;
         size_t        size;
-        size_t        dst; // offset in data
+        size_t        dst; // offset in the state
     };
 
-    explicit llama_io_write_capture(std::vector<uint8_t> & data) : data(data) {}
-
     void write(const void * src, size_t size) override {
-        const size_t n = data.size();
-        data.resize(n + size);
-        memcpy(data.data() + n, src, size);
+        host_segs.push_back({ total, host.size(), size });
+        host.insert(host.end(), (const uint8_t *) src, (const uint8_t *) src + size);
+        total += size;
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        ranges.push_back({ tensor, offset, size, data.size() });
-        data.resize(data.size() + size);
+        ranges.push_back({ tensor, offset, size, total });
+        total += size;
     }
 
     size_t n_bytes() override {
-        return data.size();
+        return total;
     }
 
-    std::vector<range> ranges;
-
-private:
-    std::vector<uint8_t> & data;
+    std::vector<uint8_t> host;
+    std::vector<llama_state_capture_host_seg> host_segs;
+    std::vector<range>   ranges;
+    size_t total = 0;
 };
 
 // a range of a state tensor can be copied on the device if it is made of whole blocks
@@ -3370,8 +3369,7 @@ bool llama_context::state_seq_capture_add(llama_seq_id seq_id, llama_pos pos, ll
 
     // check that the current layout of the state can be captured
     {
-        std::vector<uint8_t> data;
-        llama_io_write_capture io(data);
+        llama_io_write_capture io;
         try {
             memory->state_write(io, seq_id, flags);
         } catch (const std::exception &) {
@@ -3429,12 +3427,17 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
         cap.bufs.clear();
         cap.ctxs.clear();
         cap.ranges.clear();
+        cap.events.clear();
+        cap.need_sync = false;
         cap.taken = false;
         cap.read  = false;
 
         cap.data.clear();
+        cap.host.clear();
+        cap.host_segs.clear();
+        cap.n_bytes = 0;
 
-        llama_io_write_capture io(cap.data);
+        llama_io_write_capture io;
 
         try {
             io.write(&io_magic, sizeof(io_magic));
@@ -3510,15 +3513,16 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
             }
 
             ggml_backend_t backend = nullptr;
-            {
-                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-                for (const auto & b : backends) {
-                    if (ggml_backend_get_device(b.get()) == dev) {
-                        backend = b.get();
-                        break;
-                    }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            for (const auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) == dev) {
+                    backend = b.get();
+                    break;
                 }
             }
+            // the scheduler runs the CPU parts of the graph synchronously, so state in CPU memory is
+            // final when the ubatch has been submitted; waiting for the other devices is not needed
+            const bool cpu_state = dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 
             ggml_tallocr talloc = ggml_tallocr_new(buf.get());
 
@@ -3531,8 +3535,10 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
                     break;
                 }
 
-                if (backend) {
+                if (backend && !cpu_state) {
                     ggml_backend_tensor_copy_async(backend, backend, org, cpy);
+                } else if (cpu_state) {
+                    ggml_backend_tensor_copy(org, cpy);
                 } else {
                     synchronize();
                     ggml_backend_tensor_copy(org, cpy);
@@ -3540,6 +3546,16 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
 
                 const auto & r = io.ranges[idxs[j]];
                 cap.ranges.push_back({ cpy, r.dst, r.size });
+            }
+
+            if (ok && backend && !cpu_state) {
+                ggml_backend_event_ptr ev { ggml_backend_event_new(dev) };
+                if (ev) {
+                    ggml_backend_event_record(ev.get(), backend);
+                    cap.events.push_back(std::move(ev));
+                } else {
+                    cap.need_sync = true;
+                }
             }
 
             cap.ctxs.push_back(std::move(ctx_cpy));
@@ -3550,6 +3566,10 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
             }
         }
 
+        cap.host      = std::move(io.host);
+        cap.host_segs = std::move(io.host_segs);
+        cap.n_bytes   = io.total;
+
         if (!ok) {
             LLAMA_LOG_WARN("%s: cannot capture the state of seq %d on the device\n", __func__, cap.seq_id);
 
@@ -3557,6 +3577,7 @@ void llama_context::state_captures_take(const llama_ubatch & ubatch) {
                 state_capture_pool.push_back(std::move(buf));
             }
             cap.bufs.clear();
+            cap.events.clear();
             cap.ctxs.clear();
             cap.ranges.clear();
             cap.data.clear();
@@ -3580,11 +3601,25 @@ size_t llama_context::state_seq_capture_get(llama_seq_id seq_id, llama_pos pos, 
         }
 
         if (!cap.read) {
-            synchronize();
+            // wait for the copies only: later ubatches may still be running
+            if (cap.need_sync) {
+                synchronize();
+            } else {
+                for (auto & ev : cap.events) {
+                    ggml_backend_event_synchronize(ev.get());
+                }
+            }
+            cap.events.clear();
 
+            cap.data.resize(cap.n_bytes);
+            for (const auto & s : cap.host_segs) {
+                memcpy(cap.data.data() + s.dst, cap.host.data() + s.src, s.size);
+            }
             for (const auto & r : cap.ranges) {
                 ggml_backend_tensor_get(r.cpy, cap.data.data() + r.dst, 0, r.size);
             }
+            cap.host.clear();
+            cap.host_segs.clear();
 
             for (auto & buf : cap.bufs) {
                 state_capture_pool.push_back(std::move(buf));
@@ -3622,6 +3657,12 @@ void llama_context::state_seq_capture_clear() {
 
     for (auto & cap : state_captures) {
         in_flight = in_flight || !cap.bufs.empty();
+
+        // an event is only freed once it has completed
+        for (auto & ev : cap.events) {
+            ggml_backend_event_synchronize(ev.get());
+        }
+        cap.events.clear();
 
         for (auto & buf : cap.bufs) {
             state_capture_pool.push_back(std::move(buf));
