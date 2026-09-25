@@ -143,6 +143,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     }
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+        if (!end.empty() && !end_alts.empty()) {
+            std::vector<std::string>       ends = { trim_whitespace(end) };
+            std::vector<common_peg_parser> closers = { p.optspace(end) };
+            for (const auto & alt : end_alts) {
+                ends.push_back(trim_whitespace(alt));
+                closers.push_back(p.optspace(alt));
+            }
+            auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
+            return p.optional(start.empty() ? body : p.optspace(start) + body);
+        }
         if (!end.empty()) {
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)

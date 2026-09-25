@@ -220,11 +220,17 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
       // start/end tag pair per template (no per-request alternation), so if a deployment
       // ever switches reasoning_effort away from "low" fleet-wide, this workaround needs
       // updating to match -- it will not silently adapt.
+      //
+      // The model does not always close with the tag it opened: at "low" it often ends
+      // its thinking with the "high" tag "</ifm|think>" (seen live, 2026-09-25), which left
+      // the whole reply in reasoning_content and content empty. Any of the three close
+      // tags ends the reasoning.
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
               analysis.reasoning.start = "<ifm|think_faster>";
               analysis.reasoning.end   = "</ifm|think_faster>";
+              analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
               analysis.preserved_tokens.push_back("<ifm|think_faster>");
               analysis.preserved_tokens.push_back("</ifm|think_faster>");
               // Not the registered start/end pair (see comment above), but still real

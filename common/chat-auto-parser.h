@@ -258,6 +258,7 @@ struct analyze_reasoning : analyze_base {
 
     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
+    std::vector<std::string> end_alts; // other tags that also close the reasoning (the model may emit any of them)
 
     analyze_reasoning() = default;
     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
