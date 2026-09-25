@@ -161,9 +161,17 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
 
     if (is_always_wrapped()) {
         if (ctx.extracting_reasoning) {
-            return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
+            // p.space() drops any whitespace the model leaves between the reasoning end tag
+            // and the content start tag (e.g. an empty K2-Horizon reasoning block followed by
+            // a formatting newline) so it never lands at the front of content.
+            return ctx.reasoning_parser + p.space() + start + p.content(p.until(end)) + end + p.end();
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+    }
+    if (ctx.extracting_reasoning) {
+        // Drop whitespace between the reasoning end tag and the content, only when reasoning was
+        // actually parsed out, so a model with no reasoning tags keeps any leading whitespace it emits.
+        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }
