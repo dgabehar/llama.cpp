@@ -847,19 +847,24 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
     }
     const int64_t n_embd_act = model.n_embd > 0 ? model.n_embd : n_embd;
 
-    common_json cache = common_json::object();
-    // read even when forced: force only skips the entries of the devices calibrated now, the file keeps the rest
-    if (!cache_path.empty()) {
-        std::ifstream f(cache_path);
-        if (f) {
-            std::stringstream ss;
-            ss << f.rdbuf();
-            cache = common_json::parse_no_throw(ss.str());
-            if (!cache.is_object()) {
-                cache = common_json::object();
+    auto read_cache = [&]() {
+        common_json c = common_json::object();
+        if (!cache_path.empty()) {
+            std::ifstream f(cache_path);
+            if (f) {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                c = common_json::parse_no_throw(ss.str());
+                if (!c.is_object()) {
+                    c = common_json::object();
+                }
             }
         }
-    }
+        return c;
+    };
+    // read even when forced: force only skips the entries of the devices calibrated now, the file keeps the rest
+    common_json cache = read_cache();
+    common_json written = common_json::object(); // this run's entries, merged into the file as it is at write time
 
     // measurements older than this are taken again (driver, firmware or worker updates, thermal changes)
     constexpr int64_t max_age_s = 7 * 24 * 3600;
@@ -881,10 +886,11 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         p.s_hop_byte     = e.at("s_hop_byte").get<double>();
         p.s_output_byte  = e.value("s_output_byte", 0.0);
         s_check          = e.at("s_check_byte").get<double>();
-        // both time memory-bound matmuls of the same type, so they agree within a small factor; an entry
-        // where they don't was not written by one calibration run
+        // both time memory-bound matmuls, so they agree within a factor; an entry where they are far apart
+        // was not written by one calibration run. Wide: a mixed-type layer vs one matmul type can differ by
+        // 5x on CPU workers (MXFP4).
         const double self_ratio = p.s_decode_byte / s_check;
-        return perf_valid(p) && s_check > 0.0 && self_ratio <= 4.0 && self_ratio >= 0.25;
+        return perf_valid(p) && s_check > 0.0 && self_ratio <= 16.0 && self_ratio >= 1.0 / 16.0;
     };
     auto entry_json = [&](const common_split_device_perf & p, double s_check, int64_t ttl) {
         return common_json::object({
@@ -921,6 +927,9 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             } catch (const std::exception &) {
                 has_ref = false;
             }
+            if (!has_ref) {
+                LOG_INF("%s: the reference calibration of %s is expired or unusable, not using it\n", __func__, name);
+            }
         }
 
         double s_now = 0.0;
@@ -935,19 +944,25 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         if (!force && cache.contains(key)) {
             try {
                 double s_check = 0.0;
-                if (!read_entry(cache.at(key), perf[i], s_check) || !check_now()) {
-                    throw std::runtime_error("unusable");
+                if (!read_entry(cache.at(key), perf[i], s_check)) {
+                    throw std::runtime_error("expired or unusable");
+                }
+                if (!check_now()) {
+                    throw std::runtime_error("the quick check failed");
                 }
                 const double ratio = s_now / s_check;
                 // slower: 1.5x is wide enough for noise and a moment of load, a different worker is typically
                 // off by 2x or more; faster: the entry was measured while the device was busy
                 if (ratio > 1.5 || ratio < 1.0 / busy_ratio) {
                     LOG_INF("%s: %s runs at %.2fx its cached speed, calibrating again\n", __func__, name, 1.0 / ratio);
-                    throw std::runtime_error("changed");
+                    throw std::runtime_error("");
                 }
                 continue;
-            } catch (const std::exception &) {
-                // fall through and measure again
+            } catch (const std::exception & e) {
+                // measure again
+                if (e.what()[0] != '\0') {
+                    LOG_INF("%s: cached calibration of %s: %s, calibrating again\n", __func__, name, e.what());
+                }
             }
         }
 
@@ -956,7 +971,7 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             if (ratio <= 1.1 && ratio >= 1.0 / 1.1) {
                 LOG_INF("%s: %s matches its reference calibration on the quick check, reusing it\n", __func__, name);
                 perf[i] = ref;
-                cache[key] = entry_json(ref, ref_check, max_age_s);
+                written[key] = entry_json(ref, ref_check, max_age_s);
                 dirty = true;
                 continue;
             }
@@ -985,15 +1000,21 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
                 ttl = busy_ttl_s;
             }
         }
-        cache[key] = entry_json(perf[i], s_check, ttl);
+        written[key] = entry_json(perf[i], s_check, ttl);
         if (ttl == max_age_s && s_check > 0.0) {
-            cache[ref_key] = entry_json(perf[i], s_check, max_age_s);
+            written[ref_key] = entry_json(perf[i], s_check, max_age_s);
         }
         dirty = true;
     }
 
     if (dirty && !cache_path.empty()) {
-        // drop entries of other builds and expired ones, so the file does not grow with every build
+        // another server on this node may have written the file since it was read: merge into its current state
+        cache = read_cache();
+        for (auto it = written.begin(); it != written.end(); ++it) {
+            cache[it.key()] = it.value();
+        }
+        // drop entries of other builds, expired ones and malformed ones, so the file does not grow with every
+        // build and a bad entry can't break every later start
         const std::string build = std::string("|") + llama_commit();
         std::vector<std::string> drop;
         for (auto it = cache.begin(); it != cache.end(); ++it) {
@@ -1002,11 +1023,16 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
             const bool same_build = k.size() >= build.size() && k.compare(k.size() - build.size(), build.size(), build) == 0;
             int64_t t_meas = 0;
             int64_t ttl    = max_age_s;
-            if (it.value().is_object()) {
-                t_meas = it.value().value("measured_at", (int64_t) 0);
-                ttl    = it.value().value("ttl", max_age_s);
+            bool    valid  = it.value().is_object();
+            if (valid) {
+                try {
+                    t_meas = it.value().value("measured_at", (int64_t) 0);
+                    ttl    = it.value().value("ttl", max_age_s);
+                } catch (const std::exception &) {
+                    valid = false;
+                }
             }
-            if ((!same_build && !is_ref) || now_s - t_meas > ttl) {
+            if (!valid || (!same_build && !is_ref) || now_s - t_meas > ttl) {
                 drop.push_back(k);
             }
         }
