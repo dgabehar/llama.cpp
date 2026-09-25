@@ -409,6 +409,20 @@ where the incident happened and the 2 s default timeout applies.
   decoding change: re-score its output with the plain target model and
   count emitted tokens the target gives p < 0.002 (22 broken, 0 fixed).
 
+- **Prompt cache update on a busy slot** (2026-09-25, `0ab13d2bb`, upstream
+  bug, still in upstream master): a request pinned with `id_slot` to a slot
+  that is still generating is deferred, but slot selection first ran the
+  prompt cache update on that slot, loading the cached prompt that best
+  matches the pinned request into the running task. The running task then
+  finished on another conversation's context. Any model, any
+  `--cache-ram` > 0 (the default), triggered by the LiteLLM slot-persistence
+  hook's `id_slot` pins. Symptom: a reply that quotes another client's
+  conversation, and a slot whose `n_tokens` at release does not equal its
+  prompt plus generated tokens. When testing a server fix against an
+  unfixed binary, copy the whole `bin/` directory: `llama-server` loads
+  `libllama-server-impl.so` through its build-tree RUNPATH, so a copied
+  binary alone runs whatever library is currently built.
+
 - **K2-Horizon reasoning tags** (2026-09-25, `8519f34e6`): the template
   opens the reasoning with the tag for the request's `reasoning_effort`, but
   the model does not always close with the same one. At the fleet's "low"
