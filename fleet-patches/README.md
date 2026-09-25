@@ -96,7 +96,14 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0079 | `b32f04a9b` | rpc: say that the connection to the server was lost when a request fails |
 | 0080 | `c3705709a` | vulkan: on integrated GPUs, cap the free memory of host heaps at MemAvailable |
 | 0081 | `9826fa24e` | split-balance: re-check local devices' cached timings too |
-| 0082 | (this commit) | vulkan: find the host-RAM heap of an integrated GPU by size |
+| 0082 | `1cce05e7c` | vulkan: find the host-RAM heap of an integrated GPU by size |
+| 0083 | `3b45d35dc` | llama: cheaper state captures: no host-side materialization, no context sync |
+| 0084 | `0f453a6f3` | llama: add llama_model_n_devices_used |
+| 0085 | `5fca3701f` | server: capture checkpoints in-batch only across devices, read them after the next decode |
+| 0086 | `571d2f523` | llama: direct I/O into memory that refuses DMA goes through a bounce buffer |
+| 0087 | `280a0f95f` | split-balance: time MoE models with routed expert matmuls, reject inconsistent entries |
+| 0088 | `32a4c4aa5` | server tests: keep the slot busy longer than the save timeout on fast hardware |
+| 0089 | (this commit) | FLEET: capture policy, direct I/O bounce buffer, MoE calibration |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

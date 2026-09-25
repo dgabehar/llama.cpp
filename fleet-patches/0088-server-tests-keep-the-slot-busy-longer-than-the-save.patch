@@ -1,0 +1,45 @@
+From 32a4c4aa5f1d094b3e0de7ac507d6eff39171e94 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 20:37:55 -0500
+Subject: [PATCH] server tests: keep the slot busy longer than the save timeout
+ on fast hardware
+
+The tiny model stopped at its 2048-token training context after ~0.7 s on a
+GPU, before the 0.3 s + 500 ms window, so the save was never deferred.
+Shift the context and generate 12000 tokens.
+
+Assisted-by: Claude Opus 5.5
+---
+ tools/server/tests/unit/test_slot_save.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 1240a459e..a36186617 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -244,7 +244,11 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
+     # clear, distinct error instead of an indefinite hang.
+     global server
+     server.n_slots = 1  # single slot, easy to keep permanently busy
+-    server.n_ctx = 8192  # large enough that a real generation clearly outlasts the timeout below
++    # a real generation must clearly outlast the timeout below: the tiny test model stops at its
++    # 2048-token training context after ~0.7 s on a GPU, so shift the context and keep going
++    server.n_ctx = 8192
++    server.n_predict = 12000
++    server.enable_ctx_shift = True
+     server.slot_action_timeout_ms = 500
+     server.start()
+ 
+@@ -252,7 +256,8 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
+     def keep_slot_busy():
+         r = server.make_request("POST", "/completion", data={
+             "prompt": "Tell me a very long, very detailed story about dragons:",
+-            "n_predict": 8000,
++            "n_predict": 12000,
++            "ignore_eos": True,  # the tiny model ends its story early otherwise
+             "id_slot": 0,
+         }, timeout=90)
+         busy["status_code"] = r.status_code
+-- 
+2.43.0
+

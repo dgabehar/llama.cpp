@@ -289,6 +289,31 @@ llama-server, median of 3, drift 3%):**
   `nCpuMoe` default on a dense model) don't disable balancing. Patterns that
   do match keep the memory split.
 
+**In-batch checkpoint capture is for multi-device models only.** On one
+device it cost 12-15% prompt speed. The worst case was the gabesrv10 router
+(Qwen3.8-27B, MTP draft, `--parallel 3`, `-b/-ub 1024`), where QA measured
+0.85x on 1.5K-token prompts. llama-server now captures only when the model
+spans several non-CPU devices (`llama_model_n_devices_used`).
+`LLAMA_SERVER_CKPT_CAPTURE=1` forces it on anyway, and `=0` turns it off.
+
+A capture is read after the next `llama_decode()` has been submitted, and it
+waits on an event instead of synchronizing the context. Slot saves stay
+byte-identical to the split path.
+
+**Direct I/O (`--load-mode dio`)** now goes through a bounce buffer where the
+destination refuses DMA (EFAULT on amdgpu pinned memory). Before, the whole
+file fell back to buffered reads and filled the page cache.
+
+**MoE calibration:** MoE models are timed with `mul_mat_id` over their expert
+shape. gpt-oss-20b on a 3080 Ti:
+
+| | pp | tg |
+|---|---|---|
+| predicted | 1535 | 98.1 |
+| measured | 1796 | 99.6 |
+
+The dense matmul used before was off by about 2x.
+
 **rpc-server admission:** a connection takes a `--max-clients` slot only
 once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
 slot. At most 64 connections wait for their HELLO; the oldest is closed to

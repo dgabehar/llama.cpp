@@ -1,0 +1,47 @@
+From 571d2f5238fdf38ad085546efc3e6cf451fce0d3 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 20:37:55 -0500
+Subject: [PATCH] llama: direct I/O into memory that refuses DMA goes through a
+ bounce buffer
+
+amdgpu's pinned staging memory rejects O_DIRECT reads with EFAULT, and the
+whole file then fell back to buffered reads, filling the page cache (and
+swap on a 31 GB node reading a 27 GB model). Read through an aligned bounce
+buffer instead and keep direct I/O.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/llama-mmap.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 715a6e354..599bdb1e2 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -288,6 +288,23 @@ struct llama_file::impl {
+                     if (errno == EINTR) {
+                         continue;  // Interrupted by signal, retry
+                     }
++                    // The destination can't take a direct transfer (e.g. GPU-pinned memory on amdgpu): read
++                    // through an aligned bounce buffer, which keeps direct I/O (no page cache) for the file
++                    if (errno == EFAULT && alignment > 1) {
++                        static bool warned = false;
++                        if (!warned) {
++                            warned = true;
++                            LLAMA_LOG_INFO("%s: destination does not accept direct I/O, reading through a bounce buffer\n", __func__);
++                        }
++                        void * bounce = nullptr;
++                        if (posix_memalign(&bounce, alignment, to_read) != 0) {
++                            throw std::runtime_error("posix_memalign failed for the direct I/O bounce buffer");
++                        }
++                        std::unique_ptr<void, decltype(&free)> bounce_ptr(bounce, &free);
++                        read_raw_unsafe(bounce, to_read);
++                        std::memcpy(reinterpret_cast<char *>(ptr) + bytes_read, bounce, to_read);
++                        return;
++                    }
+                     // Fallback to std::fread in case the DMA controller cannot access the buffer
+                     if (errno == EFAULT || errno == EINVAL) {
+                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+-- 
+2.43.0
+
