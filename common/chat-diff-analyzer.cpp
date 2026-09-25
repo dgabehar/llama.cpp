@@ -230,7 +230,7 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
       //
       // Round 7 found a second, separate leak: with no tools in the request, the model
       // sometimes still emits tool-call markup after its answer (e.g. an answer ending
-      // "...ghe.coxautoin</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
+      // "...answer</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
       // of that is a reasoning tag, so it landed in content verbatim. stray_ends_no_tools
       // ends content at the same three tags whenever the request has no tools -- with
       // tools offered, they're real tool-call syntax and analyze_tools parses them instead.
