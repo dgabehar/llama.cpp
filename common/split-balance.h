@@ -85,7 +85,9 @@ struct common_split_calib_layer {
     std::vector<common_split_calib_weight> weights;
     double   share      = 1.0;
     // mean weight bytes of the layers of this kind / bytes of the timed one: layers that differ only in
-    // weight types (mixed quants) are one kind, timed on its most common types, decode scaled by bytes
+    // weight types (mixed quants) are one kind, timed on its most common types, decode and prefill scaled
+    // by bytes (both the memory-bound decode matmul and the quantized dequant work a prefill matmul pays
+    // scale with weight size, not just element count)
     double   byte_scale = 1.0;
     uint32_t n_head     = 0; // 0: no attention op in this layer
     uint32_t n_head_kv  = 0;

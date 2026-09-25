@@ -328,8 +328,12 @@ subtracted.
 Layers are grouped by structure, not by weight types. Mixed quants vary the
 types per layer: Qwen3.8 UD-Q4_K_XL has 53 type layouts over 3 structures,
 which took 118 s to calibrate on a 780M worker. Each structure is timed on
-its most common type layout, with decode scaled by the structure's mean
-bytes. Graphs over 50 ms are timed once per round.
+its most common type layout, with decode *and prefill* scaled by the
+structure's mean bytes (added 2026-09-25, pp-predict fix: prefill was left
+unscaled at first, so a structure whose untimed types were the heavier ones
+had its prefill rate under-measured -- both the memory-bound decode matmul
+and the dequant work a prefill matmul pays scale with weight size, not just
+element count). Graphs over 50 ms are timed once per round.
 
 **Busy nodes:** after a warm-up pass each timing runs up to 4 rounds and
 keeps the fastest. A load that lasts the whole calibration slows every round
