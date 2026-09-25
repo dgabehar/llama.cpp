@@ -14857,19 +14857,6 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     *total = 0;
     *free = 0;
 
-    // On an integrated GPU the largest heap is the one backed by host RAM (GTT). Drivers flag it
-    // device-local or not depending on the carve-out size, so it is found by size. A carved-out
-    // VRAM heap is separate from host RAM and is not capped.
-    uint32_t host_heap = UINT32_MAX;
-    if (is_integrated_gpu) {
-        for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
-            if (host_heap == UINT32_MAX ||
-                memprops.memoryProperties.memoryHeaps[i].size > memprops.memoryProperties.memoryHeaps[host_heap].size) {
-                host_heap = i;
-            }
-        }
-    }
-
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
 
@@ -14880,12 +14867,16 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
                 heap_free = budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
             }
-            if (i == host_heap) {
-                // the budget only counts GPU allocations, not what other processes hold
-                heap_free = std::min(heap_free, ggml_vk_host_mem_available());
-            }
             *free += heap_free;
         }
+    }
+
+    // An integrated GPU's heaps are carved out of host RAM: RADV, for one, splits GTT into a
+    // device-local and a host heap. Their budgets only count GPU allocations, not what other
+    // processes hold, so cap the total at what the host has available. This under-reports by
+    // at most the BIOS VRAM carve-out, which is not part of MemAvailable.
+    if (is_integrated_gpu) {
+        *free = std::min(*free, ggml_vk_host_mem_available());
     }
 }
 
