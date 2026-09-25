@@ -224,13 +224,16 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
       // The model does not always close with the tag it opened: at "low" it often ends
       // its thinking with the "high" tag "</ifm|think>" (seen live, 2026-09-25), which left
       // the whole reply in reasoning_content and content empty. Any of the three close
-      // tags ends the reasoning.
+      // tags ends the reasoning. It also sometimes answers, emits a second close tag and
+      // starts over with a garbled copy of the answer (Dawn QA round 5: 4/120 replies, all
+      // repeat-back prompts), so a close tag after the reasoning ends the content.
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
               analysis.reasoning.start = "<ifm|think_faster>";
               analysis.reasoning.end   = "</ifm|think_faster>";
               analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
+              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
               analysis.preserved_tokens.push_back("<ifm|think_faster>");
               analysis.preserved_tokens.push_back("</ifm|think_faster>");
               // Not the registered start/end pair (see comment above), but still real

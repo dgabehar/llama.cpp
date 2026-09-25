@@ -289,6 +289,10 @@ struct analyze_content : analyze_base {
 
     bool requires_nonnull_content = false;
 
+    // tags the model may emit after its answer before derailing (e.g. a second reasoning close tag): content
+    // ends at the first of them and the rest of the output is dropped
+    std::vector<std::string> stray_ends;
+
     analyze_content() = default;
     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);
 

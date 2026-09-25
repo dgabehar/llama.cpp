@@ -175,6 +175,9 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
     }
+    if (!stray_ends.empty()) {
+        return ctx.reasoning_parser + p.content(p.until_one_of(stray_ends)) + p.optional(p.rest()) + p.end();
+    }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }
 

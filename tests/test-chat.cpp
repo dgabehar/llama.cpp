@@ -4970,6 +4970,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 .expect_content("6:35 PM.")
                 .run();
         }
+
+        // a second close tag after the answer: the garbled restart after it is dropped
+        tst.test("Repeat it.</ifm|think>ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Repeat it.")
+            .expect_content("ghe.coxautoinc.com")
+            .run();
     }
 
     // Kimi-K2-Thinking tests - custom parser
