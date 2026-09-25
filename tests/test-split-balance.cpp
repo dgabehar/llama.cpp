@@ -236,6 +236,38 @@ static void test_byte_scale_affects_prefill() {
           p_scaled[0].s_decode_byte, p_base[0].s_decode_byte);
 }
 
+// a single MoE layer with an output layer configured: this makes calibrate_device build a graph of every
+// kind it can (decode, prefill, prefill_exp, output), leaving little slack in the ggml_context sized for
+// them. Regression test for a context-memory-pool overflow (GGML_ASSERT in ggml_scale/ggml_new_graph_custom)
+// that a too-small budget for the untimed-op probe's chain of scale ops caused.
+static void test_calibrate_context_memory_budget() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the context memory budget test\n");
+        return;
+    }
+    common_split_calib_model m;
+    m.n_embd        = 256;
+    m.n_expert      = 8;
+    m.n_expert_used = 2;
+    common_split_calib_layer l;
+    l.share   = 1.0;
+    l.weights = { cw(256, 256, GGML_TYPE_Q4_K, 8) };
+    m.layers  = { l };
+    m.output  = cw(256, 2048, GGML_TYPE_Q6_K);
+    m.layer_bytes = 1e6;
+    m.layer_flops = 1e6;
+
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto p = common_split_balance_calibrate({ cpu }, m, wl, "", false);
+    CHECK(p.size() == 1 && p[0].s_decode_byte > 0, "calibration ran out of context memory");
+}
+
 int main() {
     const auto shape = qwen27b();
     // device order as llama.cpp lists them: RPC first, then the local GPU
@@ -325,6 +357,7 @@ int main() {
 
     test_calibrate_cpu();
     test_byte_scale_affects_prefill();
+    test_calibrate_context_memory_budget();
 
     if (n_fail == 0) {
         printf("test-split-balance: OK\n");
