@@ -108,7 +108,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0091 | `c0f21d0b1` | vulkan: cap an integrated GPU's total free memory at MemAvailable |
 | 0092 | `f2a024139` | fleet: regenerate patch mirror for the conv-window and UMA memory fixes |
 | 0093 | `adb26194f` | tests: rpc-server multiclient: cast RAND_MAX to float |
-| 0094 | (this commit) | fleet: regenerate patch mirror |
+| 0094 | `2510ec358` | fleet: regenerate patch mirror for the macOS test build fix |
+| 0095 | `e9319f635` | server: don't update the prompt cache of a busy slot picked by id_slot |
+| 0096 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
