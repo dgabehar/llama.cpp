@@ -55,6 +55,10 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+// compute nodes (views/reshapes excluded) of the prompt and single-token graphs reserved by the most recent
+// memory probe of the main model, -1 if none ran
+void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg);
+
 // Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
 // main model's devices the way common_fit_params accounts for it. extra may be nullptr.
 common_device_memory_data_vec common_get_device_memory_data_with_extra(

@@ -31,6 +31,7 @@ struct common_split_device_perf {
     double s_prefill_flop  = 0.0; // seconds per flop in an n_ubatch-token matmul (compute bound)
     double t_hop           = 0.0; // fixed seconds per hand-off into/out of this device (0 = local)
     double s_hop_byte      = 0.0; // seconds per activation byte moved into/out of this device
+    double s_output_byte   = 0.0; // seconds per output-layer weight byte per token (0 = s_decode_byte)
 };
 
 // what the cost model needs to know about the model
@@ -73,15 +74,54 @@ std::vector<uint32_t> common_split_balance_optimize(
         const std::vector<uint32_t> & max_layers,
         const common_split_workload & wl);
 
-// Times each device with synthetic matmuls shaped like the model's layers
-// (n_embd x n_ff weights of type wtype). Remote (RPC) devices are timed over
-// their normal protocol, so nothing changes on the worker. Results are cached
-// in cache_path (empty = no cache) keyed by device, shape and type.
+// one weight matrix of a layer; ne[2] > 1 is a stack of experts (multiplied with mul_mat_id)
+struct common_split_calib_weight {
+    int64_t   ne[3] = { 0, 0, 1 };
+    ggml_type type  = GGML_TYPE_F16;
+};
+
+// one kind of repeating layer (hybrid models have several) and the share of the layers like it
+struct common_split_calib_layer {
+    std::vector<common_split_calib_weight> weights;
+    double   share      = 1.0;
+    uint32_t n_head     = 0; // 0: no attention op in this layer
+    uint32_t n_head_kv  = 0;
+    uint32_t head_dim_k = 0;
+    uint32_t head_dim_v = 0;
+    // gated delta net (qwen35/qwen3next linear attention): conv + recurrence; 0 = none
+    uint32_t gdn_state  = 0; // S: head size of the recurrent state
+    uint32_t gdn_h_k    = 0;
+    uint32_t gdn_h_v    = 0;
+    uint32_t conv_k     = 0; // conv kernel width
+    uint32_t conv_ch    = 0; // conv channels
+};
+
+// what the calibration times: the model's own layers with its real shapes, types and expert count
+struct common_split_calib_model {
+    std::vector<common_split_calib_layer> layers;
+    uint32_t n_expert      = 0;
+    uint32_t n_expert_used = 0;
+    int64_t  n_embd        = 0;   // width of the activations handed between devices
+    common_split_calib_weight output; // the output layer (token_embd when tied); ne[1] == 0: none
+    // compute nodes per repeating layer in the model's real graphs (0 = unknown): the calibration times the
+    // heavy ops of a layer, the rest (norms, RoPE, elementwise, copies) is charged per node
+    double nodes_tg_layer = 0.0;
+    double nodes_pp_layer = 0.0;
+    double   layer_bytes   = 0.0; // as in common_split_model_shape, to turn layer times into rates
+    double   layer_flops   = 0.0;
+};
+
+// Times each device on one layer of every kind the model has (real weight shapes and types,
+// flash attention at the workload's context), weighted by how many layers of each kind there
+// are, and expresses the result as the per-byte / per-flop rates the cost model uses. Remote
+// (RPC) devices are timed over their normal protocol, so nothing changes on the worker. Each
+// timing is repeated and the fastest kept, since other load on a node only slows it down.
+// Results are cached in cache_path (empty = no cache) keyed by device, model layers and build.
 std::vector<common_split_device_perf> common_split_balance_calibrate(
         const std::vector<ggml_backend_dev_t> & devs,
-        int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
-        const std::string & cache_path, bool force,
-        uint32_t n_expert = 0, uint32_t n_expert_used = 0); // MoE: time the routed expert matmuls
+        const common_split_calib_model & model,
+        const common_split_workload & wl,
+        const std::string & cache_path, bool force);
 
 const char * common_split_balance_mode_name(common_split_balance_mode mode);
 
