@@ -119,6 +119,7 @@ json task_params::to_json(bool only_metrics) const {
         {"adaptive_target",           sampling.adaptive_target},
         {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
+        {"stop_after_reasoning",      antiprompt_after_reasoning},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},

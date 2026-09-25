@@ -633,6 +633,37 @@ struct server_slot {
             }
         }
 
+        // these count only after one of them already closed the reasoning (text is the unsent tail of
+        // generated_text, so its offset there locates the earlier output)
+        const size_t offset = generated_text.size() >= text.size() ? generated_text.size() - text.size() : 0;
+        for (const std::string & word : task->params.antiprompt_after_reasoning) {
+            size_t pos;
+            if (is_full_stop) {
+                const size_t tmp      = word.size() + last_token_size;
+                const size_t from_pos = text.size() > tmp ? text.size() - tmp : 0;
+                pos = text.find(word, from_pos);
+            } else {
+                pos = string_find_partial_stop(text, word);
+            }
+            if (pos == std::string::npos || (stop_pos != std::string::npos && pos >= stop_pos)) {
+                continue;
+            }
+            const std::string before = generated_text.substr(0, std::min(generated_text.size(), offset + pos));
+            bool closed = false;
+            for (const std::string & w : task->params.antiprompt_after_reasoning) {
+                closed = closed || before.find(w) != std::string::npos;
+            }
+            if (!closed) {
+                continue;
+            }
+            if (is_full_stop) {
+                stop           = STOP_TYPE_WORD;
+                stopping_word  = word;
+                has_next_token = false;
+            }
+            stop_pos = pos;
+        }
+
         return stop_pos;
     }
 
