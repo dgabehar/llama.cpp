@@ -125,3 +125,11 @@ jobs:
               --title "fleet-patches rebase conflict against upstream master" \
               --body-file /tmp/issue-body.md
           fi
+
+      # The conflict is reported in the issue above; fail the run too, so it
+      # doesn't show up as a green "success" in the Actions list (issue #1 did).
+      - name: Fail on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        run: |
+          echo "::error::fleet-patches could not be rebased onto upstream/master cleanly -- see the tracking issue"
+          exit 1
