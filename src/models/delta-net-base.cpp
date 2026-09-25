@@ -456,6 +456,28 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 // kernel width. The straddling case is the one the old concat-based code got
 // "for free"; here it costs a small (at most dm1-wide) concat instead of one
 // sized by the full n_t.
+//
+// new_tokens is a transposed view: its dim 0 (tokens) has a row-sized stride.
+// ggml_view_* always gives a view a unit dim-0 stride, so a token range is cut
+// from the untransposed [conv_channels, n_t, n_seqs] layout and transposed back.
+static ggml_tensor * build_token_cols(
+        ggml_context * ctx0,
+        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], transposed view
+        int64_t        start,
+        int64_t        count,
+        int64_t        conv_channels,
+        int64_t        n_seqs) {
+    ggml_tensor * rows = ggml_transpose(ctx0, new_tokens);
+    GGML_ASSERT(rows->nb[0] == ggml_type_size(rows->type));
+
+    rows = ggml_view_3d(ctx0, rows,
+            conv_channels, count, n_seqs,
+            rows->nb[1], rows->nb[2],
+            start * rows->nb[1]);
+
+    return ggml_transpose(ctx0, rows);
+}
+
 static ggml_tensor * build_conv_window(
         ggml_context * ctx0,
         ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
@@ -471,10 +493,7 @@ static ggml_tensor * build_conv_window(
     }
 
     if (s_idx >= dm1) {
-        return ggml_view_3d(ctx0, new_tokens,
-                dm1, conv_channels, n_seqs,
-                new_tokens->nb[1], new_tokens->nb[2],
-                (s_idx - dm1) * new_tokens->nb[0]);
+        return build_token_cols(ctx0, new_tokens, s_idx - dm1, dm1, conv_channels, n_seqs);
     }
 
     ggml_tensor * prefix_part =
@@ -483,11 +502,7 @@ static ggml_tensor * build_conv_window(
                 prefix->nb[1], prefix->nb[2],
                 s_idx * prefix->nb[0]);
 
-    ggml_tensor * new_tokens_part =
-        ggml_view_3d(ctx0, new_tokens,
-                s_idx, conv_channels, n_seqs,
-                new_tokens->nb[1], new_tokens->nb[2],
-                0);
+    ggml_tensor * new_tokens_part = build_token_cols(ctx0, new_tokens, 0, s_idx, conv_channels, n_seqs);
 
     return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
 }
