@@ -2,9 +2,15 @@
 
 #include "split-balance.h"
 
+#include "ggml-backend.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 static int n_fail = 0;
@@ -61,6 +67,128 @@ static std::vector<uint32_t> brute_force(common_split_balance_mode mode, const c
         }
     }
     return best;
+}
+
+static common_split_calib_weight cw(int64_t ne0, int64_t ne1, ggml_type type, int64_t ne2 = 1) {
+    common_split_calib_weight w;
+    w.ne[0] = ne0;
+    w.ne[1] = ne1;
+    w.ne[2] = ne2;
+    w.type  = type;
+    return w;
+}
+
+// a small model with one layer of each kind the calibration builds graphs for: attention, gated delta net
+// (qwen35-style shapes) and experts
+static common_split_calib_model tiny_model() {
+    const int64_t E = 256;
+    common_split_calib_model m;
+    m.n_embd        = E;
+    m.n_expert      = 8;
+    m.n_expert_used = 2;
+
+    common_split_calib_layer attn;
+    attn.share      = 0.25;
+    attn.n_head     = 4;
+    attn.n_head_kv  = 2;
+    attn.head_dim_k = 64;
+    attn.head_dim_v = 64;
+    attn.weights    = { cw(E, 256, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q8_0),
+                        cw(E, E, GGML_TYPE_Q4_K), cw(E, 512, GGML_TYPE_Q4_K), cw(E, 512, GGML_TYPE_Q4_K),
+                        cw(512, E, GGML_TYPE_Q6_K) };
+
+    common_split_calib_layer gdn;
+    gdn.share      = 0.5;
+    gdn.byte_scale = 1.1;
+    gdn.gdn_state  = 32;
+    gdn.gdn_h_k    = 2;
+    gdn.gdn_h_v    = 4;
+    gdn.conv_k     = 4;
+    gdn.conv_ch    = 2 * 2 * 32 + 4 * 32;
+    gdn.weights    = { cw(E, gdn.conv_ch, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 4, GGML_TYPE_F16),
+                       cw(E, 4, GGML_TYPE_F16), cw(128, E, GGML_TYPE_F16), cw(E, 512, GGML_TYPE_Q4_K),
+                       cw(E, 512, GGML_TYPE_Q4_K), cw(512, E, GGML_TYPE_Q6_K) };
+
+    common_split_calib_layer moe = attn;
+    moe.share   = 0.25;
+    moe.weights = { cw(E, 256, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K),
+                    cw(E, E, GGML_TYPE_Q4_K), cw(E, 8, GGML_TYPE_F32), cw(E, 256, GGML_TYPE_Q4_K, 8),
+                    cw(E, 256, GGML_TYPE_Q4_K, 8), cw(256, E, GGML_TYPE_Q4_K, 8) };
+
+    m.layers = { attn, gdn, moe };
+    m.output = cw(E, 2048, GGML_TYPE_Q6_K);
+    m.nodes_tg_layer = 20;
+    m.nodes_pp_layer = 20;
+
+    double bytes = 0.0;
+    double flops = 0.0;
+    for (const auto & l : m.layers) {
+        for (const auto & w : l.weights) {
+            bytes += l.share * ggml_row_size(w.type, w.ne[0]) * w.ne[1] * w.ne[2];
+            flops += l.share * 2.0 * w.ne[0] * w.ne[1] * (w.ne[2] > 1 ? m.n_expert_used : 1);
+        }
+    }
+    m.layer_bytes = bytes;
+    m.layer_flops = flops;
+    return m;
+}
+
+static std::string read_file(const std::string & path) {
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// calibration on the CPU device: every layer kind builds and runs, and the cache is hit, falls back to the
+// device's reference entry, and survives a forced calibration
+static void test_calibrate_cpu() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the calibration test\n");
+        return;
+    }
+    const auto m = tiny_model();
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    const std::string cache = (std::filesystem::temp_directory_path() / "test-split-balance-cache.json").string();
+    std::filesystem::remove(cache);
+    {
+        std::ofstream f(cache);
+        f << R"({"ref|some other device": {"measured_at": 0}})";
+    }
+
+    auto p1 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
+    CHECK(p1.size() == 1 && p1[0].s_decode_byte > 0 && p1[0].s_prefill_flop > 0 && p1[0].s_output_byte > 0,
+          "calibration of the CPU failed");
+    if (p1.size() != 1) {
+        return;
+    }
+    std::string c = read_file(cache);
+    CHECK(c.find("\"ref|CPU") != std::string::npos, "no reference entry written");
+
+    // a cache hit gives the same numbers (unless the quick re-check found the CPU at another speed)
+    auto p2 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
+    CHECK(p2.size() == 1 && p2[0].s_decode_byte > 0, "cached calibration failed");
+
+    // forced: measured again, the rest of the file is kept
+    auto p3 = common_split_balance_calibrate({ cpu }, m, wl, cache, true);
+    CHECK(p3.size() == 1 && p3[0].s_decode_byte > 0, "forced calibration failed");
+    c = read_file(cache);
+    CHECK(c.find("\"ref|CPU") != std::string::npos, "forced calibration dropped the reference entry");
+
+    // a model only differing in its byte scale is another key; with the reference present the result is either
+    // the reference itself (quick check matched) or a fresh valid calibration
+    auto m2 = m;
+    m2.layers[1].byte_scale = 1.2;
+    auto p4 = common_split_balance_calibrate({ cpu }, m2, wl, cache, false);
+    CHECK(p4.size() == 1 && p4[0].s_decode_byte > 0, "calibration of a second model failed");
+
+    std::filesystem::remove(cache);
 }
 
 int main() {
@@ -149,6 +277,8 @@ int main() {
             }
         }
     }
+
+    test_calibrate_cpu();
 
     if (n_fail == 0) {
         printf("test-split-balance: OK\n");

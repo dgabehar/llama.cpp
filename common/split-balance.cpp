@@ -19,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <random>
 #include <regex>
 #include <map>
 #include <sstream>
@@ -239,14 +240,15 @@ static bool dev_is_remote(ggml_backend_dev_t dev) {
     return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
 }
 
-static std::string cache_key(ggml_backend_dev_t dev, const common_split_calib_model & m, const common_split_workload & wl) {
+static std::string cache_key(ggml_backend_dev_t dev, const common_split_calib_model & m, const common_split_workload & wl,
+                             bool with_build = true) {
     size_t free = 0;
     size_t total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
     // the model part of the key: every timed layer kind with its shapes and types
     std::ostringstream ms;
     for (const auto & l : m.layers) {
-        ms << l.share << ':' << l.n_head << '/' << l.n_head_kv << '/' << l.head_dim_k << '/' << l.head_dim_v
+        ms << l.share << '*' << l.byte_scale << ':' << l.n_head << '/' << l.n_head_kv << '/' << l.head_dim_k << '/' << l.head_dim_v
            << "|gdn" << l.gdn_state << '/' << l.gdn_h_k << '/' << l.gdn_h_v << '/' << l.conv_k << '/' << l.conv_ch;
         for (const auto & w : l.weights) {
             ms << ',' << w.ne[0] << 'x' << w.ne[1] << 'x' << w.ne[2] << ggml_type_name(w.type);
@@ -261,7 +263,10 @@ static std::string cache_key(ggml_backend_dev_t dev, const common_split_calib_mo
     // from here, driver/kernel upgrades neither, hence also the age limit on entries)
     ss << ggml_backend_dev_name(dev) << "|" << ggml_backend_dev_description(dev) << "|" << (total >> 20) << "MiB|layers"
        << std::hex << std::hash<std::string>{}(ms.str()) << std::dec << "|ub" << wl.n_ubatch << "|p" << wl.n_prompt
-       << "g" << wl.n_gen << "|" << llama_commit();
+       << "g" << wl.n_gen;
+    if (with_build) {
+        ss << "|" << llama_commit();
+    }
     return ss.str();
 }
 
@@ -303,8 +308,10 @@ static void compute_and_wait(ggml_backend_t backend, ggml_cgraph * gf) {
     ggml_backend_tensor_get(ggml_graph_node(gf, -1), &v, 0, sizeof(v));
 }
 
-static double time_graph(ggml_backend_t backend, ggml_cgraph * gf, int reps) {
-    compute_and_wait(backend, gf); // warmup, compiles pipelines
+static double time_graph(ggml_backend_t backend, ggml_cgraph * gf, int reps, bool warmup = true) {
+    if (warmup) {
+        compute_and_wait(backend, gf); // compiles pipelines
+    }
     std::vector<double> t;
     for (int r = 0; r < reps; r++) {
         const int64_t t0 = ggml_time_us();
@@ -335,6 +342,7 @@ struct calib_layer_graphs {
     ggml_cgraph * prefill     = nullptr;
     ggml_cgraph * prefill_exp = nullptr; // null without experts
     double        share       = 0.0;
+    double        byte_scale  = 1.0;
 };
 
 // Adds `out` to the graph through a one-element copy: the op's own output then has a consumer, so
@@ -472,7 +480,8 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     for (size_t li = 0; li < m.layers.size(); li++) {
         const auto & l = m.layers[li];
         auto & g = graphs[li];
-        g.share   = l.share;
+        g.share      = l.share;
+        g.byte_scale = l.byte_scale;
         g.decode  = ggml_new_graph(gctx.get());
         g.prefill = ggml_new_graph(gctx.get());
         bool has_exp = false;
@@ -601,13 +610,13 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
 
     // every graph gets its own allocation of the op outputs; they are timed one after another
     // kind: 0 decode, 1 prefill, 2 prefill of the experts
-    struct timed { ggml_cgraph * gf; ggml_gallocr_t alloc; double best; double share; int kind; };
+    struct timed { ggml_cgraph * gf; ggml_gallocr_t alloc; double best; double share; int kind; double byte_scale = 1.0; };
     std::vector<timed> all;
     for (auto & g : graphs) {
         int kind = 0;
         for (ggml_cgraph * gf : { g.decode, g.prefill, g.prefill_exp }) {
             if (gf != nullptr && ggml_graph_n_nodes(gf) > 0) {
-                all.push_back({ gf, nullptr, std::numeric_limits<double>::infinity(), g.share, kind });
+                all.push_back({ gf, nullptr, std::numeric_limits<double>::infinity(), g.share, kind, g.byte_scale });
             }
             kind++;
         }
@@ -655,16 +664,24 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
 
     // Other load on the node (compiles, other models) only ever slows a timing down, so each graph keeps its
     // fastest round. Rounds repeat until the last one agrees with the best within 10%, at most 4.
-    // one untimed pass first: an idle GPU needs a moment to raise its clocks
-    for (auto & t : all) {
-        compute_and_wait(backend.get(), t.gf);
+    // one untimed pass first: an idle GPU needs a moment to raise its clocks. It also sizes the repetitions:
+    // a graph that runs for tens of ms is timed once per round (a slow device spent most of its calibration
+    // repeating its long prefill graphs), a short one takes the median of 3.
+    std::vector<int> reps(all.size());
+    for (size_t i = 0; i < all.size(); i++) {
+        compute_and_wait(backend.get(), all[i].gf);
+        const int64_t t0 = ggml_time_us();
+        compute_and_wait(backend.get(), all[i].gf);
+        reps[i] = ggml_time_us() - t0 > 50000 ? 1 : 3;
     }
     double worst_spread = 1.0;
     std::vector<double> first(all.size());
+    int n_rounds = 0;
     for (int round = 0; round < 4; round++) {
+        n_rounds++;
         bool settled = round > 0;
         for (size_t i = 0; i < all.size(); i++) {
-            const double t = time_graph(backend.get(), all[i].gf, 3);
+            const double t = time_graph(backend.get(), all[i].gf, reps[i], false);
             if (round == 0) {
                 first[i] = t;
             }
@@ -679,10 +696,13 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    if (worst_spread > 1.25) {
-        LOG_INF("%s: %s timed %.2fx slower in its first round than its best, the node was probably busy; kept the best\n",
-                __func__, ggml_backend_dev_name(dev), worst_spread);
+    for (const auto & t : all) {
+        LOG_DBG("%s: %s: graph kind %d, %d nodes: %.3f ms\n", __func__, ggml_backend_dev_name(dev), t.kind,
+                ggml_graph_n_nodes(t.gf), t.best * 1e3);
     }
+    // a spread inside one run is mostly clock ramp-up; a load that lasts the whole run slows every round
+    // alike, which is what the comparison with the device's reference calibration catches
+    LOG_DBG("%s: %s: %d rounds, first round %.2fx its best\n", __func__, ggml_backend_dev_name(dev), n_rounds, worst_spread);
 
     // per mean layer, turned into the rates the cost model multiplies with layer_bytes / layer_flops
     double t_sync = 0.0;
@@ -701,7 +721,7 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
             case 3: out.s_output_byte = t.best / (double) ggml_nbytes(out_w); break;
             case 4: t_op_tg = t.best / n_chain; break;
             case 5: t_op_pp = t.best / n_chain; break;
-            case 0: t_decode  += t.share * t.best;             break;
+            case 0: t_decode  += t.share * t.best * t.byte_scale; break;
             case 1: t_prefill += t.share * t.best;             break;
             case 2: t_prefill += t.share * t.best / exp_scale; break;
         }
@@ -828,7 +848,8 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
     const int64_t n_embd_act = model.n_embd > 0 ? model.n_embd : n_embd;
 
     common_json cache = common_json::object();
-    if (!cache_path.empty() && !force) {
+    // read even when forced: force only skips the entries of the devices calibrated now, the file keeps the rest
+    if (!cache_path.empty()) {
         std::ifstream f(cache_path);
         if (f) {
             std::stringstream ss;
@@ -845,50 +866,99 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
     const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
+    // An entry's perf, if it is valid and fresh. Every entry is re-checked with a quick timing (s_now, the
+    // same memory-bound matmul as its s_check_byte): an RPC key cannot see the hardware behind the endpoint,
+    // and the entry may have been measured while something else loaded the device.
+    auto read_entry = [&](const common_json & e, common_split_device_perf & p, double & s_check) {
+        const int64_t t_meas = e.value("measured_at", (int64_t) 0);
+        const int64_t ttl    = e.value("ttl", max_age_s);
+        if (now_s - t_meas > ttl || t_meas > now_s) {
+            return false;
+        }
+        p.s_decode_byte  = e.at("s_decode_byte").get<double>();
+        p.s_prefill_flop = e.at("s_prefill_flop").get<double>();
+        p.t_hop          = e.at("t_hop").get<double>();
+        p.s_hop_byte     = e.at("s_hop_byte").get<double>();
+        p.s_output_byte  = e.value("s_output_byte", 0.0);
+        s_check          = e.at("s_check_byte").get<double>();
+        // both time memory-bound matmuls of the same type, so they agree within a small factor; an entry
+        // where they don't was not written by one calibration run
+        const double self_ratio = p.s_decode_byte / s_check;
+        return perf_valid(p) && s_check > 0.0 && self_ratio <= 4.0 && self_ratio >= 0.25;
+    };
+    auto entry_json = [&](const common_split_device_perf & p, double s_check, int64_t ttl) {
+        return common_json::object({
+            {"s_check_byte",   s_check},
+            {"s_decode_byte",  p.s_decode_byte},
+            {"s_prefill_flop", p.s_prefill_flop},
+            {"t_hop",          p.t_hop},
+            {"s_hop_byte",     p.s_hop_byte},
+            {"s_output_byte",  p.s_output_byte},
+            {"measured_at",    now_s},
+            {"ttl",            ttl},
+        });
+    };
+    // A node that is busy for a whole calibration measures slow in every round. The reference entry (per
+    // device and model, not per build) keeps its last calibration that did not look busy: a new one clearly
+    // slower than it is taken as busy and only kept for an hour, and after a build change a device whose
+    // quick check still matches its reference reuses it instead of calibrating again.
+    constexpr double  busy_ratio = 1.25;
+    constexpr int64_t busy_ttl_s = 3600;
+
     std::vector<common_split_device_perf> perf(devs.size());
     bool dirty = false;
     for (size_t i = 0; i < devs.size(); i++) {
-        const std::string key = cache_key(devs[i], model, wl);
-        if (cache.contains(key)) {
+        const std::string key     = cache_key(devs[i], model, wl);
+        const std::string ref_key = "ref|" + cache_key(devs[i], model, wl, false);
+        const char * name = ggml_backend_dev_name(devs[i]);
+
+        common_split_device_perf ref;
+        double ref_check = 0.0;
+        bool   has_ref   = false;
+        if (cache.contains(ref_key)) {
             try {
-                const common_json & e = cache.at(key);
-                const int64_t t_meas = e.value("measured_at", (int64_t) 0);
-                if (now_s - t_meas > max_age_s || t_meas > now_s) {
-                    throw std::runtime_error("stale");
+                has_ref = read_entry(cache.at(ref_key), ref, ref_check);
+            } catch (const std::exception &) {
+                has_ref = false;
+            }
+        }
+
+        double s_now = 0.0;
+        bool   have_now = false;
+        auto check_now = [&]() {
+            if (!have_now) {
+                have_now = quick_check(devs[i], n_embd, n_ff, wtype, s_now);
+            }
+            return have_now;
+        };
+
+        if (!force && cache.contains(key)) {
+            try {
+                double s_check = 0.0;
+                if (!read_entry(cache.at(key), perf[i], s_check) || !check_now()) {
+                    throw std::runtime_error("unusable");
                 }
-                perf[i].s_decode_byte  = e.at("s_decode_byte").get<double>();
-                perf[i].s_prefill_flop = e.at("s_prefill_flop").get<double>();
-                perf[i].t_hop          = e.at("t_hop").get<double>();
-                perf[i].s_hop_byte     = e.at("s_hop_byte").get<double>();
-                perf[i].s_output_byte  = e.value("s_output_byte", 0.0);
-                if (!perf_valid(perf[i])) {
-                    throw std::runtime_error("invalid");
-                }
-                {
-                    // every entry is re-checked: an RPC key cannot see the hardware behind the endpoint, and a
-                    // local measurement may have been taken while something else loaded the device
-                    const double s_ref = e.at("s_check_byte").get<double>();
-                    // both time memory-bound matmuls of the same type, so they agree within a small factor;
-                    // an entry where they don't was not written by one calibration run
-                    const double self_ratio = perf[i].s_decode_byte / s_ref;
-                    if (!(s_ref > 0.0) || self_ratio > 4.0 || self_ratio < 0.25) {
-                        throw std::runtime_error("inconsistent");
-                    }
-                    double s_now = 0.0;
-                    if (!quick_check(devs[i], n_embd, n_ff, wtype, s_now)) {
-                        throw std::runtime_error("no check");
-                    }
-                    const double ratio = s_now / s_ref;
-                    // wide enough for run-to-run noise; a different worker is typically off by 2x or more
-                    if (ratio > 1.5 || ratio < 1.0 / 1.5) {
-                        LOG_INF("%s: %s runs at %.2fx its cached speed, calibrating again\n", __func__,
-                                ggml_backend_dev_name(devs[i]), 1.0 / ratio);
-                        throw std::runtime_error("changed");
-                    }
+                const double ratio = s_now / s_check;
+                // slower: 1.5x is wide enough for noise and a moment of load, a different worker is typically
+                // off by 2x or more; faster: the entry was measured while the device was busy
+                if (ratio > 1.5 || ratio < 1.0 / busy_ratio) {
+                    LOG_INF("%s: %s runs at %.2fx its cached speed, calibrating again\n", __func__, name, 1.0 / ratio);
+                    throw std::runtime_error("changed");
                 }
                 continue;
             } catch (const std::exception &) {
                 // fall through and measure again
+            }
+        }
+
+        if (has_ref && !force && check_now()) {
+            const double ratio = s_now / ref_check;
+            if (ratio <= 1.1 && ratio >= 1.0 / 1.1) {
+                LOG_INF("%s: %s matches its reference calibration on the quick check, reusing it\n", __func__, name);
+                perf[i] = ref;
+                cache[key] = entry_json(ref, ref_check, max_age_s);
+                dirty = true;
+                continue;
             }
         }
         const int64_t t0 = ggml_time_us();
@@ -904,16 +974,21 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         if (!quick_check(devs[i], n_embd, n_ff, wtype, s_check)) {
             s_check = 0.0;
         }
-        LOG_INF("%s: calibrated %s in %.1f s\n", __func__, ggml_backend_dev_name(devs[i]), (ggml_time_us() - t0) * 1e-6);
-        cache[key] = common_json::object({
-            {"s_check_byte",   s_check},
-            {"s_decode_byte",  perf[i].s_decode_byte},
-            {"s_prefill_flop", perf[i].s_prefill_flop},
-            {"t_hop",          perf[i].t_hop},
-            {"s_hop_byte",     perf[i].s_hop_byte},
-            {"s_output_byte",  perf[i].s_output_byte},
-            {"measured_at",    now_s},
-        });
+        LOG_INF("%s: calibrated %s in %.1f s\n", __func__, name, (ggml_time_us() - t0) * 1e-6);
+        int64_t ttl = max_age_s;
+        if (has_ref) {
+            const double slow = std::max(perf[i].s_decode_byte / ref.s_decode_byte, perf[i].s_prefill_flop / ref.s_prefill_flop);
+            if (slow > busy_ratio) {
+                LOG_WRN("%s: %s measured %.2fx slower than its reference calibration, the node is probably busy; "
+                        "using this measurement for now and measuring again on the next start after an hour\n",
+                        __func__, name, slow);
+                ttl = busy_ttl_s;
+            }
+        }
+        cache[key] = entry_json(perf[i], s_check, ttl);
+        if (ttl == max_age_s && s_check > 0.0) {
+            cache[ref_key] = entry_json(perf[i], s_check, max_age_s);
+        }
         dirty = true;
     }
 
@@ -923,12 +998,15 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         std::vector<std::string> drop;
         for (auto it = cache.begin(); it != cache.end(); ++it) {
             const std::string & k = it.key();
+            const bool is_ref     = k.rfind("ref|", 0) == 0;
             const bool same_build = k.size() >= build.size() && k.compare(k.size() - build.size(), build.size(), build) == 0;
             int64_t t_meas = 0;
+            int64_t ttl    = max_age_s;
             if (it.value().is_object()) {
                 t_meas = it.value().value("measured_at", (int64_t) 0);
+                ttl    = it.value().value("ttl", max_age_s);
             }
-            if (!same_build || now_s - t_meas > max_age_s) {
+            if ((!same_build && !is_ref) || now_s - t_meas > ttl) {
                 drop.push_back(k);
             }
         }
@@ -937,7 +1015,8 @@ std::vector<common_split_device_perf> common_split_balance_calibrate(
         }
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(cache_path).parent_path(), ec);
-        const std::string tmp = cache_path + ".tmp";
+        // per process: two servers on one node (sharing a cache dir) must not write the same temp file
+        const std::string tmp = cache_path + ".tmp." + std::to_string(std::random_device{}());
         std::ofstream f(tmp);
         bool ok = false;
         if (f) {
@@ -987,6 +1066,7 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
         return false;
     }
     ggml_context_ptr meta_ptr { meta };
+    gguf_context_ptr gguf_ptr { gctx }; // the layer-kind pass below still reads per-layer keys
 
     std::string arch;
     {
@@ -1134,7 +1214,6 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
             }
         }
     }
-    gguf_free(gctx);
 
     if (info.n_ff == 0 && dense_ff > 0) {
         info.n_embd = dense_embd;
@@ -1159,12 +1238,28 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
     info.shape.act_bytes    = (double) info.n_embd * sizeof(float);
     info.shape.output_bytes = has_output ? output_bytes : tok_embd_bytes; // tied embeddings
 
-    // the layer kinds to time: layers with the same weights (names, shapes, types) and attention shape
-    // are the same kind; the first layer of each kind stands in for all of them
+    // the layer kinds to time: layers with the same weights (names, shapes) and attention shape are one kind.
+    // Mixed quants (e.g. Unsloth UD) vary the types per layer -- 53 type layouts over Qwen3.8's 3 kinds of
+    // layer, 100 s of calibration on a 780M -- so each kind is timed on its most common type layout and its
+    // decode time scaled by the kind's mean weight bytes.
     {
         const uint32_t n_embd_model = get_u32("embedding_length", (uint32_t) info.n_embd);
+        struct kind_acc {
+            common_split_calib_layer l;
+            std::map<std::string, std::pair<int, std::vector<common_split_calib_weight>>> layouts; // types -> count, weights
+            double bytes = 0.0;
+            int    n     = 0;
+        };
+        std::vector<kind_acc> acc;
         std::map<std::string, size_t> kinds;
         auto & cm = info.calib;
+        auto w_bytes = [](const std::vector<common_split_calib_weight> & ws) {
+            double b = 0.0;
+            for (const auto & w : ws) {
+                b += (double) ggml_row_size(w.type, w.ne[0]) * w.ne[1] * w.ne[2];
+            }
+            return b;
+        };
         for (uint32_t il = 0; il < n_layer; il++) {
             auto & lw = per_layer[il];
             std::sort(lw.w.begin(), lw.w.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
@@ -1190,18 +1285,39 @@ static bool read_model_layers(const char * path, uint32_t n_layer, const llama_m
             std::ostringstream sig;
             sig << l.n_head << '/' << l.n_head_kv << '/' << l.head_dim_k << '/' << l.head_dim_v << "|gdn" << l.gdn_state
                 << '/' << l.gdn_h_k << '/' << l.gdn_h_v << '/' << l.conv_k << '/' << l.conv_ch;
+            std::ostringstream types;
+            std::vector<common_split_calib_weight> ws;
             for (const auto & [suffix, w] : lw.w) {
-                sig << ';' << suffix << ':' << w.ne[0] << 'x' << w.ne[1] << 'x' << w.ne[2] << ggml_type_name(w.type);
-                l.weights.push_back(w);
+                sig << ';' << suffix << ':' << w.ne[0] << 'x' << w.ne[1] << 'x' << w.ne[2];
+                types << ggml_type_name(w.type) << ',';
+                ws.push_back(w);
             }
             auto it = kinds.find(sig.str());
             if (it == kinds.end()) {
-                l.share = 0.0;
-                kinds[sig.str()] = cm.layers.size();
-                cm.layers.push_back(std::move(l));
-                it = kinds.find(sig.str());
+                it = kinds.emplace(sig.str(), acc.size()).first;
+                acc.push_back({ l, {}, 0.0, 0 });
             }
-            cm.layers[it->second].share += 1.0 / n_layer;
+            auto & a = acc[it->second];
+            auto & layout = a.layouts[types.str()];
+            layout.first++;
+            layout.second = ws;
+            a.bytes += w_bytes(ws);
+            a.n++;
+        }
+        for (auto & a : acc) {
+            const std::vector<common_split_calib_weight> * rep = nullptr;
+            int rep_n = 0;
+            for (const auto & [types, cw] : a.layouts) {
+                if (cw.first > rep_n) {
+                    rep_n = cw.first;
+                    rep   = &cw.second;
+                }
+            }
+            a.l.weights    = *rep;
+            a.l.share      = (double) a.n / n_layer;
+            const double b = w_bytes(a.l.weights);
+            a.l.byte_scale = b > 0.0 ? (a.bytes / a.n) / b : 1.0;
+            cm.layers.push_back(std::move(a.l));
         }
         cm.n_expert      = n_expert;
         cm.n_expert_used = n_expert_used;
