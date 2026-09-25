@@ -110,7 +110,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0093 | `adb26194f` | tests: rpc-server multiclient: cast RAND_MAX to float |
 | 0094 | `2510ec358` | fleet: regenerate patch mirror for the macOS test build fix |
 | 0095 | `773e1bef6` | common: split-balance: calibrate on the model's own layers |
-| 0096 | (this commit) | fleet: regenerate patch mirror |
+| 0096 | `2e3f93153` | fleet: regenerate patch mirror for the per-layer calibration |
+| 0097 | `8519f34e6` | chat: K2-Horizon: accept any effort's close tag as the end of reasoning |
+| 0098 | (this commit) | fleet: regenerate patch mirror |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
