@@ -80,7 +80,8 @@ std::vector<uint32_t> common_split_balance_optimize(
 std::vector<common_split_device_perf> common_split_balance_calibrate(
         const std::vector<ggml_backend_dev_t> & devs,
         int64_t n_embd, int64_t n_ff, ggml_type wtype, uint32_t n_ubatch,
-        const std::string & cache_path, bool force);
+        const std::string & cache_path, bool force,
+        uint32_t n_expert = 0, uint32_t n_expert_used = 0); // MoE: time the routed expert matmuls
 
 const char * common_split_balance_mode_name(common_split_balance_mode mode);
 
