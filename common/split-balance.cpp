@@ -391,6 +391,13 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     const double  exp_scale = (double) n_e / std::max<uint32_t>(1, m.n_expert);
     const int64_t ub_exp    = std::max<int64_t>(1, (int64_t) std::llround(ub * exp_scale));
 
+    // what one node costs to submit and run: a chain of scales over one token's activations (dispatch bound)
+    // and over a ubatch of them (memory bound). Long enough that a backend which submits one command buffer
+    // per node (e.g. Vulkan with GGML_VK_MAX_NODES_PER_SUBMIT=1) pays its real per-submit cost here too, not
+    // just the cheap, unsaturated cost a short chain would see -- the same reason the weight/attention/GDN
+    // graphs above are too small to show it on their own (see t_op_tg/t_op_pp below).
+    constexpr int n_chain = 256;
+
     size_t n_tensors = 16;
     for (const auto & l : m.layers) {
         n_tensors += 6 * l.weights.size() + 32;
@@ -402,7 +409,8 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     };
     ggml_context_ptr wctx { ggml_init(wparams) };          // weights and inputs, allocated once
     ggml_init_params gparams = {
-        /* .mem_size   = */ ggml_tensor_overhead() * n_tensors * 4 + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
+        // 2 * n_chain: the untimed-op probe below builds two chains of n_chain scale nodes in this same context
+        /* .mem_size   = */ ggml_tensor_overhead() * (n_tensors * 4 + 2 * n_chain) + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -632,9 +640,8 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
         }
     }
 
-    // what one of the untimed small ops costs: a chain of scales over one token's activations (dispatch bound)
-    // and over a ubatch of them (memory bound)
-    constexpr int n_chain = 64;
+    // the untimed-op probe: a chain of scales over one token's activations (dispatch bound) and over a
+    // ubatch of them (memory bound) -- see n_chain's declaration above for why it needs to be this long
     for (int j = 0; j < 2; j++) {
         ggml_cgraph * g_ops = ggml_new_graph(gctx.get());
         ggml_tensor * y = j == 0 ? ggml_view_1d(gctx.get(), x_hop, n_embd, 0) : x_hop;

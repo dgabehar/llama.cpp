@@ -370,6 +370,33 @@ Predicted vs measured on a 3080 Ti:
 pp still reads 20-40% high on three of the four; the error is similar
 across devices, so the chosen split is affected less than the numbers.
 
+**Calibration overrated a Vulkan device 6-8x under `GGML_VK_MAX_NODES_PER_SUBMIT=1`
+(fixed 2026-09-25, `vk-calib-overrate` branch):** on gabesrv01 (gfx90c, where
+production sets the env var as the DeviceLost mitigation above), per-layer
+calibration predicted K2-Horizon-7B tg 7.1 and Qwen3.5-4B tg 10.9, while real
+`llama-server` measured 0.89 and 1.63 -- `auto` put every layer on it. Root
+cause: the untimed-op probe (the `t_op_tg`/`t_op_pp` chain of scale ops that
+prices the layer's norms/RoPE/elementwise nodes per node) was only 64 nodes
+long. On a backend that submits one command buffer per node, that's too short
+to reach the same submit-queue depth a real decode/prefill graph runs at, so
+it measured the cheap, unsaturated per-submit cost instead of the real one --
+the same class of problem `GGML_VK_MAX_NODES_PER_SUBMIT=1`'s own fleet-wide
+note above describes for pipeline parallelism, just inside calibration's own
+timing instead of the real graph. Fixed by lengthening the chain to 256 nodes
+(8x amdgpu's 32-job `sched_jobs` ring), which required accounting for its
+tensors in `calibrate_device`'s `ggml_context` sizing too -- the untouched
+budget was tight enough that a MoE model with an output layer configured
+(gpt-oss-20b) overflowed it and crashed (`GGML_ASSERT` in `ggml_scale` /
+`ggml_new_graph_custom`); `tests/test-split-balance.cpp` gained a regression
+test for that (`test_calibrate_context_memory_budget`, a synthetic one-layer
+MoE model on the CPU backend, no GPU needed). Verified on an RTX 3080 Ti
+Laptop GPU (real per-node submit cost is much smaller there than on gfx90c's
+weak amdgpu ring, so the predicted/measured gap the env var causes is only
+~10-19%, not 6-8x, but it moves in the right direction and by roughly the
+right amount for K2-Horizon-7B, Qwen3.5-4B and gpt-oss-20b); the severity on
+gfx90c itself needs the cluster QA loop (Dawn) to confirm against a real
+`--split-balance auto` start with the env var set.
+
 **rpc-server admission:** a connection takes a `--max-clients` slot only
 once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
 slot. At most 64 connections wait for their HELLO; the oldest is closed to
