@@ -244,7 +244,11 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
     # clear, distinct error instead of an indefinite hang.
     global server
     server.n_slots = 1  # single slot, easy to keep permanently busy
-    server.n_ctx = 8192  # large enough that a real generation clearly outlasts the timeout below
+    # a real generation must clearly outlast the timeout below: the tiny test model stops at its
+    # 2048-token training context after ~0.7 s on a GPU, so shift the context and keep going
+    server.n_ctx = 8192
+    server.n_predict = 12000
+    server.enable_ctx_shift = True
     server.slot_action_timeout_ms = 500
     server.start()
 
@@ -252,7 +256,8 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
     def keep_slot_busy():
         r = server.make_request("POST", "/completion", data={
             "prompt": "Tell me a very long, very detailed story about dragons:",
-            "n_predict": 8000,
+            "n_predict": 12000,
+            "ignore_eos": True,  # the tiny model ends its story early otherwise
             "id_slot": 0,
         }, timeout=90)
         busy["status_code"] = r.status_code
