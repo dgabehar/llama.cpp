@@ -603,6 +603,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+
+    // number of non-CPU devices that hold layers of the model (the stages of a layer split)
+    LLAMA_API int32_t llama_model_n_devices_used(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -952,6 +955,33 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // [EXPERIMENTAL] Capture the state of seq_id right after the token at position pos is processed by the
+    // following llama_decode() calls. The ubatch is split after that token and the state is copied on the
+    // device in order with the computation, so taking it does not drain a multi-device pipeline the way
+    // llama_state_seq_get_data_ext() between two llama_decode() calls does.
+    // Returns false if captures are not supported for this context or flags.
+    LLAMA_API bool llama_state_seq_capture_add(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   pos,
+           llama_state_seq_flags   flags);
+
+    // Copy a capture requested with llama_state_seq_capture_add() into dst, in the llama_state_seq_get_data_ext()
+    // format, and its position range into pos_min/pos_max (may be NULL). With dst == NULL only returns the size.
+    // Returns 0 if the capture has not been taken (yet), e.g. because pos was not reached or the ubatch could
+    // not be split there.
+    LLAMA_API size_t llama_state_seq_capture_get(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   pos,
+                         uint8_t * dst,
+                          size_t   size,
+                       llama_pos * pos_min,
+                       llama_pos * pos_max);
+
+    // Drop all captures, taken or not
+    LLAMA_API void llama_state_seq_capture_clear(struct llama_context * ctx);
 
     //
     // Decoding

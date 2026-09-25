@@ -1,0 +1,1232 @@
+From ac9411b42f318f1067eafcd72a1c7a77a6e3c0c2 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 00:56:40 -0500
+Subject: [PATCH] llama, server : capture context checkpoints inside a batch
+
+llama-server ends the prompt batch at every context checkpoint (4 and
+4+n_ubatch tokens before the end, user message starts) and reads the
+state between llama_decode() calls. On a multi-device split each break
+drains the pipeline, and the n_ubatch-token call in between runs one
+device at a time: on gabesrv10+gabesrv06 (RPC) a 1.9K-token prompt took
+9.3 s where llama-bench needs ~6.6 s.
+
+New (experimental) API: llama_state_seq_capture_add(ctx, seq, pos,
+flags) asks the next llama_decode() calls to capture the state of seq
+right after the token at pos. The batch allocator ends the ubatch there
+(an explicit cut also satisfies the recurrent rollback tail, since
+prompt tokens are never rolled back into), and the state's tensor
+ranges are copied into device buffers with ggml_backend_tensor_copy_async
+on the owning backend, ordered between that ubatch and the next.
+llama_state_seq_capture_get() reads them back in the
+llama_state_seq_get_data_ext() format. Layouts that can't be copied
+this way (partial quant blocks, transposed-V row explosion) are refused
+by capture_add, so callers can fall back.
+
+The server registers captures instead of breaking the batch and turns
+them into checkpoints after the decode, with the same checks a batch
+start gets. The draft context is captured too unless it can be trimmed
+back (partial seq_rm), in which case it is read after the batch and
+trimmed on restore as before. eagle3 keeps splitting (its boundary
+state is per batch). LLAMA_SERVER_CKPT_CAPTURE=0 restores the old
+behavior.
+
+Results (Qwen3.8-27B Q4_K_XL):
+- slot saves (KV, recurrent state, checkpoint appendix) byte-identical
+  to the split behavior when the ubatch boundaries match, on one GPU and
+  over RPC, including a restore from a captured checkpoint
+- 20/80 RPC split, 1.9K prompt: 206 -> 262 t/s (llama-bench: ~287)
+- single 8060S: +20-40% on 0.2-3.6K prompts
+
+tests: test-state-capture compares captures in one decode against
+states read between decodes ending at the same positions (single seq,
+two seqs, q8_0 KV full state, retake after re-decode), for qwen35 and
+nemotron_h.
+
+Assisted-by: Claude Opus 5.5
+---
+ include/llama.h                 |  27 +++
+ src/llama-batch.cpp             |  42 ++++
+ src/llama-batch.h               |  10 +
+ src/llama-context.cpp           | 343 ++++++++++++++++++++++++++++++++
+ src/llama-context.h             |  38 ++++
+ tests/CMakeLists.txt            |  21 ++
+ tests/test-state-capture.cpp    | 226 +++++++++++++++++++++
+ tools/server/server-context.cpp | 200 +++++++++++++++++--
+ 8 files changed, 892 insertions(+), 15 deletions(-)
+ create mode 100644 tests/test-state-capture.cpp
+
+diff --git a/include/llama.h b/include/llama.h
+index 5af3be4c6..cd456c364 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -953,6 +953,33 @@ extern "C" {
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+ 
++    // [EXPERIMENTAL] Capture the state of seq_id right after the token at position pos is processed by the
++    // following llama_decode() calls. The ubatch is split after that token and the state is copied on the
++    // device in order with the computation, so taking it does not drain a multi-device pipeline the way
++    // llama_state_seq_get_data_ext() between two llama_decode() calls does.
++    // Returns false if captures are not supported for this context or flags.
++    LLAMA_API bool llama_state_seq_capture_add(
++            struct llama_context * ctx,
++                    llama_seq_id   seq_id,
++                       llama_pos   pos,
++           llama_state_seq_flags   flags);
++
++    // Copy a capture requested with llama_state_seq_capture_add() into dst, in the llama_state_seq_get_data_ext()
++    // format, and its position range into pos_min/pos_max (may be NULL). With dst == NULL only returns the size.
++    // Returns 0 if the capture has not been taken (yet), e.g. because pos was not reached or the ubatch could
++    // not be split there.
++    LLAMA_API size_t llama_state_seq_capture_get(
++            struct llama_context * ctx,
++                    llama_seq_id   seq_id,
++                       llama_pos   pos,
++                         uint8_t * dst,
++                          size_t   size,
++                       llama_pos * pos_min,
++                       llama_pos * pos_max);
++
++    // Drop all captures, taken or not
++    LLAMA_API void llama_state_seq_capture_clear(struct llama_context * ctx);
++
+     //
+     // Decoding
+     //
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a552f..ba8c062f9 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -502,6 +502,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+         if (idxs.size() >= n_ubatch) {
+             break;
+         }
++
++        if (is_split_after(idxs.back())) {
++            break;
++        }
+     }
+ 
+     return ubatch_add(idxs, idxs.size(), false);
+@@ -586,6 +590,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+             break;
+         }
+ 
++        bool split_after_cur = false;
++
+         for (uint32_t s = 0; s < n_seqs; ++s) {
+             const int32_t idx = seq_set_map[cur_seq_set[s]][cur_idx[s]];
+ 
+@@ -595,11 +601,17 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+             ++n_used;
+ 
+             ++cur_idx[s];
++
++            split_after_cur = split_after_cur || is_split_after(idx);
+         }
+ 
+         if  ((idxs_per_seq[0].size() + 1)*n_seqs > n_ubatch) {
+             break;
+         }
++
++        if (split_after_cur) {
++            break;
++        }
+     }
+ 
+     // if n_keep_tail > 0, keep only the seqs that either finish in this ubatch or have at least
+@@ -609,6 +621,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+         GGML_ASSERT(n_ubatch > n_keep_tail);
+ 
+         auto n_remaining = [&](uint32_t s) {
++            // a seq that stops at a split-after point is treated as finishing here (the tokens after it are
++            // prompt tokens that are never rolled back into, see llama_state_seq_capture_add)
++            if (!idxs_per_seq[s].empty() && is_split_after(idxs_per_seq[s].back())) {
++                return (uint32_t) 0;
++            }
+             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
+         };
+ 
+@@ -706,6 +723,10 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+             break;
+         }
+ 
++        if (is_split_after(cur_idx)) {
++            break;
++        }
++
+         do {
+             ++cur_idx;
+         } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx])));
+@@ -720,9 +741,30 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+     return ubatch_add(idxs, 1, true);
+ }
+ 
++void llama_batch_allocr::set_split_after(std::vector<std::pair<llama_seq_id, llama_pos>> split_after) {
++    this->split_after = std::move(split_after);
++}
++
++bool llama_batch_allocr::is_split_after(int32_t idx) const {
++    for (const auto & [s, p] : split_after) {
++        if (batch.pos[idx] != p) {
++            continue;
++        }
++        for (int32_t i = 0; i < batch.n_seq_id[idx]; ++i) {
++            if (batch.seq_id[idx][i] == s) {
++                return true;
++            }
++        }
++    }
++
++    return false;
++}
++
+ void llama_batch_allocr::clear() {
+     n_outputs = 0;
+ 
++    split_after.clear();
++
+     batch = {};
+ 
+     pos       .clear();
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889d4..88a03fd4e 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -110,6 +110,11 @@ public:
+     // sequence-set-wise split - each ubatch contains a single sequence-set
+     llama_ubatch split_seq(uint32_t n_ubatch);
+ 
++    // end a ubatch right after the token of seq_id at pos, for each (seq_id, pos) given
++    // (used to capture the memory state at that point, see llama_state_seq_capture_add)
++    // reset by init()
++    void set_split_after(std::vector<std::pair<llama_seq_id, llama_pos>> split_after);
++
+     // a helper method for creating a well-defined ubatch of tokens
+     // TODO: support embeddings if needed in the future
+     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+@@ -117,6 +122,9 @@ public:
+ private:
+     void clear();
+ 
++    // true if a ubatch has to end after the token at batch index idx
++    bool is_split_after(int32_t idx) const;
++
+     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
+     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
+     llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+@@ -146,6 +154,8 @@ private:
+     std::vector<int32_t>        seq_idx;
+     std::vector<int8_t>         output;
+ 
++    std::vector<std::pair<llama_seq_id, llama_pos>> split_after;
++
+     using pos_set_t = std::set<llama_pos>;
+     using seq_cpl_t = std::vector<bool>;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4d7d2cf9c..53f1bf163 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1903,6 +1903,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    if (!state_captures.empty()) {
++        std::vector<std::pair<llama_seq_id, llama_pos>> split_after;
++        for (const auto & cap : state_captures) {
++            split_after.emplace_back(cap.seq_id, cap.pos);
++        }
++        balloc->set_split_after(std::move(split_after));
++    }
++
+     while (true) {
+         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+         if (!mctx) {
+@@ -2135,6 +2143,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
++
++        if (!state_captures.empty()) {
++            state_captures_take(ubatch);
++        }
+     } while (mctx->next());
+ 
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+@@ -3309,6 +3321,325 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+     }
+ }
+ 
++// records the host part of a sequence state and the tensor ranges it references
++class llama_io_write_capture : public llama_io_write_i {
++public:
++    struct range {
++        ggml_tensor * tensor;
++        size_t        offset;
++        size_t        size;
++        size_t        dst; // offset in data
++    };
++
++    explicit llama_io_write_capture(std::vector<uint8_t> & data) : data(data) {}
++
++    void write(const void * src, size_t size) override {
++        const size_t n = data.size();
++        data.resize(n + size);
++        memcpy(data.data() + n, src, size);
++    }
++
++    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        ranges.push_back({ tensor, offset, size, data.size() });
++        data.resize(data.size() + size);
++    }
++
++    size_t n_bytes() override {
++        return data.size();
++    }
++
++    std::vector<range> ranges;
++
++private:
++    std::vector<uint8_t> & data;
++};
++
++// a range of a state tensor can be copied on the device if it is made of whole blocks
++static bool state_capture_range_ok(const ggml_tensor * tensor, size_t offset, size_t size) {
++    const size_t ts = ggml_type_size(tensor->type);
++    return tensor->buffer != nullptr && size % ts == 0 && offset % ts == 0;
++}
++
++// the most tensor ranges a capture copies (a transposed V cache writes one per element row)
++static constexpr size_t state_capture_max_ranges = 4096;
++
++bool llama_context::state_seq_capture_add(llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags) {
++    if (!memory || (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
++        return false;
++    }
++
++    // check that the current layout of the state can be captured
++    {
++        std::vector<uint8_t> data;
++        llama_io_write_capture io(data);
++        try {
++            memory->state_write(io, seq_id, flags);
++        } catch (const std::exception &) {
++            return false;
++        }
++        if (io.ranges.size() > state_capture_max_ranges) {
++            return false;
++        }
++        for (const auto & r : io.ranges) {
++            if (!state_capture_range_ok(r.tensor, r.offset, r.size)) {
++                return false;
++            }
++        }
++    }
++
++    for (const auto & cap : state_captures) {
++        if (cap.seq_id == seq_id && cap.pos == pos) {
++            return true;
++        }
++    }
++
++    state_capture cap;
++    cap.seq_id = seq_id;
++    cap.pos    = pos;
++    cap.flags  = flags;
++
++    state_captures.push_back(std::move(cap));
++
++    return true;
++}
++
++void llama_context::state_captures_take(const llama_ubatch & ubatch) {
++    for (auto & cap : state_captures) {
++        bool in_ubatch = false;
++        for (uint32_t i = 0; i < ubatch.n_tokens && !in_ubatch; ++i) {
++            if (ubatch.pos[i] != cap.pos) {
++                continue;
++            }
++            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++                if (ubatch.seq_id[i][j] == cap.seq_id) {
++                    in_ubatch = true;
++                    break;
++                }
++            }
++        }
++
++        if (!in_ubatch || memory->seq_pos_max(cap.seq_id) != cap.pos) {
++            continue;
++        }
++
++        // retaking: the buffers are reused, the copies into them are ordered after the earlier ones
++        for (auto & buf : cap.bufs) {
++            state_capture_pool.push_back(std::move(buf));
++        }
++        cap.bufs.clear();
++        cap.ctxs.clear();
++        cap.ranges.clear();
++        cap.taken = false;
++        cap.read  = false;
++
++        cap.data.clear();
++
++        llama_io_write_capture io(cap.data);
++
++        try {
++            io.write(&io_magic, sizeof(io_magic));
++            io.write(&cap.seq_id, sizeof(cap.seq_id));
++
++            memory->state_write(io, cap.seq_id, cap.flags);
++        } catch (const std::exception & err) {
++            LLAMA_LOG_WARN("%s: failed to capture the state of seq %d at pos %d: %s\n", __func__, cap.seq_id, cap.pos, err.what());
++            continue;
++        }
++
++        // copy the tensor ranges into one buffer per buffer type, on the backend that owns it, so that the copies
++        // are queued after this ubatch and before the next one
++        std::map<ggml_backend_buffer_type_t, std::vector<size_t>> groups;
++        for (size_t i = 0; i < io.ranges.size(); ++i) {
++            if (io.ranges[i].size > 0) {
++                groups[ggml_backend_buffer_get_type(io.ranges[i].tensor->buffer)].push_back(i);
++            }
++        }
++
++        bool ok = true;
++
++        for (const auto & [buft, idxs] : groups) {
++            ggml_init_params params = {
++                /*.mem_size   =*/ 2*idxs.size()*ggml_tensor_overhead(),
++                /*.mem_buffer =*/ NULL,
++                /*.no_alloc   =*/ true,
++            };
++
++            ggml_context_ptr ctx_cpy(ggml_init(params));
++
++            const size_t align = ggml_backend_buft_get_alignment(buft);
++
++            std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs; // (org, cpy)
++            size_t size_buf = 0;
++
++            for (const size_t i : idxs) {
++                const auto & r = io.ranges[i];
++
++                if (!state_capture_range_ok(r.tensor, r.offset, r.size) || io.ranges.size() > state_capture_max_ranges) {
++                    ok = false;
++                    break;
++                }
++
++                const int64_t n = (int64_t) (r.size/ggml_type_size(r.tensor->type))*ggml_blck_size(r.tensor->type);
++
++                ggml_tensor * org = ggml_view_1d      (ctx_cpy.get(), r.tensor, n, r.offset);
++                ggml_tensor * cpy = ggml_new_tensor_1d(ctx_cpy.get(), r.tensor->type, n);
++
++                pairs.emplace_back(org, cpy);
++                size_buf += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, cpy), align);
++            }
++
++            if (!ok) {
++                break;
++            }
++
++            ggml_backend_buffer_ptr buf;
++            for (auto it = state_capture_pool.begin(); it != state_capture_pool.end(); ++it) {
++                if (ggml_backend_buffer_get_type(it->get()) == buft && ggml_backend_buffer_get_size(it->get()) >= size_buf) {
++                    buf = std::move(*it);
++                    state_capture_pool.erase(it);
++                    break;
++                }
++            }
++            if (!buf) {
++                buf.reset(ggml_backend_buft_alloc_buffer(buft, size_buf));
++                if (!buf) {
++                    ok = false;
++                    break;
++                }
++                LLAMA_LOG_DEBUG("%s: allocated '%s' capture buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), size_buf/1024.0/1024.0);
++            }
++
++            ggml_backend_t backend = nullptr;
++            {
++                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++                for (const auto & b : backends) {
++                    if (ggml_backend_get_device(b.get()) == dev) {
++                        backend = b.get();
++                        break;
++                    }
++                }
++            }
++
++            ggml_tallocr talloc = ggml_tallocr_new(buf.get());
++
++            for (size_t j = 0; j < pairs.size(); ++j) {
++                auto [org, cpy] = pairs[j];
++
++                ggml_backend_view_init(org);
++                if (ggml_tallocr_alloc(&talloc, cpy) != GGML_STATUS_SUCCESS) {
++                    ok = false;
++                    break;
++                }
++
++                if (backend) {
++                    ggml_backend_tensor_copy_async(backend, backend, org, cpy);
++                } else {
++                    synchronize();
++                    ggml_backend_tensor_copy(org, cpy);
++                }
++
++                const auto & r = io.ranges[idxs[j]];
++                cap.ranges.push_back({ cpy, r.dst, r.size });
++            }
++
++            cap.ctxs.push_back(std::move(ctx_cpy));
++            cap.bufs.push_back(std::move(buf));
++
++            if (!ok) {
++                break;
++            }
++        }
++
++        if (!ok) {
++            LLAMA_LOG_WARN("%s: cannot capture the state of seq %d on the device\n", __func__, cap.seq_id);
++
++            for (auto & buf : cap.bufs) {
++                state_capture_pool.push_back(std::move(buf));
++            }
++            cap.bufs.clear();
++            cap.ctxs.clear();
++            cap.ranges.clear();
++            cap.data.clear();
++            continue;
++        }
++
++        cap.taken   = true;
++        cap.pos_min = memory->seq_pos_min(cap.seq_id);
++        cap.pos_max = memory->seq_pos_max(cap.seq_id);
++    }
++}
++
++size_t llama_context::state_seq_capture_get(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) {
++    for (auto & cap : state_captures) {
++        if (cap.seq_id != seq_id || cap.pos != pos) {
++            continue;
++        }
++
++        if (!cap.taken) {
++            return 0;
++        }
++
++        if (!cap.read) {
++            synchronize();
++
++            for (const auto & r : cap.ranges) {
++                ggml_backend_tensor_get(r.cpy, cap.data.data() + r.dst, 0, r.size);
++            }
++
++            for (auto & buf : cap.bufs) {
++                state_capture_pool.push_back(std::move(buf));
++            }
++            cap.bufs.clear();
++            cap.ctxs.clear();
++            cap.ranges.clear();
++
++            cap.read = true;
++        }
++
++        if (pos_min) {
++            *pos_min = cap.pos_min;
++        }
++        if (pos_max) {
++            *pos_max = cap.pos_max;
++        }
++
++        if (dst) {
++            if (size < cap.data.size()) {
++                LLAMA_LOG_ERROR("%s: buffer too small for the capture (%zu < %zu)\n", __func__, size, cap.data.size());
++                return 0;
++            }
++            memcpy(dst, cap.data.data(), cap.data.size());
++        }
++
++        return cap.data.size();
++    }
++
++    return 0;
++}
++
++void llama_context::state_seq_capture_clear() {
++    bool in_flight = false;
++
++    for (auto & cap : state_captures) {
++        in_flight = in_flight || !cap.bufs.empty();
++
++        for (auto & buf : cap.bufs) {
++            state_capture_pool.push_back(std::move(buf));
++        }
++    }
++
++    state_captures.clear();
++
++    // a reused buffer is only written after the copies queued before it, but freeing one needs them done
++    constexpr size_t n_pool_max = 8;
++    if (state_capture_pool.size() > n_pool_max) {
++        if (in_flight) {
++            synchronize();
++        }
++        state_capture_pool.erase(state_capture_pool.begin(), state_capture_pool.end() - n_pool_max);
++    }
++}
++
+ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+     llama_file file(filepath, "rb");
+ 
+@@ -4386,6 +4717,18 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+     return ctx->state_seq_set_data(seq_id, src, size, flags);
+ }
+ 
++bool llama_state_seq_capture_add(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags) {
++    return ctx->state_seq_capture_add(seq_id, pos, flags);
++}
++
++size_t llama_state_seq_capture_get(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max) {
++    return ctx->state_seq_capture_get(seq_id, pos, dst, size, pos_min, pos_max);
++}
++
++void llama_state_seq_capture_clear(llama_context * ctx) {
++    ctx->state_seq_capture_clear();
++}
++
+ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1bce28841..5a77022d2 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -157,6 +157,10 @@ struct llama_context {
+     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
++    bool   state_seq_capture_add  (llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags);
++    size_t state_seq_capture_get  (llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max);
++    void   state_seq_capture_clear();
++
+     bool state_load_file(
+             const char * filepath,
+            llama_token * tokens_out,
+@@ -393,6 +397,40 @@ private:
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
++    // state captures taken inside decode(), see llama_state_seq_capture_add
++    struct state_capture {
++        llama_seq_id          seq_id;
++        llama_pos             pos;
++        llama_state_seq_flags flags;
++
++        bool      taken   = false;
++        bool      read    = false; // device copies have been read into data
++        llama_pos pos_min = -1;
++        llama_pos pos_max = -1;
++
++        std::vector<uint8_t> data;
++
++        // on-device copies of the tensor ranges, read into data at dst on first access
++        struct range {
++            ggml_tensor * cpy;
++            size_t        dst;
++            size_t        size;
++        };
++        std::vector<range> ranges;
++
++        std::vector<ggml_context_ptr>        ctxs;
++        std::vector<ggml_backend_buffer_ptr> bufs;
++    };
++
++    std::vector<state_capture> state_captures;
++
++    // buffers of cleared captures, reused by later ones
++    std::vector<ggml_backend_buffer_ptr> state_capture_pool;
++
++    // take the captures whose token is in the ubatch just processed (again, if the seq was rolled back and
++    // processed again, so the last pass wins)
++    void state_captures_take(const llama_ubatch & ubatch);
++
+     bool has_evaluated_once = false;
+ 
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 6582c4499..eeae6ec67 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -207,6 +207,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_SETUP generate-models
+     )
+ 
++    llama_build(test-state-capture.cpp)
++
++    llama_test(
++        test-state-capture
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-state-capture PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
++    llama_test(
++        test-state-capture
++        NAME test-state-capture-nemotron-h
++        LABEL main
++        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
++    )
++    set_tests_properties(test-state-capture-nemotron-h PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     llama_test(
+         test-recurrent-state-rollback
+         LABEL main
+diff --git a/tests/test-state-capture.cpp b/tests/test-state-capture.cpp
+new file mode 100644
+index 000000000..126c33828
+--- /dev/null
++++ b/tests/test-state-capture.cpp
+@@ -0,0 +1,226 @@
++// Tests llama_state_seq_capture_*: the state captured inside one llama_decode() must be identical to the
++// state read between llama_decode() calls that end at the same positions.
++
++#include "arg.h"
++#include "common.h"
++#include "llama.h"
++
++#include <clocale>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++struct seg {
++    llama_seq_id seq_id;
++    llama_pos    p0; // first position
++    llama_pos    p1; // one past the last position
++};
++
++static llama_token tok(llama_seq_id s, llama_pos p) {
++    return (llama_token) (1 + (p*7 + s*13) % 97);
++}
++
++static bool decode_segs(llama_context * ctx, const std::vector<seg> & segs) {
++    int32_t n = 0;
++    for (const auto & sg : segs) {
++        n += sg.p1 - sg.p0;
++    }
++    llama_batch batch = llama_batch_init(n, 0, 1);
++    for (const auto & sg : segs) {
++        for (llama_pos p = sg.p0; p < sg.p1; ++p) {
++            common_batch_add(batch, tok(sg.seq_id, p), p, { sg.seq_id }, p + 1 == sg.p1);
++        }
++    }
++    const bool ok = llama_decode(ctx, batch) == 0;
++    llama_batch_free(batch);
++    return ok;
++}
++
++static std::vector<uint8_t> get_state(llama_context * ctx, llama_seq_id s, llama_state_seq_flags flags) {
++    std::vector<uint8_t> data(llama_state_seq_get_size_ext(ctx, s, flags));
++    data.resize(llama_state_seq_get_data_ext(ctx, data.data(), data.size(), s, flags));
++    return data;
++}
++
++static std::vector<uint8_t> get_capture(llama_context * ctx, llama_seq_id s, llama_pos pos, llama_pos * pos_max = nullptr) {
++    std::vector<uint8_t> data(llama_state_seq_capture_get(ctx, s, pos, nullptr, 0, nullptr, nullptr));
++    llama_pos pmin = -1;
++    llama_pos pmax = -1;
++    if (!data.empty()) {
++        data.resize(llama_state_seq_capture_get(ctx, s, pos, data.data(), data.size(), &pmin, &pmax));
++    }
++    if (pos_max) {
++        *pos_max = pmax;
++    }
++    return data;
++}
++
++struct cap_point {
++    llama_seq_id          seq_id;
++    llama_pos             pos;
++    llama_state_seq_flags flags;
++};
++
++static int n_fail = 0;
++
++#define CHECK(cond, ...) do { if (!(cond)) { n_fail++; fprintf(stderr, "FAIL %s:%d: %s -- ", __FILE__, __LINE__, #cond); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++// decode the segments of every call in one batch with captures at the ends of all calls but the last,
++// and compare with a reference that decodes call by call and reads the state in between
++static void run_case(const char * name, llama_model * model, llama_context_params cparams,
++                     const std::vector<std::vector<seg>> & calls, const std::vector<cap_point> & caps) {
++    fprintf(stderr, "%s: %s\n", __func__, name);
++
++    llama_context * ctx_ref = llama_init_from_model(model, cparams);
++    llama_context * ctx_cap = llama_init_from_model(model, cparams);
++    if (!ctx_ref || !ctx_cap) {
++        CHECK(false, "failed to create contexts");
++        return;
++    }
++
++    // reference: one decode per call, state read after each call
++    std::vector<std::vector<uint8_t>> ref(caps.size());
++    for (const auto & call : calls) {
++        CHECK(decode_segs(ctx_ref, call), "reference decode failed");
++        for (size_t i = 0; i < caps.size(); ++i) {
++            for (const auto & sg : call) {
++                if (sg.seq_id == caps[i].seq_id && sg.p1 - 1 == caps[i].pos) {
++                    ref[i] = get_state(ctx_ref, caps[i].seq_id, caps[i].flags);
++                }
++            }
++        }
++    }
++
++    // captured: all calls merged into one batch, per seq in position order
++    std::vector<seg> merged;
++    for (const auto & call : calls) {
++        for (const auto & sg : call) {
++            bool found = false;
++            for (auto & m : merged) {
++                if (m.seq_id == sg.seq_id && m.p1 == sg.p0) {
++                    m.p1  = sg.p1;
++                    found = true;
++                }
++            }
++            if (!found) {
++                merged.push_back(sg);
++            }
++        }
++    }
++
++    for (const auto & c : caps) {
++        CHECK(llama_state_seq_capture_add(ctx_cap, c.seq_id, c.pos, c.flags), "capture_add failed for seq %d pos %d", c.seq_id, c.pos);
++    }
++
++    // a capture that is not reached must not be reported as taken
++    CHECK(llama_state_seq_capture_add(ctx_cap, 0, 100000, 0), "capture_add failed for an unreached pos");
++
++    CHECK(decode_segs(ctx_cap, merged), "capture decode failed");
++
++    for (size_t i = 0; i < caps.size(); ++i) {
++        llama_pos pmax = -1;
++        const auto got = get_capture(ctx_cap, caps[i].seq_id, caps[i].pos, &pmax);
++        CHECK(!got.empty(), "capture seq %d pos %d not taken", caps[i].seq_id, caps[i].pos);
++        CHECK(pmax == caps[i].pos, "capture seq %d pos %d has pos_max %d", caps[i].seq_id, caps[i].pos, pmax);
++        CHECK(got.size() == ref[i].size() && memcmp(got.data(), ref[i].data(), got.size()) == 0,
++              "capture seq %d pos %d flags %u differs from the reference (%zu vs %zu bytes)",
++              caps[i].seq_id, caps[i].pos, caps[i].flags, got.size(), ref[i].size());
++    }
++    CHECK(get_capture(ctx_cap, 0, 100000).empty(), "unreached capture reported as taken");
++
++    // the live states at the end must match too
++    for (const auto & sg : merged) {
++        const auto a = get_state(ctx_ref, sg.seq_id, 0);
++        const auto b = get_state(ctx_cap, sg.seq_id, 0);
++        CHECK(a.size() == b.size() && memcmp(a.data(), b.data(), a.size()) == 0, "final state of seq %d differs", sg.seq_id);
++    }
++
++    // decoding again after a full removal retakes the captures (as chained MTP heads do)
++    llama_state_seq_capture_clear(ctx_cap);
++    for (const auto & c : caps) {
++        llama_state_seq_capture_add(ctx_cap, c.seq_id, c.pos, c.flags);
++    }
++    for (int pass = 0; pass < 2; ++pass) {
++        for (const auto & sg : merged) {
++            llama_memory_seq_rm(llama_get_memory(ctx_cap), sg.seq_id, -1, -1);
++        }
++        CHECK(decode_segs(ctx_cap, merged), "capture re-decode failed");
++    }
++    for (size_t i = 0; i < caps.size(); ++i) {
++        const auto got = get_capture(ctx_cap, caps[i].seq_id, caps[i].pos);
++        CHECK(got.size() == ref[i].size() && memcmp(got.data(), ref[i].data(), got.size()) == 0,
++              "retaken capture seq %d pos %d differs from the reference", caps[i].seq_id, caps[i].pos);
++    }
++
++    // clear drops everything
++    llama_state_seq_capture_clear(ctx_cap);
++    CHECK(get_capture(ctx_cap, caps[0].seq_id, caps[0].pos).empty(), "capture survived clear");
++
++    llama_free(ctx_ref);
++    llama_free(ctx_cap);
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    common_init();
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++
++    ggml_backend_load_all();
++
++    llama_model_params mparams = common_model_params_to_llama(params);
++    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "%s : failed to load model\n", __func__);
++        return 1;
++    }
++
++    const llama_state_seq_flags partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
++
++    auto cparams = common_context_params_to_llama(params);
++    cparams.n_ctx      = 512;
++    cparams.n_batch    = 256;
++    cparams.n_ubatch   = 16;
++    cparams.n_seq_max  = 2;
++    cparams.kv_unified = false;
++    cparams.n_rs_seq   = 0;
++
++    // one seq, checkpoints like the server's (partial state), plus a full state capture
++    run_case("single seq", model, cparams,
++        { { { 0, 0, 21 } }, { { 0, 21, 51 } }, { { 0, 51, 55 } }, { { 0, 55, 70 } } },
++        { { 0, 20, partial }, { 0, 50, partial }, { 0, 54, 0 } });
++
++    // two seqs in one batch with the same cut, then a cut in one seq only
++    run_case("two seqs", model, cparams,
++        { { { 0, 0, 21 }, { 1, 0, 21 } }, { { 0, 21, 38 }, { 1, 21, 38 } }, { { 0, 38, 45 }, { 1, 38, 45 } } },
++        { { 0, 20, partial }, { 1, 20, partial }, { 1, 37, partial } });
++
++    // quantized KV cache: the full state has block-quantized ranges
++    {
++        auto cq = cparams;
++        cq.type_k = GGML_TYPE_Q8_0;
++        cq.type_v = GGML_TYPE_Q8_0;
++        cq.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        run_case("q8_0 kv, full state", model, cq,
++            { { { 0, 0, 33 } }, { { 0, 33, 40 } } },
++            { { 0, 32, 0 } });
++    }
++
++    // on-device flags are not supported
++    {
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        CHECK(!llama_state_seq_capture_add(ctx, 0, 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE), "capture_add accepted ON_DEVICE");
++        llama_free(ctx);
++    }
++
++    llama_model_free(model);
++
++    if (n_fail == 0) {
++        fprintf(stderr, "test-state-capture: OK\n");
++    }
++    return n_fail == 0 ? 0 : 1;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8efeb6e66..bd8b4dc6e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -256,6 +256,15 @@ struct server_slot {
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
++
++    // context checkpoints captured inside the current batch instead of splitting it
++    // (see llama_state_seq_capture_add)
++    struct ckpt_capture {
++        int64_t   n_tokens; // prompt tokens covered by the checkpoint
++        llama_pos pos;      // position of the last of them
++        int32_t   i_batch;  // index of that token in the batch
++    };
++    std::vector<ckpt_capture> ckpt_captures;
+     std::mt19937 spec_synth_rng;
+ 
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+@@ -916,6 +925,10 @@ private:
+     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+ 
++    // take mid-batch context checkpoints with llama_state_seq_capture_add instead of splitting the batch
++    bool ckpt_capture     = false;
++    bool ckpt_capture_dft = false; // capture the draft state too (it can't be trimmed back after the batch)
++
+     common_speculative_ptr spec;
+ 
+     bool add_bos_token = true;
+@@ -1294,6 +1307,25 @@ private:
+             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+         }
+ 
++        // Splitting the batch at a checkpoint drains a multi-device pipeline and runs the next ubatch on
++        // one device at a time. Capturing the state inside the batch avoids that. A draft state that can be
++        // trimmed back (partial seq_rm) is read after the batch and trimmed on restore, otherwise it is
++        // captured too. The eagle3 boundary state is per batch, so eagle3 keeps splitting.
++        {
++            const auto & types = params_base.speculative.types;
++            const bool has_eagle3 = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != types.end();
++
++            ckpt_capture     = params_base.n_ctx_checkpoints > 0 && !has_eagle3;
++            ckpt_capture_dft = ctx_dft != nullptr && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
++
++            const char * env = getenv("LLAMA_SERVER_CKPT_CAPTURE");
++            if (env && atoi(env) == 0) {
++                ckpt_capture = false;
++            }
++
++            SRV_INF("context checkpoints inside a batch: %s\n", ckpt_capture ? (ckpt_capture_dft ? "captured (with draft)" : "captured") : "split");
++        }
++
+         if (spec) {
+             SRV_TRC("%s", "speculative decoding context initialized\n");
+         } else {
+@@ -2328,8 +2360,10 @@ private:
+         return true;
+     }
+ 
+-    // n_tokens_cur: the number of tokens added to the batch for the current slot
+-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
++    // n_tokens_ckpt: the number of prompt tokens covered by the checkpoint
++    // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
++    void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
++            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr) {
+         const int id_task = slot.task->id;
+ 
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+@@ -2363,7 +2397,7 @@ private:
+ 
+         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+         {
+-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
++            const int64_t n_tokens_new = n_tokens_ckpt;
+             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                 if (it->n_tokens == n_tokens_new) {
+                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+@@ -2381,10 +2415,18 @@ private:
+         // [TAG_CHECKPOINTS_FIX_POS_MIN]
+         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
++        cur.update_pos(n_tokens_ckpt, pos_min, pos_max);
+ 
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        if (data_tgt) {
++            cur.data_tgt = std::move(*data_tgt);
++        } else {
++            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        }
++        if (data_dft) {
++            cur.data_dft = std::move(*data_dft);
++        } else {
++            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        }
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
+@@ -3100,6 +3142,10 @@ private:
+                     // move the head of the batch forward with the number of tokens we just processed
+                     off_next = off + n_tokens;
+ 
++                    if (ckpt_capture) {
++                        create_captured_checkpoints(off_next);
++                    }
++
+                     // on successful decode, restore the original batch size
+                     n_batch = llama_n_batch(ctx_tgt);
+                 } else {
+@@ -3123,6 +3169,87 @@ private:
+         }
+     }
+ 
++    // create the context checkpoints captured in batch tokens before i_end, with the checks the start
++    // of a batch gets when the batch is split at each of them instead
++    void create_captured_checkpoints(int32_t i_end) {
++        bool pending = false;
++
++        for (auto & slot : slots) {
++            auto & caps = slot.ckpt_captures;
++
++            size_t n_done = 0;
++            for (; n_done < caps.size() && caps[n_done].i_batch < i_end; ++n_done) {
++                const auto & cap = caps[n_done];
++
++                llama_pos pos_min = -1;
++                llama_pos pos_max = -1;
++
++                const size_t n = llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, nullptr, 0, &pos_min, &pos_max);
++                if (n == 0 || slot.task == nullptr) {
++                    SLT_WRN(slot, "context checkpoint at n_tokens = %" PRId64 " was not captured\n", cap.n_tokens);
++                    continue;
++                }
++
++                const auto & spans = slot.task->params.message_spans;
++                const int64_t n_task = slot.task->n_tokens();
++
++                // where the batch starting here would have ended
++                const int64_t n_end = n_done + 1 < caps.size() ? caps[n_done + 1].n_tokens : (int64_t) slot.prompt.n_tokens();
++
++                const bool near_prompt_end      = n_task < n_end + (int64_t) llama_n_ubatch(ctx_tgt);
++                const bool is_user_start        = spans.is_user_start(cap.n_tokens);
++                const bool is_last_user_message = cap.n_tokens == spans.last_user_message_pos();
++
++                const auto & checkpoints = slot.prompt.checkpoints;
++
++                bool do_checkpoint = pos_min >= 0;
++                do_checkpoint = do_checkpoint && (n_end == n_task || is_user_start || near_prompt_end);
++                do_checkpoint = do_checkpoint && (
++                        checkpoints.empty() || is_last_user_message || near_prompt_end ||
++                        cap.n_tokens > checkpoints.back().n_tokens + params_base.checkpoint_min_step);
++
++                SLT_DBG(slot, "capture/do_checkpoint = %s, n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d\n",
++                        do_checkpoint ? "yes" : "no", cap.n_tokens, pos_min, pos_max);
++
++                // the draft state: captured, not started yet, or read now and trimmed on restore
++                std::vector<uint8_t> data_dft;
++                bool read_dft_now = false;
++                if (do_checkpoint && ctx_dft) {
++                    const size_t n_dft = ckpt_capture_dft ? llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, nullptr, 0, nullptr, nullptr) : 0;
++                    if (n_dft > 0) {
++                        data_dft.resize(n_dft);
++                        llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, data_dft.data(), data_dft.size(), nullptr, nullptr);
++                    } else if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) < 0) {
++                        // draft not started for this seq, same as update_dft()
++                    } else if (!ckpt_capture_dft) {
++                        read_dft_now = true;
++                    } else {
++                        SLT_WRN(slot, "draft state for the context checkpoint at n_tokens = %" PRId64 " was not captured\n", cap.n_tokens);
++                        do_checkpoint = false;
++                    }
++                }
++
++                if (do_checkpoint) {
++                    std::vector<uint8_t> data(n);
++                    llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
++
++                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft);
++                }
++            }
++
++            caps.erase(caps.begin(), caps.begin() + n_done);
++
++            pending = pending || !caps.empty();
++        }
++
++        if (!pending) {
++            llama_state_seq_capture_clear(ctx_tgt);
++            if (ckpt_capture_dft) {
++                llama_state_seq_capture_clear(ctx_dft);
++            }
++        }
++    }
++
+     void pre_decode() {
+         // apply context-shift if needed
+         // TODO: simplify and improve
+@@ -3191,6 +3318,16 @@ private:
+         // start populating the batch for this iteration
+         batch.clear();
+ 
++        if (ckpt_capture) {
++            llama_state_seq_capture_clear(ctx_tgt);
++            if (ckpt_capture_dft) {
++                llama_state_seq_capture_clear(ctx_dft);
++            }
++            for (auto & slot : slots) {
++                slot.ckpt_captures.clear();
++            }
++        }
++
+         // track if given slot can be batched with slots already in the batch
+         auto & slot_batched = batch.slot_batched;
+ 
+@@ -3763,12 +3900,39 @@ private:
+                             /* is_prompt = */ true);
+                         slot.prompt.tokens.push_back(cur_tok);
+ 
++                        // capture the checkpoint state here if possible, otherwise end the batch here
++                        auto capture_checkpoint = [&]() {
++                            if (!ckpt_capture || has_mtmd || alora_scale > 0.0f) {
++                                return false;
++                            }
++
++                            const llama_pos pos = slot.prompt.tokens.pos_next() - 1;
++                            if (ckpt_capture_dft && !llama_state_seq_capture_add(ctx_dft, slot.id, pos, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
++                                return false;
++                            }
++                            if (!llama_state_seq_capture_add(ctx_tgt, slot.id, pos, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
++                                return false;
++                            }
++
++                            slot.ckpt_captures.push_back({ (int64_t) slot.prompt.n_tokens(), pos, (int32_t) batch.size() - 1 });
++
++                            return true;
++                        };
++
+                         // break at the last user message, or at user messages at least min step past the last checkpoint
+                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                             const auto pos = slot.prompt.n_tokens();
+                             const auto & checkpoints = slot.prompt.checkpoints;
+ 
+-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
++                            // a capture in this batch becomes the latest checkpoint
++                            const bool has_last = !checkpoints.empty() || !slot.ckpt_captures.empty();
++                            const int64_t n_last = !slot.ckpt_captures.empty() ? slot.ckpt_captures.back().n_tokens :
++                                                   !checkpoints.empty()        ? checkpoints.back().n_tokens : 0;
++
++                            if (pos == last_user_pos || !has_last || pos > n_last + params_base.checkpoint_min_step) {
++                                if (capture_checkpoint()) {
++                                    continue;
++                                }
+                                 break;
+                             }
+                         }
+@@ -3790,6 +3954,9 @@ private:
+                                 }
+                             }
+                             if (should_break) {
++                                if (capture_checkpoint()) {
++                                    continue;
++                                }
+                                 break;
+                             }
+                         }
+@@ -3800,7 +3967,10 @@ private:
+ 
+                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+ 
+-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
++                    // without captures the batch would have ended at the first one
++                    const int64_t n_tokens_end = slot.ckpt_captures.empty() ? (int64_t) slot.prompt.n_tokens() : slot.ckpt_captures.front().n_tokens;
++
++                    const bool near_prompt_end = slot.task->n_tokens() < n_tokens_end + n_ubatch;
+ 
+                     const bool is_user_start = spans.is_user_start(n_tokens_start);
+                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+@@ -3818,12 +3988,12 @@ private:
+                         slot.i_batch     = batch.size() - 1;
+ 
+                         slot.init_sampler();
+-                    } else {
+-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+-                        // message or we are near the end of the prompt
+-                        if (!is_user_start && !near_prompt_end) {
+-                            do_checkpoint = false;
+-                        }
++                    }
++
++                    // skip ordinary mid-prompt checkpoints, unless the batch starts a user
++                    // message or we are near the end of the prompt
++                    if (n_tokens_end < slot.task->n_tokens() && !is_user_start && !near_prompt_end) {
++                        do_checkpoint = false;
+                     }
+ 
+                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+@@ -3848,7 +4018,7 @@ private:
+                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                     //       yet processed and therefore it is not part of the checkpoint.
+                     if (do_checkpoint) {
+-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
++                        create_checkpoint(slot, n_tokens_start, pos_min, pos_max);
+                     }
+                 }
+ 
+-- 
+2.43.0
+

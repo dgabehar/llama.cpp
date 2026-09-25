@@ -1,0 +1,140 @@
+From d196898760ce310d23cb0a1f0a65a98dff46a64c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 23:45:55 -0500
+Subject: [PATCH] llama : restore the worst-case sched plan before large
+ ubatches
+
+With pipeline parallelism, small graphs (below the GPU op-offload batch
+size) are placed differently by the scheduler and replace the reserved
+worst-case allocation plan. The next large ubatch then gets a plan sized
+for itself, and every later ubatch with a bigger KV view reallocates,
+which synchronizes all backends and drains the pipeline (1.19 s stall
+before the tail ubatch of a prompt in llama-server).
+
+Factor the pp-graph reserve out of sched_reserve and re-run it before
+the first ubatch of >= 32 tokens that follows a small one.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/llama-context.cpp | 63 ++++++++++++++++++++++++++++++-------------
+ src/llama-context.h   |  9 +++++++
+ 2 files changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index df4bca517..4d7d2cf9c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -686,6 +686,30 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+     return (int) users.size();
+ }
+ 
++bool llama_context::graph_reserve_worst_pp(const llama_memory_context_i * mctx) {
++    const uint32_t n_seqs       = cparams.n_seq_max;
++    const uint32_t n_tokens     = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
++
++    // TODO: the worst case graph is not always reached for `n_seqs > 1`
++    //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
++    ggml_cgraph * gf = nullptr;
++    switch (model.arch) {
++        case LLM_ARCH_KIMI_LINEAR:
++        case LLM_ARCH_MINIMAX_01:
++            // [TAG_RESERVE_DIAG_DECAY]
++            // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
++            // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
++            gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx, model.hparams.no_alloc);
++            break;
++        default:
++            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx, model.hparams.no_alloc);
++    };
++
++    sched_plan_worst_pp = gf != nullptr;
++    return gf != nullptr;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -779,25 +803,8 @@ void llama_context::sched_reserve() {
+     }
+ 
+     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+-    {
+-        // TODO: the worst case graph is not always reached for `n_seqs > 1`
+-        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+-        ggml_cgraph * gf = nullptr;
+-        switch (model.arch) {
+-            case LLM_ARCH_KIMI_LINEAR:
+-            case LLM_ARCH_MINIMAX_01:
+-                // [TAG_RESERVE_DIAG_DECAY]
+-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+-                break;
+-            default:
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+-        };
+-
+-        if (!gf) {
+-            throw std::runtime_error("failed to allocate compute pp buffers");
+-        }
++    if (!graph_reserve_worst_pp(mctx.get())) {
++        throw std::runtime_error("failed to allocate compute pp buffers");
+     }
+ 
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -1486,6 +1493,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         n_reused++;
+     } else {
++        // Small graphs are placed differently by the scheduler (ops move between backends
++        // below the offload batch size) and replace the worst-case allocation plan. A large
++        // graph allocated after that gets a plan sized for itself, so every later ubatch
++        // with a bigger KV view reallocates, which synchronizes all backends and stops
++        // pipeline parallelism. Restore the worst-case plan first instead.
++        constexpr uint32_t n_tokens_large = 32; // default op offload batch size of the GPU backends
++        if (cparams.pipeline_parallel && memory && !model.hparams.no_alloc) {
++            if (ubatch.n_tokens < n_tokens_large) {
++                sched_plan_worst_pp = false;
++            } else if (!sched_plan_worst_pp) {
++                // the full-memory context is a placeholder for sizing and leaves the cache untouched
++                auto mctx_full = memory->init_full();
++                if (mctx_full) {
++                    graph_reserve_worst_pp(mctx_full.get());
++                }
++            }
++        }
++
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bb81793fe..1bce28841 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -249,6 +249,9 @@ public:
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+ 
+     // reserve a graph with a dummy ubatch of the specified size
++    // reserves the worst-case prompt-processing graph, see sched_plan_worst_pp
++    bool graph_reserve_worst_pp(const llama_memory_context_i * mctx);
++
+     ggml_cgraph * graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+ 
+@@ -349,6 +352,12 @@ private:
+ 
+     bool sched_need_reserve = true;
+ 
++    // true while the scheduler's allocation plan is the worst-case prompt-processing
++    // graph from sched_reserve; small graphs (token generation) replace that plan, and
++    // allocating large graphs against a plan sized for the current graph reallocates
++    // (and synchronizes every backend) each time the KV cache grows
++    bool sched_plan_worst_pp = false;
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+-- 
+2.43.0
+

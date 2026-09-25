@@ -1,0 +1,154 @@
+From 4727d61e04118f8512e94432778ca4dd0faf97a5 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 01:12:20 -0500
+Subject: [PATCH] common : split-balance: time the dominant weight type, model
+ n_batch drains
+
+The calibration timed the type of layer 0's ffn_up. In mixed-quant files
+that is often not representative: Qwen3.8-27B UD-Q4_K_XL has q3_K there,
+which made the 780M look 6x slower than the 8060S for decode instead of
+the ~2.6x measured on the real layers (now q5_K, 3.4x).
+
+The prefill model assumed one pipeline over the whole prompt, but every
+llama_decode() call (n_batch tokens) drains it. Model the drain per
+call; the workload gets n_batch from the context params.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/split-balance.cpp     | 36 +++++++++++++++++++++++++++++-------
+ common/split-balance.h       |  1 +
+ tests/test-split-balance.cpp | 15 +++++++++++++++
+ 3 files changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+index aca9f5357..77a9d4b52 100644
+--- a/common/split-balance.cpp
++++ b/common/split-balance.cpp
+@@ -56,8 +56,10 @@ double common_split_predict_prefill(
+         const std::vector<common_split_device_perf> & perf,
+         const std::vector<uint32_t> & n_layers,
+         const common_split_workload & wl) {
+-    const uint32_t ub = std::max<uint32_t>(1, std::min(wl.n_ubatch, std::max<uint32_t>(1, wl.n_prompt)));
+-    const uint32_t n_ub = (std::max<uint32_t>(1, wl.n_prompt) + ub - 1) / ub;
++    const uint32_t n_prompt = std::max<uint32_t>(1, wl.n_prompt);
++    const uint32_t ub = std::max<uint32_t>(1, std::min(wl.n_ubatch, n_prompt));
++    // the prompt is decoded n_batch tokens at a time and each call drains the pipeline
++    const uint32_t nb = std::max<uint32_t>(ub, wl.n_batch > 0 ? std::min(wl.n_batch, n_prompt) : n_prompt);
+ 
+     // ubatches are pipelined across the stages: the slowest stage sets the pace, and the
+     // pipeline takes (n_stages - 1) extra stage times to fill
+@@ -78,8 +80,15 @@ double common_split_predict_prefill(
+     if (n_stages == 0) {
+         return 0.0;
+     }
+-    // with a single ubatch nothing overlaps; the fill term covers that exactly
+-    return (n_ub - 1) * t_stage_max + t_stage_sum;
++    // per call: with a single ubatch nothing overlaps; the fill term covers that exactly
++    // (the last, shorter ubatch of a call is counted as a full one)
++    auto t_call = [&](uint32_t n_tokens) {
++        const uint32_t n_ub = (n_tokens + ub - 1) / ub;
++        return (n_ub - 1) * t_stage_max + t_stage_sum;
++    };
++    const uint32_t n_full = n_prompt / nb;
++    const uint32_t n_rest = n_prompt % nb;
++    return n_full * t_call(nb) + (n_rest > 0 ? t_call(n_rest) : 0.0);
+ }
+ 
+ struct split_cost {
+@@ -473,6 +482,7 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
+ 
+     double layer_bytes = 0.0;
+     double layer_flops = 0.0;
++    std::map<ggml_type, double> type_bytes;
+     double output_bytes = 0.0;
+     double tok_embd_bytes = 0.0;
+     bool   has_output = false;
+@@ -495,10 +505,12 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
+             if (t->ne[1] > 1) {
+                 layer_flops += 2.0 * ggml_nelements(t) * frac;
+             }
+-            if (info.wtype == GGML_TYPE_COUNT && (name.find(".ffn_up.weight") != std::string::npos || name.find(".ffn_up_exps.weight") != std::string::npos)) {
++            if (t->ne[1] > 1) {
++                type_bytes[t->type] += ggml_nbytes(t) * frac;
++            }
++            if (info.n_ff == 0 && (name.find(".ffn_up.weight") != std::string::npos || name.find(".ffn_up_exps.weight") != std::string::npos)) {
+                 info.n_embd = t->ne[0];
+                 info.n_ff   = t->ne[1];
+-                info.wtype  = t->type;
+             }
+         } else if (name == "output.weight") {
+             output_bytes = ggml_nbytes(t);
+@@ -509,7 +521,16 @@ static bool read_model_layers(const char * path, uint32_t n_layer, model_layer_i
+     }
+     gguf_free(gctx);
+ 
+-    if (info.wtype == GGML_TYPE_COUNT || n_layer == 0) {
++    // time the type that holds most of the weight bytes (mixed-quant files differ per tensor)
++    double best_bytes = 0.0;
++    for (const auto & [type, bytes] : type_bytes) {
++        if (bytes > best_bytes) {
++            best_bytes = bytes;
++            info.wtype = type;
++        }
++    }
++
++    if (info.wtype == GGML_TYPE_COUNT || info.n_ff == 0 || n_layer == 0) {
+         return false;
+     }
+     info.shape.n_layer      = n_layer;
+@@ -616,6 +637,7 @@ void common_split_balance_apply(
+     wl.n_prompt = params.split_workload_prompt;
+     wl.n_gen    = params.split_workload_gen;
+     wl.n_ubatch = cparams.n_ubatch;
++    wl.n_batch  = cparams.n_batch;
+ 
+     // optimize, then check the choice against real buffer sizes; shrink the cap of any device
+     // that would overflow and try again
+diff --git a/common/split-balance.h b/common/split-balance.h
+index 70927fe8d..ccf98216a 100644
+--- a/common/split-balance.h
++++ b/common/split-balance.h
+@@ -46,6 +46,7 @@ struct common_split_workload {
+     uint32_t n_prompt = 4096;
+     uint32_t n_gen    = 256;
+     uint32_t n_ubatch = 512;
++    uint32_t n_batch  = 2048; // the pipeline drains at the end of every llama_decode() call
+ };
+ 
+ // predicted seconds per decoded token / for processing n_prompt tokens, for
+diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
+index 556cb7272..1c76c8c0a 100644
+--- a/tests/test-split-balance.cpp
++++ b/tests/test-split-balance.cpp
+@@ -71,6 +71,7 @@ int main() {
+     wl.n_prompt = 8192;
+     wl.n_gen    = 0;
+     wl.n_ubatch = 512;
++    wl.n_batch  = 8192;
+ 
+     // memory mode leaves the split to llama.cpp
+     CHECK(common_split_balance_optimize(COMMON_SPLIT_BALANCE_MEMORY, shape, perf, { 64, 64 }, wl).empty(), "memory mode must not choose a split");
+@@ -94,6 +95,20 @@ int main() {
+         const double t_fast  = common_split_predict_prefill(shape, perf, { 0, 64 }, wl);
+         CHECK(t_split < t_fast, "balanced prefill should beat the fast device alone (%.3f vs %.3f s)", t_split, t_fast);
+     }
++    // every llama_decode() call drains the pipeline, so a smaller n_batch predicts less overlap
++    {
++        const std::vector<uint32_t> n = { 13, 51 };
++        common_split_workload small = wl;
++        small.n_batch = 2048;
++        const double t_big   = common_split_predict_prefill(shape, perf, n, wl);
++        const double t_small = common_split_predict_prefill(shape, perf, n, small);
++        CHECK(t_small > t_big, "n_batch 2048 should predict slower prefill than 8192 (%.3f vs %.3f s)", t_small, t_big);
++        // one device has nothing to overlap, so n_batch doesn't matter there
++        const double t1_big   = common_split_predict_prefill(shape, perf, { 0, 64 }, wl);
++        const double t1_small = common_split_predict_prefill(shape, perf, { 0, 64 }, small);
++        CHECK(std::fabs(t1_big - t1_small) < 1e-9, "single device prefill should not depend on n_batch");
++    }
++
+     // auto: decode-heavy request behaves like decode, prompt-heavy like prefill
+     {
+         common_split_workload chat = wl;
+-- 
+2.43.0
+

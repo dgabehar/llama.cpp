@@ -207,6 +207,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    llama_build(test-state-capture.cpp)
+
+    llama_test(
+        test-state-capture
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-state-capture PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-state-capture
+        NAME test-state-capture-nemotron-h
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+    )
+    set_tests_properties(test-state-capture-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
@@ -261,6 +282,7 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
+llama_build_and_test(test-split-balance.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)

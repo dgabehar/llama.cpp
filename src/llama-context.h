@@ -40,6 +40,13 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// a piece of the host part of a captured sequence state
+struct llama_state_capture_host_seg {
+    size_t dst;  // offset in the state
+    size_t src;  // offset in the host bytes
+    size_t size;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -157,6 +164,10 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    bool   state_seq_capture_add  (llama_seq_id seq_id, llama_pos pos, llama_state_seq_flags flags);
+    size_t state_seq_capture_get  (llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size, llama_pos * pos_min, llama_pos * pos_max);
+    void   state_seq_capture_clear();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -249,6 +260,9 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // reserves the worst-case prompt-processing graph, see sched_plan_worst_pp
+    bool graph_reserve_worst_pp(const llama_memory_context_i * mctx);
+
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
@@ -349,6 +363,12 @@ private:
 
     bool sched_need_reserve = true;
 
+    // true while the scheduler's allocation plan is the worst-case prompt-processing
+    // graph from sched_reserve; small graphs (token generation) replace that plan, and
+    // allocating large graphs against a plan sized for the current graph reallocates
+    // (and synchronizes every backend) each time the KV cache grows
+    bool sched_plan_worst_pp = false;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -383,6 +403,49 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // state captures taken inside decode(), see llama_state_seq_capture_add
+    struct state_capture {
+        llama_seq_id          seq_id;
+        llama_pos             pos;
+        llama_state_seq_flags flags;
+
+        bool      taken   = false;
+        bool      read    = false; // device copies have been read into data
+        llama_pos pos_min = -1;
+        llama_pos pos_max = -1;
+
+        std::vector<uint8_t> data; // the assembled state, once read
+
+        // the host part of the state (small), placed into data at dst when it is assembled
+        std::vector<uint8_t> host;
+        std::vector<llama_state_capture_host_seg> host_segs;
+        size_t n_bytes = 0; // size of the state
+
+        // on-device copies of the tensor ranges, read into data at dst on first access
+        struct range {
+            ggml_tensor * cpy;
+            size_t        dst;
+            size_t        size;
+        };
+        std::vector<range> ranges;
+
+        std::vector<ggml_context_ptr>        ctxs;
+        std::vector<ggml_backend_buffer_ptr> bufs;
+
+        // recorded after the copies on each device: reading waits for these, not for the whole context
+        std::vector<ggml_backend_event_ptr> events;
+        bool need_sync = false; // a device without events: reading synchronizes the context
+    };
+
+    std::vector<state_capture> state_captures;
+
+    // buffers of cleared captures, reused by later ones
+    std::vector<ggml_backend_buffer_ptr> state_capture_pool;
+
+    // take the captures whose token is in the ubatch just processed (again, if the seq was rolled back and
+    // processed again, so the last pass wins)
+    void state_captures_take(const llama_ubatch & ubatch);
 
     bool has_evaluated_once = false;
 

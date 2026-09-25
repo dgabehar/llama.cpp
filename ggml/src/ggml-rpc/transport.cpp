@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -18,9 +19,19 @@
 #  include <unistd.h>
 #endif
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #include <optional>
+
+// Writing to a socket whose peer has gone away must fail with EPIPE, not
+// raise SIGPIPE: the default action kills the process, and with it every
+// other client of an rpc-server.
+#if defined(MSG_NOSIGNAL)
+#  define RPC_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define RPC_SEND_FLAGS 0
+#endif
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -490,8 +501,13 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, RPC_SEND_FLAGS);
         if (n < 0) {
+#ifndef _WIN32
+            if (errno == EINTR) {
+                continue;
+            }
+#endif
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
             return false;
@@ -516,6 +532,11 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
+#ifndef _WIN32
+            if (errno == EINTR) {
+                continue;
+            }
+#endif
             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
                            bytes_recv, size_to_recv);
             return false;
@@ -635,21 +656,123 @@ static bool set_no_delay(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static void set_no_sigpipe(sockfd_t sockfd) {
+#if defined(SO_NOSIGPIPE)
+    int flag = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int));
+#else
+    GGML_UNUSED(sockfd);
+#endif
+}
+
 static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
     return ret == 0;
 }
 
-socket_ptr socket_t::accept() {
+bool socket_t::set_keepalive(int idle_sec, int interval_sec, int count) {
+    sockfd_t fd = pimpl->fd;
+    int on = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&on, sizeof(on)) != 0) {
+        return false;
+    }
+#if defined(__linux__)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle_sec,     sizeof(idle_sec))     != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &count,        sizeof(count))        != 0) {
+        return false;
+    }
+#elif defined(__APPLE__)
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle_sec,     sizeof(idle_sec))     != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &count,        sizeof(count))        != 0) {
+        return false;
+    }
+#else
+    GGML_UNUSED(idle_sec);
+    GGML_UNUSED(interval_sec);
+    GGML_UNUSED(count);
+#endif
+    return true;
+}
+
+bool socket_t::set_recv_timeout(int sec) {
+    sockfd_t fd = pimpl->fd;
+#ifdef _WIN32
+    DWORD tv = (DWORD) sec * 1000;
+#else
+    timeval tv = {};
+    tv.tv_sec = sec;
+#endif
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
+}
+
+void socket_t::shutdown() {
+#ifdef _WIN32
+    ::shutdown(pimpl->fd, SD_BOTH);
+#else
+    ::shutdown(pimpl->fd, SHUT_RDWR);
+#endif
+}
+
+std::string socket_t::peer_address() const {
+    sockaddr_storage addr = {};
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(pimpl->fd, reinterpret_cast<sockaddr *>(&addr), &addr_len) != 0) {
+        return "unknown";
+    }
+    char host[INET6_ADDRSTRLEN] = {};
+    int port = 0;
+    if (addr.ss_family == AF_INET) {
+        const auto * a = reinterpret_cast<const sockaddr_in *>(&addr);
+        inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
+        port = ntohs(a->sin_port);
+    } else if (addr.ss_family == AF_INET6) {
+        const auto * a = reinterpret_cast<const sockaddr_in6 *>(&addr);
+        inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host));
+        port = ntohs(a->sin6_port);
+    } else {
+        return "unknown";
+    }
+    return std::string(host) + ":" + std::to_string(port);
+}
+
+socket_ptr socket_t::accept(bool * fatal) {
+    if (fatal) {
+        *fatal = false;
+    }
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
+#ifdef _WIN32
+        const int err = WSAGetLastError();
+        const bool is_fatal = err == WSAENOTSOCK || err == WSAEINVAL || err == WSAEOPNOTSUPP || err == WSAEFAULT;
+#else
+        const int err = errno;
+        const bool is_fatal = err == EBADF || err == EINVAL || err == ENOTSOCK || err == EOPNOTSUPP || err == EFAULT;
+        if (err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM) {
+            // out of fds/memory: back off instead of spinning on accept()
+            usleep(100 * 1000);
+        }
+#endif
+        if (err != EINTR) {
+            GGML_LOG_ERROR("accept failed: %s\n", strerror(err));
+        }
+        if (fatal) {
+            *fatal = is_fatal;
+        }
         return nullptr;
     }
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+#ifdef _WIN32
+        closesocket(client_socket_fd);
+#else
+        close(client_socket_fd);
+#endif
         return nullptr;
     }
+    set_no_sigpipe(client_socket_fd);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
@@ -674,7 +797,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, SOMAXCONN) < 0) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
@@ -701,6 +824,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
+    set_no_sigpipe(sockfd);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 

@@ -13893,18 +13893,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
-    uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
+    bool     flops_cap_timeout = false;
 
     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
         if (ctx->device->architecture == AMD_GCN && ctx->device->shader_core_count < 32) {
             flops_cap = 500'000'000ULL * ctx->device->shader_core_count;
+            flops_cap_timeout = true;
         } else if (ctx->device->architecture != AMD_GCN && ctx->device->shader_core_count < 24) {
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
+            flops_cap_timeout = true;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // Size the batches from this graph's own work. Using the previous graph's total instead
+    // makes the first large graph after a small one (e.g. a prompt ubatch after a single-token
+    // decode) submit almost every node separately; on amdgpu those submits fill the kernel job
+    // queue and graph_compute blocks until the GPU drains, which defeats pipeline parallelism.
+    uint64_t graph_flops = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+    }
+    uint64_t flops_per_submit = std::min(flops_cap, graph_flops / 40u);
+    // Each submit is a job in the kernel's queue (amdgpu sched_jobs, 32 by default). With too many of them
+    // vkQueueSubmit blocks until the GPU catches up and graph_compute is no longer asynchronous, so with
+    // pipeline parallelism the host can't feed the next device. Keep the flop-sized submits of a graph
+    // well below that, except where the cap above protects against the driver timeout.
+    if (!flops_cap_timeout) {
+        constexpr uint64_t n_submits_max = 12;
+        flops_per_submit = std::max(flops_per_submit, graph_flops / n_submits_max);
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -13943,7 +13961,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         {
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
-            total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
             if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
@@ -14249,7 +14266,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask = 0;
     }
 
-    ctx->last_total_flops = total_flops;
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -14798,6 +14814,31 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
+// Host RAM the kernel could hand out now (MemAvailable), or SIZE_MAX if unknown.
+// The GTT budget of an integrated GPU only counts GPU allocations, not the host
+// memory that other processes already hold, so on its own it over-reports free.
+static size_t ggml_vk_host_mem_available() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        unsigned long long kb = 0;
+        bool found = false;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                found = true;
+                break;
+            }
+        }
+        fclose(f);
+        if (found) {
+            return (size_t) kb * 1024;
+        }
+    }
+#endif
+    return SIZE_MAX;
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
@@ -14822,12 +14863,20 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
         if (is_integrated_gpu || (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
             *total += heap.size;
 
+            size_t heap_free = heap.size;
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
-            } else {
-                *free += heap.size;
+                heap_free = budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
             }
+            *free += heap_free;
         }
+    }
+
+    // An integrated GPU's heaps are carved out of host RAM: RADV, for one, splits GTT into a
+    // device-local and a host heap. Their budgets only count GPU allocations, not what other
+    // processes hold, so cap the total at what the host has available. This under-reports by
+    // at most the BIOS VRAM carve-out, which is not part of MemAvailable.
+    if (is_integrated_gpu) {
+        *free = std::min(*free, ggml_vk_host_mem_available());
     }
 }
 

@@ -22,6 +22,9 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <list>
+#include <chrono>
+#include <functional>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -32,7 +35,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Lost the connection to the RPC server (it exited, restarted or is unreachable) or it sent a malformed response")
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
@@ -353,6 +356,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
+    if (response.major == 0 && response.minor == 0 && response.patch == 0) {
+        GGML_LOG_ERROR("RPC server refused the connection: all of its client slots are in use (rpc-server --max-clients)\n");
+        return false;
+    }
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
@@ -1143,13 +1150,45 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+// Server-wide state shared by every connection.
+struct rpc_server_context {
+    std::vector<ggml_backend_dev_t> devices;
+    size_t                          n_threads = 1;
+    const char *                    cache_dir = nullptr;
+
+    // serialize_compute: every connection shares one backend per device and
+    // graph computes are serialized per device. Otherwise each connection
+    // lazily creates its own backend instances (the same way several
+    // llama_contexts share a device), so connections compute concurrently.
+    bool                                     serialize_compute = false;
+    std::vector<ggml_backend_t>              shared_backends;
+    std::vector<std::unique_ptr<std::mutex>> device_mutexes;
+};
+
+static ggml_backend_t rpc_server_init_backend(ggml_backend_dev_t dev, size_t n_threads) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) {
+        GGML_LOG_ERROR("Failed to create backend for device %s\n", ggml_backend_dev_name(dev));
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg) {
+        auto set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads_fn) {
+            set_n_threads_fn(backend, n_threads);
+        }
+    }
+    return backend;
+}
+
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
-        stored_graphs.resize(backends.size());
+    rpc_server(rpc_server_context & sctx) : sctx(sctx), cache_dir(sctx.cache_dir) {
+        backends.resize(sctx.devices.size(), nullptr);
+        stored_graphs.resize(sctx.devices.size());
     }
     ~rpc_server();
+    size_t n_devices() const { return sctx.devices.size(); }
 
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
@@ -1181,8 +1220,14 @@ private:
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
+    ggml_backend_t get_backend(uint32_t device);
+    ggml_backend_buffer_type_t get_buft(uint32_t device) const {
+        return ggml_backend_dev_buffer_type(sctx.devices[device]);
+    }
 
-
+    rpc_server_context & sctx;
+    // per-connection backend instances, created on first compute; unused when
+    // sctx.serialize_compute is set
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
@@ -1197,9 +1242,19 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
+ggml_backend_t rpc_server::get_backend(uint32_t device) {
+    if (sctx.serialize_compute) {
+        return sctx.shared_backends[device];
+    }
+    if (backends[device] == nullptr) {
+        backends[device] = rpc_server_init_backend(sctx.devices[device], sctx.n_threads);
+    }
+    return backends[device];
+}
+
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
     uint32_t dev_id = request.device;
-    if (dev_id >= backends.size()) {
+    if (dev_id >= n_devices()) {
         return false;
     }
     ggml_backend_buffer_type_t buft;
@@ -1227,7 +1282,7 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     LOG_DBG("[%s] device: %d, buffer: %p, data: %p\n", __func__, dev_id, (void*)tensor->buffer, tensor->data);
     if (tensor->buffer == nullptr) {
         //No buffer allocated.
-        buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+        buft = get_buft(dev_id);
     } else {
         buft = tensor->buffer->buft;
     }
@@ -1239,10 +1294,10 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
 
 bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
     uint32_t dev_id = request.device;
-    if (dev_id >= backends.size()) {
+    if (dev_id >= n_devices()) {
         return false;
     }
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = get_buft(dev_id);
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
     response.remote_size = 0;
@@ -1260,10 +1315,10 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
 
 bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response) {
     uint32_t dev_id = request.device;
-    if (dev_id >= backends.size()) {
+    if (dev_id >= n_devices()) {
         return false;
     }
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = get_buft(dev_id);
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     LOG_DBG("[%s] device: %d, alignment: %lu\n", __func__, dev_id, alignment);
     response.alignment = alignment;
@@ -1272,10 +1327,10 @@ bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_ms
 
 bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response) {
     uint32_t dev_id = request.device;
-    if (dev_id >= backends.size()) {
+    if (dev_id >= n_devices()) {
         return false;
     }
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+    ggml_backend_buffer_type_t buft = get_buft(dev_id);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
     LOG_DBG("[%s] device: %d, max_size: %lu\n", __func__, dev_id, max_size);
     response.max_size = max_size;
@@ -1403,8 +1458,13 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        // a bad tensor from one client must not abort the server (and every other client)
+        if (tensor->data + tensor_size < tensor->data ||
+            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", size=%" PRIu64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+                           __func__, tensor->data, tensor_size, buffer_start, buffer_start + buffer_size);
+            return nullptr;
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1465,9 +1525,22 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
         // save to cache_dir/hash_str
         fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        // several connections may cache the same tensor at once: write a
+        // private temp file and rename it into place atomically
+        fs::path tmp_file = cache_file;
+        tmp_file += ".tmp." + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        {
+            std::ofstream ofs(tmp_file, std::ios::binary);
+            ofs.write((const char *)data, size);
+        }
+        std::error_code ec;
+        fs::rename(tmp_file, cache_file, ec);
+        if (ec) {
+            GGML_LOG_WARN("[%s] failed to save '%s': %s\n", __func__, cache_file.string().c_str(), ec.message().c_str());
+            fs::remove(tmp_file, ec);
+        } else {
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -1712,7 +1785,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     uint32_t device;
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
-    if (device >= backends.size()) {
+    if (device >= n_devices()) {
         return false;
     }
     uint32_t n_nodes;
@@ -1769,15 +1842,29 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    ggml_backend_t backend = get_backend(device);
+    if (backend == nullptr) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock;
+    if (sctx.serialize_compute) {
+        lock = std::unique_lock<std::mutex>(*sctx.device_mutexes[device]);
+    }
+    ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        // RPC has no way to report a compute failure to the client, so drop
+        // this connection instead of aborting the server for every client.
+        GGML_LOG_ERROR("[%s] graph computation failed on device %u, status: %d\n", __func__, device, (int) status);
+        stored_graphs[device].graph = nullptr;
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     uint32_t device = request.device;
-    if (device >= backends.size()) {
+    if (device >= n_devices()) {
         return false;
     }
     if (stored_graphs[device].graph == nullptr) {
@@ -1785,18 +1872,29 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    ggml_backend_t backend = get_backend(device);
+    if (backend == nullptr) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock;
+    if (sctx.serialize_compute) {
+        lock = std::unique_lock<std::mutex>(*sctx.device_mutexes[device]);
+    }
+    ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph computation failed on device %u, status: %d\n", __func__, device, (int) status);
+        return false;
+    }
     return true;
 }
 
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
     uint32_t dev_id = request.device;
-    if (dev_id >= backends.size()) {
+    if (dev_id >= n_devices()) {
         return false;
     }
     size_t free, total;
-    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    ggml_backend_dev_t dev = sctx.devices[dev_id];
     ggml_backend_dev_memory(dev, &free, &total);
     response.free_mem = free;
     response.total_mem = total;
@@ -1808,11 +1906,17 @@ rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
+    for (auto backend : backends) {
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
+    }
 }
 
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+// `admit` is asked for a client slot once the HELLO has arrived: connections that never complete a
+// HELLO (TCP health probes, port scans, stuck peers) never hold a slot.
+static void rpc_serve_client(rpc_server_context & sctx, socket_ptr sock, const std::function<bool()> & admit) {
+    rpc_server server(sctx);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1839,7 +1943,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         return;
     }
 
+    // a connected client may stay idle for as long as it likes
+    sock->set_recv_timeout(0);
+
     rpc_msg_hello_rsp rsp = {};
+    if (!admit()) {
+        // all-zero version: the client reports that the server is full
+        send_msg(sock, &rsp, sizeof(rsp));
+        return;
+    }
     server.hello(rsp);
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
@@ -1868,7 +1980,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_device_count_rsp response;
-                response.device_count = backends.size();
+                response.device_count = server.n_devices();
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
@@ -2078,38 +2190,73 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+struct ggml_backend_rpc_server_params ggml_backend_rpc_server_default_params(void) {
+    ggml_backend_rpc_server_params params = {};
+    params.max_clients       = 8;
+    params.keepalive_sec     = 30;
+    params.serialize_compute = false;
+    return params;
+}
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    ggml_backend_rpc_server_params params = ggml_backend_rpc_server_default_params();
+    ggml_backend_rpc_start_server_ex(endpoint, cache_dir, n_threads, n_devices, devices, &params);
+}
+
+struct rpc_connection {
+    uint64_t          id = 0;
+    std::string       peer;
+    socket_ptr        sock;
+    std::atomic<bool> handshaking{true};
+    std::thread       thread;
+    std::atomic<bool> done{false};
+};
+
+void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir,
+                                      size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                      const struct ggml_backend_rpc_server_params * params) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
-    std::vector<ggml_backend_t> backends;
+    const ggml_backend_rpc_server_params sparams = params ? *params : ggml_backend_rpc_server_default_params();
+
+    rpc_server_context sctx;
+    sctx.devices.assign(devices, devices + n_devices);
+    sctx.n_threads         = n_threads;
+    sctx.cache_dir         = cache_dir;
+    sctx.serialize_compute = sparams.serialize_compute;
+
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("  max clients    : %u%s\n", sparams.max_clients, sparams.max_clients == 0 ? " (unlimited)" : "");
+    printf("  keepalive      : %u s%s\n", sparams.keepalive_sec, sparams.keepalive_sec == 0 ? " (disabled)" : "");
+    printf("  compute        : %s\n", sparams.serialize_compute ? "shared backends, serialized per device" : "per-connection backends");
     printf("Devices:\n");
-    for (size_t i = 0; i < n_devices; i++) {
-        auto dev = devices[i];
+    for (auto dev : sctx.devices) {
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
                total / 1024 / 1024, free / 1024 / 1024);
-        auto backend = ggml_backend_dev_init(dev, nullptr);
-        if (!backend) {
-            fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+        // Initialize every device once up front, so an unusable device fails
+        // at startup rather than on a client's first graph compute.
+        ggml_backend_t backend = rpc_server_init_backend(dev, n_threads);
+        if (backend == nullptr) {
+            for (auto b : sctx.shared_backends) {
+                ggml_backend_free(b);
+            }
             return;
         }
-        backends.push_back(backend);
-        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg) {
-            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-            if (ggml_backend_set_n_threads_fn) {
-                ggml_backend_set_n_threads_fn(backend, n_threads);
-            }
+        if (sctx.serialize_compute) {
+            sctx.shared_backends.push_back(backend);
+            sctx.device_mutexes.push_back(std::make_unique<std::mutex>());
+        } else {
+            ggml_backend_free(backend);
         }
     }
 
@@ -2133,20 +2280,130 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
-    while (true) {
-        auto client_socket = server_socket->accept();
-        if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
+    fflush(stdout);
+
+    // Each connection is served on its own thread: a llama-server client holds
+    // its connection open for the lifetime of the model, so serving
+    // connections one at a time starves every other client (and TCP health
+    // probes) behind the first one. Only this thread touches `conns`.
+    //
+    // A connection takes a client slot only once its HELLO arrives, and the
+    // HELLO must arrive within a timeout. Health probes and idle sockets that
+    // never speak therefore neither hold slots nor delay accepting others.
+    constexpr int      handshake_timeout_sec = 10;
+    constexpr uint32_t max_handshakes        = 64; // connections still waiting for their HELLO
+    std::list<std::unique_ptr<rpc_connection>> conns;
+    std::mutex         slots_mutex;
+    std::condition_variable slots_cv;
+    uint32_t           n_active = 0;
+    std::atomic<uint32_t> n_handshaking{0};
+    uint64_t next_id = 1;
+    auto reap = [&conns]() {
+        for (auto it = conns.begin(); it != conns.end(); ) {
+            if ((*it)->done.load()) {
+                (*it)->thread.join();
+                it = conns.erase(it);
+            } else {
+                ++it;
+            }
         }
-        printf("Accepted client connection\n");
-        fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
-        printf("Client connection closed\n");
-        fflush(stdout);
+    };
+    while (true) {
+        bool fatal = false;
+        auto client_socket = server_socket->accept(&fatal);
+        if (client_socket == nullptr) {
+            if (fatal) {
+                fprintf(stderr, "Failed to accept client connection, shutting down\n");
+                break;
+            }
+            reap(); // finished connections still hold their fds until reaped
+            continue; // transient (aborted handshake, EINTR, fd/memory pressure); keep serving
+        }
+        reap();
+        std::string peer = client_socket->peer_address();
+        if (n_handshaking.load() >= max_handshakes) {
+            // make room by closing the connection that has waited longest: a real client sends its
+            // HELLO right after connecting, so a flood of silent connections can't keep it out
+            for (auto & other : conns) {
+                if (other->handshaking.load() && !other->done.load()) {
+                    printf("Closing connection %" PRIu64 " (%s): %u connections have not sent HELLO yet\n",
+                           other->id, other->peer.c_str(), max_handshakes);
+                    fflush(stdout);
+                    other->sock->shutdown();
+                    other->handshaking.store(false); // its thread still does the accounting
+                    break;
+                }
+            }
+        }
+        if (!client_socket->set_recv_timeout(handshake_timeout_sec)) {
+            GGML_LOG_WARN("Failed to set the handshake timeout for %s\n", peer.c_str());
+        }
+        if (sparams.keepalive_sec > 0) {
+            const int idle     = (int) sparams.keepalive_sec;
+            const int interval = std::max(1, idle / 3);
+            if (!client_socket->set_keepalive(idle, interval, 3)) {
+                GGML_LOG_WARN("Failed to enable TCP keepalive for client %s\n", peer.c_str());
+            }
+        }
+        auto conn  = std::make_unique<rpc_connection>();
+        conn->id   = next_id++;
+        conn->peer = peer;
+        conn->sock = client_socket;
+        rpc_connection * c = conn.get();
+        n_handshaking++;
+        c->thread = std::thread([&sctx, &sparams, &slots_mutex, &slots_cv, &n_active, &n_handshaking, c, client_socket]() {
+            bool handshaking = true;
+            bool admitted    = false;
+            auto admit = [&]() {
+                handshaking = false;
+                c->handshaking.store(false);
+                n_handshaking--;
+                std::unique_lock<std::mutex> lock(slots_mutex);
+                // a client that has just closed keeps its slot until its thread sees the EOF; give
+                // that a moment, so a quick reconnect at the cap is not rejected
+                slots_cv.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+                    return sparams.max_clients == 0 || n_active < sparams.max_clients;
+                });
+                if (sparams.max_clients > 0 && n_active >= sparams.max_clients) {
+                    printf("Rejected client %" PRIu64 " (%s): %u of %u connections in use\n", c->id, c->peer.c_str(), n_active, sparams.max_clients);
+                    fflush(stdout);
+                    return false;
+                }
+                n_active++;
+                admitted = true;
+                printf("Accepted client %" PRIu64 " (%s), %u active\n", c->id, c->peer.c_str(), n_active);
+                fflush(stdout);
+                return true;
+            };
+            try {
+                rpc_serve_client(sctx, client_socket, admit);
+            } catch (const std::exception & e) {
+                // an exception escaping a thread would std::terminate the whole server
+                GGML_LOG_ERROR("Client %" PRIu64 " (%s): %s\n", c->id, c->peer.c_str(), e.what());
+            }
+            if (handshaking) {
+                n_handshaking--;
+            }
+            if (admitted) {
+                {
+                    std::lock_guard<std::mutex> lock(slots_mutex);
+                    n_active--;
+                }
+                slots_cv.notify_all();
+                printf("Client %" PRIu64 " (%s) disconnected\n", c->id, c->peer.c_str());
+                fflush(stdout);
+            }
+            // the connection keeps a reference to the socket until it is reaped, so end it here
+            client_socket->shutdown();
+            c->done.store(true);
+        });
+        conns.push_back(std::move(conn));
+    }
+    for (auto & conn : conns) {
+        conn->thread.join();
     }
     rpc_transport_shutdown();
-    for (auto backend : backends) {
+    for (auto backend : sctx.shared_backends) {
         ggml_backend_free(backend);
     }
 }
@@ -2291,6 +2548,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_ex") == 0) {
+        return (void *)ggml_backend_rpc_start_server_ex;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_default_params") == 0) {
+        return (void *)ggml_backend_rpc_server_default_params;
     }
     return NULL;
 

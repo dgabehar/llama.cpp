@@ -1,0 +1,82 @@
+From b1ff71165c3ba895e6bf240db11f61f1df352ec7 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 23:45:55 -0500
+Subject: [PATCH] vulkan : size submit batches from the current graph's flops
+
+flops_per_submit was derived from the previous graph's total flops. The
+first large graph after a small one (a prompt ubatch after 1-token
+decode) got a tiny per-submit budget, so it submitted almost every node
+separately. On amdgpu that fills the 32-job scheduler queue, the submit
+ioctl blocks, and graph_compute turns synchronous -- which also stops
+pipeline parallelism across devices (~1.1 s stall on the first ubatch
+on gfx1151).
+
+Sum the current graph's flops in one pass before the submit loop and
+drop last_total_flops.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h |  1 -
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp     | 13 +++++++++----
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index ad7f7b718..11ebc1219 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1239,7 +1239,6 @@ struct ggml_backend_vk_context {
+     bool do_add_rms_partials_offset_calculation;
+     bool do_add_rms_partials;
+ 
+-    uint64_t last_total_flops {UINT64_MAX};
+ 
+     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
+     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index fa2f12229..fa56a0772 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -13893,7 +13893,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     uint32_t submitted_nodes = 0;
+     uint32_t submit_count = 0;
+     uint64_t batch_flops = 0;
+-    uint64_t total_flops = 0;
+     uint64_t flops_cap = 200'000'000'000ULL;
+ 
+     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
+@@ -13904,7 +13903,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
+         }
+     }
+-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
++    // Size the batches from this graph's own work. Using the previous graph's total instead
++    // makes the first large graph after a small one (e.g. a prompt ubatch after a single-token
++    // decode) submit almost every node separately; on amdgpu those submits fill the kernel job
++    // queue and graph_compute blocks until the GPU drains, which defeats pipeline parallelism.
++    uint64_t graph_flops = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
++    }
++    uint64_t flops_per_submit = std::min(flops_cap, graph_flops / 40u);
+ 
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+@@ -13943,7 +13950,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         {
+             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+-            total_flops += node_flops;
+ 
+             // Flush the current batch before recording a node that would push it over the flop threshold
+             if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+@@ -14249,7 +14255,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_ops_write_mask = 0;
+     }
+ 
+-    ctx->last_total_flops = total_flops;
+ 
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+-- 
+2.43.0
+

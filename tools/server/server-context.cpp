@@ -256,6 +256,24 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // context checkpoints captured inside the current batch instead of splitting it
+    // (see llama_state_seq_capture_add)
+    struct ckpt_capture {
+        int64_t   n_tokens; // prompt tokens covered by the checkpoint
+        llama_pos pos;      // position of the last of them
+        int32_t   i_batch;  // index of that token in the batch
+
+        // set once the batch holding it has been submitted; it is read after a later llama_decode()
+        // has been submitted too, so that reading it does not drain the pipeline
+        bool    decoded    = false;
+        int64_t decoded_at = 0;     // server_context_impl::n_decodes at that point
+        int64_t n_end      = 0;     // where the batch starting here would have ended
+        int64_t n_task     = 0;
+        bool    is_user_start        = false;
+        bool    is_last_user_message = false;
+    };
+    std::vector<ckpt_capture> ckpt_captures;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -916,6 +934,11 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // take mid-batch context checkpoints with llama_state_seq_capture_add instead of splitting the batch
+    bool ckpt_capture     = false;
+    bool ckpt_capture_dft = false; // capture the draft state too (it can't be trimmed back after the batch)
+    int64_t n_decodes     = 0;     // successful llama_decode() calls of the target context
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1292,6 +1315,36 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+        }
+
+        // Splitting the batch at a checkpoint drains a multi-device pipeline and runs the next ubatch on
+        // one device at a time. Capturing the state inside the batch avoids that. A draft state that can be
+        // trimmed back (partial seq_rm) is read after the batch and trimmed on restore, otherwise it is
+        // captured too. The eagle3 boundary state is per batch, so eagle3 keeps splitting.
+        {
+            const auto & types = params_base.speculative.types;
+            const bool has_eagle3 = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != types.end();
+
+            // Only a layer split across devices gains: on one device the batch split costs nothing and
+            // the in-batch cut leaves shorter ubatches (Qwen3.8-27B on one GPU: -12-15% prompt speed).
+            const bool multi_device = llama_model_n_devices_used(model_tgt) > 1;
+
+            ckpt_capture     = params_base.n_ctx_checkpoints > 0 && !has_eagle3 && multi_device;
+            ckpt_capture_dft = ctx_dft != nullptr && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
+            // LLAMA_SERVER_CKPT_CAPTURE: an off value disables it, an on value enables it on one device too,
+            // anything else (including "") keeps the default
+            if (const char * env = getenv("LLAMA_SERVER_CKPT_CAPTURE")) {
+                std::string v = env;
+                std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) { return (char) std::tolower(ch); });
+                if (v == "0" || v == "false" || v == "off" || v == "no") {
+                    ckpt_capture = false;
+                } else if (v == "1" || v == "true" || v == "on" || v == "yes") {
+                    ckpt_capture = params_base.n_ctx_checkpoints > 0 && !has_eagle3;
+                }
+            }
+
+            SRV_INF("context checkpoints inside a batch: %s\n", ckpt_capture ? (ckpt_capture_dft ? "captured (with draft)" : "captured") : "split");
         }
 
         if (spec) {
@@ -2328,8 +2381,10 @@ private:
         return true;
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // n_tokens_ckpt: the number of prompt tokens covered by the checkpoint
+    // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
+            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2363,7 +2418,7 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const int64_t n_tokens_new = n_tokens_ckpt;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -2381,10 +2436,18 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_ckpt, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (data_tgt) {
+            cur.data_tgt = std::move(*data_tgt);
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        if (data_dft) {
+            cur.data_dft = std::move(*data_dft);
+        } else {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2522,6 +2585,11 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // a task may launch, save or restore a slot, which uses its checkpoints
+        if (!is_yielding) {
+            create_captured_checkpoints(true);
         }
 
         switch (task.type) {
@@ -3100,6 +3168,12 @@ private:
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
+                    if (ckpt_capture) {
+                        n_decodes++;
+                        mark_captures_decoded(off_next);
+                        create_captured_checkpoints(false);
+                    }
+
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
                 } else {
@@ -3119,6 +3193,109 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+    }
+
+    // create the context checkpoints captured in batch tokens before i_end, with the checks the start
+    // of a batch gets when the batch is split at each of them instead
+    // the batch up to i_end has been submitted: remember what the checkpoint decisions need
+    void mark_captures_decoded(int32_t i_end) {
+        for (auto & slot : slots) {
+            auto & caps = slot.ckpt_captures;
+            for (size_t i = 0; i < caps.size(); ++i) {
+                auto & cap = caps[i];
+                if (cap.decoded || cap.i_batch >= i_end) {
+                    continue;
+                }
+                cap.decoded    = true;
+                cap.decoded_at = n_decodes;
+                cap.n_end      = i + 1 < caps.size() ? caps[i + 1].n_tokens : (int64_t) slot.prompt.n_tokens();
+                if (slot.task) {
+                    const auto & spans = slot.task->params.message_spans;
+                    cap.n_task               = slot.task->n_tokens();
+                    cap.is_user_start        = spans.is_user_start(cap.n_tokens);
+                    cap.is_last_user_message = cap.n_tokens == spans.last_user_message_pos();
+                } else {
+                    cap.n_task = cap.n_end;
+                }
+            }
+        }
+    }
+
+    // turns captured states into context checkpoints: those submitted before the latest llama_decode(),
+    // or all submitted ones (before anything uses or saves the checkpoints of a slot)
+    void create_captured_checkpoints(bool all) {
+        if (!ckpt_capture) {
+            return;
+        }
+
+        bool pending = false;
+
+        for (auto & slot : slots) {
+            auto & caps = slot.ckpt_captures;
+
+            size_t n_done = 0;
+            for (; n_done < caps.size() && caps[n_done].decoded && (all || caps[n_done].decoded_at < n_decodes); ++n_done) {
+                const auto & cap = caps[n_done];
+
+                llama_pos pos_min = -1;
+                llama_pos pos_max = -1;
+
+                const size_t n = llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, nullptr, 0, &pos_min, &pos_max);
+                if (n == 0) {
+                    SLT_WRN(slot, "context checkpoint at n_tokens = %" PRId64 " was not captured\n", cap.n_tokens);
+                    continue;
+                }
+
+                const bool near_prompt_end = cap.n_task < cap.n_end + (int64_t) llama_n_ubatch(ctx_tgt);
+
+                const auto & checkpoints = slot.prompt.checkpoints;
+
+                bool do_checkpoint = pos_min >= 0;
+                do_checkpoint = do_checkpoint && (cap.n_end == cap.n_task || cap.is_user_start || near_prompt_end);
+                do_checkpoint = do_checkpoint && (
+                        checkpoints.empty() || cap.is_last_user_message || near_prompt_end ||
+                        cap.n_tokens > checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                SLT_DBG(slot, "capture/do_checkpoint = %s, n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d\n",
+                        do_checkpoint ? "yes" : "no", cap.n_tokens, pos_min, pos_max);
+
+                // the draft state: captured, not started yet, or read now and trimmed on restore
+                std::vector<uint8_t> data_dft;
+                bool read_dft_now = false;
+                if (do_checkpoint && ctx_dft) {
+                    const size_t n_dft = ckpt_capture_dft ? llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, nullptr, 0, nullptr, nullptr) : 0;
+                    if (n_dft > 0) {
+                        data_dft.resize(n_dft);
+                        llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, data_dft.data(), data_dft.size(), nullptr, nullptr);
+                    } else if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) < 0) {
+                        // draft not started for this seq, same as update_dft()
+                    } else if (!ckpt_capture_dft) {
+                        read_dft_now = true;
+                    } else {
+                        SLT_WRN(slot, "draft state for the context checkpoint at n_tokens = %" PRId64 " was not captured\n", cap.n_tokens);
+                        do_checkpoint = false;
+                    }
+                }
+
+                if (do_checkpoint) {
+                    std::vector<uint8_t> data(n);
+                    llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
+
+                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft);
+                }
+            }
+
+            caps.erase(caps.begin(), caps.begin() + n_done);
+
+            pending = pending || !caps.empty();
+        }
+
+        if (!pending) {
+            llama_state_seq_capture_clear(ctx_tgt);
+            if (ckpt_capture_dft) {
+                llama_state_seq_capture_clear(ctx_dft);
             }
         }
     }
@@ -3190,6 +3367,23 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+
+        if (ckpt_capture) {
+            // captures of an earlier batch that were never submitted (a failed decode) are dropped;
+            // submitted ones are read after this batch has been submitted
+            bool pending = false;
+            for (auto & slot : slots) {
+                auto & caps = slot.ckpt_captures;
+                caps.erase(std::remove_if(caps.begin(), caps.end(), [](const server_slot::ckpt_capture & c) { return !c.decoded; }), caps.end());
+                pending = pending || !caps.empty();
+            }
+            if (!pending) {
+                llama_state_seq_capture_clear(ctx_tgt);
+                if (ckpt_capture_dft) {
+                    llama_state_seq_capture_clear(ctx_dft);
+                }
+            }
+        }
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3763,12 +3957,39 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // capture the checkpoint state here if possible, otherwise end the batch here
+                        auto capture_checkpoint = [&]() {
+                            if (!ckpt_capture || has_mtmd || alora_scale > 0.0f) {
+                                return false;
+                            }
+
+                            const llama_pos pos = slot.prompt.tokens.pos_next() - 1;
+                            if (ckpt_capture_dft && !llama_state_seq_capture_add(ctx_dft, slot.id, pos, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                return false;
+                            }
+                            if (!llama_state_seq_capture_add(ctx_tgt, slot.id, pos, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                return false;
+                            }
+
+                            slot.ckpt_captures.push_back({ (int64_t) slot.prompt.n_tokens(), pos, (int32_t) batch.size() - 1 });
+
+                            return true;
+                        };
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            // a capture in this batch becomes the latest checkpoint
+                            const bool has_last = !checkpoints.empty() || !slot.ckpt_captures.empty();
+                            const int64_t n_last = !slot.ckpt_captures.empty() ? slot.ckpt_captures.back().n_tokens :
+                                                   !checkpoints.empty()        ? checkpoints.back().n_tokens : 0;
+
+                            if (pos == last_user_pos || !has_last || pos > n_last + params_base.checkpoint_min_step) {
+                                if (capture_checkpoint()) {
+                                    continue;
+                                }
                                 break;
                             }
                         }
@@ -3790,6 +4011,9 @@ private:
                                 }
                             }
                             if (should_break) {
+                                if (capture_checkpoint()) {
+                                    continue;
+                                }
                                 break;
                             }
                         }
@@ -3800,7 +4024,10 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // without captures the batch would have ended at the first one
+                    const int64_t n_tokens_end = slot.ckpt_captures.empty() ? (int64_t) slot.prompt.n_tokens() : slot.ckpt_captures.front().n_tokens;
+
+                    const bool near_prompt_end = slot.task->n_tokens() < n_tokens_end + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
@@ -3818,12 +4045,12 @@ private:
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
-                    } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
-                            do_checkpoint = false;
-                        }
+                    }
+
+                    // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+                    // message or we are near the end of the prompt
+                    if (n_tokens_end < slot.task->n_tokens() && !is_user_start && !near_prompt_end) {
+                        do_checkpoint = false;
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3848,7 +4075,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_start, pos_min, pos_max);
                     }
                 }
 
@@ -3867,6 +4094,9 @@ private:
         metrics_pre_decode();
 
         if (batch.size() == 0) {
+            // no later llama_decode() to overlap with: read what is left now
+            create_captured_checkpoints(true);
+
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {

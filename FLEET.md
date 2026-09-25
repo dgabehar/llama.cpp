@@ -119,6 +119,231 @@ obvious from the code alone. Flag this caveat to Murat/Dawn explicitly when
 testing this on gabesrv10 -- the A/B tok/s comparison is what determines
 whether the TODO is needed at all.
 
+## rpc-server multi-client (added 2026-09-23)
+
+Upstream `ggml-rpc-server` served one connection at a time
+(`while (true) { accept(); rpc_serve_client(); }` with `listen(fd, 1)`), and a
+llama-server master holds its RPC socket for the model's whole lifetime. So
+once a master connected, everything else sat in the kernel backlog: a second
+master, `--list-devices` (about 127s of SYN retries, then `GGML_ABORT "Failed
+to connect"`), and k8s `tcpSocket` probes. That's the root cause of the
+Aug-2026 worker liveness-kill problem (the chart's `failureThreshold: 45`
+workaround) and of the 2026-09-23 gabesrv10->gabesrv06 Thunderbolt test
+failures. Upstream issue ggml-org/llama.cpp#28908.
+
+Patches 0057-0061 and 0063 (see `fleet-patches/README.md`):
+
+- **Thread per connection** (0057-0058, upstream PR #28916 cherry-picks),
+  then 0059 replaces #28916's detached threads and global compute mutex
+  with a tracked connection list (joined, reaped, logged with id + peer),
+  `listen(fd, SOMAXCONN)`, and **per-connection backend instances**: each
+  connection gets its own `ggml_backend_dev_init()` backend, so clients
+  compute concurrently with no server-side lock. The device-level
+  queue/submit locking in the backends (e.g. Vulkan's `device->mutex`,
+  `device_submit_mutex`) handles the sharing, same as several llama
+  contexts on one GPU.
+- **New rpc-server flags:** `--max-clients N` (default 8, 0 = unlimited;
+  over the cap the socket is accepted and closed immediately),
+  `--keepalive N` (TCP keepalive idle seconds, default 30, so a vanished
+  master's buffers are freed in about 60s instead of never), and
+  `--serialize-compute` (fallback: one shared backend per device plus a
+  per-device mutex, in case a backend proves unsafe with several
+  instances).
+- **One client can't kill the others** (0060): `MSG_NOSIGNAL` on send (a
+  client that FIN-closed before its reply killed the server with SIGPIPE,
+  exit 141), transient `accept()` errors (fd exhaustion etc.) no longer end
+  the accept loop, and out-of-bounds tensors and failed graph computes now
+  close only that connection instead of `GGML_ASSERT`-aborting.
+  Tensor-cache writes are atomic (tmp + rename).
+- **Test:** `test-rpc-server-multiclient` (0061, label `main`, UNIX only).
+  Every case in it fails against the pre-fix server.
+
+No wire-protocol change; old clients work unchanged. Still open,
+client-side: the coordinator aborts when a worker dies (client half of
+upstream PR #26724), and `get_dispatcher` holds its global mutex during a
+blocking `connect`.
+
+**Live results (2026-09-23, gabesrv10 master -> gabesrv06 worker over
+Thunderbolt, hostNetwork raw pods, test image
+`llamacpp-rpc-server:commit-2120ac537...@sha256:2e6b361d...`):**
+
+- `--list-devices` from a second process while a master is connected:
+  0.24s (was a ~127s hang, then `GGML_ABORT "Failed to connect"`).
+- Two masters on one worker (Qwen3.8-27B + K2-Horizon-7B), concurrent
+  chat requests: correct answers, no worker errors. Per-connection backend
+  instances cost no measurable extra device memory (~28 MiB difference vs
+  `--serialize-compute`).
+- Dead master (flow black-holed with iptables, then SIGKILL, so no
+  FIN/RST reaches the worker): dropped by keepalive after ~36s, and worker
+  free memory returned to the expected level.
+- Probe racing a client at the cap got the client rejected; fixed in
+  patch 0063 (reap grace at the cap) with a regression test.
+- Throughput, Qwen3.8-27B Q4_K_XL, ~1.9k-token prompt + 256 tokens,
+  median of 3:
+
+  | setup | pp t/s | tg t/s | load |
+  |---|---|---|---|
+  | gabesrv10 alone | 283 | 11.6 | |
+  | split over Thunderbolt | 139 | 7.0 | 25s |
+  | split over LAN (192.168.1.x) | 124 | 6.9 | 64s |
+  | TB split, 2 masters concurrent, per-connection backends | 114 | 6.3 | |
+  | TB split, 2 masters concurrent, `--serialize-compute` | 112 | 6.6 | |
+
+  So: a split is much slower than one node for a model that fits on one
+  node. Only use RPC for models that don't fit. Thunderbolt mostly speeds
+  up loading. Steady-state speed is close to LAN, because a layer split
+  only sends activations per token. With two masters the GPU is the
+  bottleneck, so per-connection backends vs `--serialize-compute` is a
+  wash on throughput. Per-connection backends stay the default for
+  isolation, not speed.
+
+## Speed-aware split and pipeline fixes (added 2026-09-24)
+
+Why a gabesrv10 (8060S) + gabesrv06 (780M, RPC over Thunderbolt) split of
+Qwen3.8-27B ran at about half of gabesrv10 alone: **not RPC.** A decoded
+token needs one round trip and ~40 KB of inputs. A layer split runs the
+devices one after another, and the default split (proportional to free
+memory) put 23 of 64 layers on a GPU that is ~2.6x slower per layer for
+decode and ~3.7x for prefill. Prompt processing can overlap the devices
+across ubatches, but four things stopped that overlap:
+
+1. **`GGML_VK_MAX_NODES_PER_SUBMIT=1`** (fleet env). Every node became a
+   job in amdgpu's 32-job ring queue (`sched_jobs`), so `vkQueueSubmit`
+   blocked and `graph_compute` turned synchronous.
+2. **Vulkan sized submits from the previous graph's flops.** The first
+   prompt ubatch after a 1-token decode went out node by node, which is
+   the same blocking as item 1.
+3. **Too many flop-sized submits.** ~110 per 512-token ubatch on the 8060S,
+   so the queue filled anyway.
+4. **Scheduler reallocs and checkpoint breaks.** Scheduler reallocs synced
+   all backends when the ubatch shape changed. llama-server also split
+   every prompt at its context checkpoints, and each break drained the
+   pipeline.
+
+Patches (see `fleet-patches/README.md`):
+
+- **vulkan: size submits from the current graph** fixes item 2.
+- **llama: restore the worst-case sched plan before large ubatches** fixes
+  the reallocs.
+- **vulkan: keep a graph's flop-sized submits below the job queue** (at
+  most 12) fixes item 3. The weak-AMD timeout cap stays as it was.
+- **llama, server: capture context checkpoints inside a batch.** New
+  experimental `llama_state_seq_capture_add/get/clear`: the ubatch is cut at
+  the checkpoint token, and the state is copied on the device in stream
+  order. The server no longer splits the prompt for checkpoints.
+  - Saves are byte-identical to the old behavior when ubatch boundaries
+    match.
+  - `LLAMA_SERVER_CKPT_CAPTURE=0` restores the old behavior.
+  - eagle3 still splits.
+- **common: `--split-balance auto|decode|prefill|memory`**, default `auto`.
+  - At startup it times each device with synthetic matmuls shaped like the
+    model's layers (RPC devices over the normal protocol, so the worker
+    needs no change) and caches the result in
+    `~/.cache/llama.cpp/split-balance.json`, keyed by device, model shape
+    and build and re-measured after 7 days (`--split-calibrate force` to
+    redo it now).
+  - It picks layer counts that minimize the predicted time of a
+    `--split-workload P:G` request (default 4096:256), capped by the fit
+    memory projection.
+  - `memory` is the old behavior, for when the model only fits split.
+    An explicit `-ts` always wins.
+
+**Results (Qwen3.8-27B Q4_K_XL, llama-server, 1.9K / 8.1K-token prompts +
+256 generated tokens):**
+
+| config | layers on 06 | pp 1.9K | pp 8.1K | tg |
+|---|---|---|---|---|
+| before: memory split, old binary | 23 | 164* | | 7.2 |
+| `--split-balance memory` (new binary) | 23 | 175 | 185 | 6.8 |
+| `auto` (default, 4096:256) | 0 | 309 | 294 | 12.0 |
+| `auto`, `--split-workload 32768:16 -b 8192` (570db1ff4 only) | 13 | 261 | 312 | 7.8 |
+| fit-limited (`-fitt 1024,100000`), `memory` | 23 | 172 | 184 | 6.8 |
+| fit-limited, `auto` | 21 | 172 | 199 | 7.0 |
+
+\* at 20/80, the earlier measurement. The same split with the capture and
+scheduler fixes: 262.
+
+The 32768:16 row is from 570db1ff4. From d7cd53de7 on (dominant-type and
+n_batch-drain cost model), `auto` keeps that workload on gabesrv10 too.
+
+**Before/after, measured by QA (2026-09-24, image d963996 vs b5f1d1bd,
+llama-server, median of 3, drift 3%):**
+
+| config | pp 1.9K | pp 8.1K | tg |
+|---|---|---|---|
+| production today: old image, memory split (23 on 06), submit env on | 138.6 | 141.5 | 6.7 |
+| new image, `memory` split, capture on | 180.0 | 186.5 | 7.1 |
+| old image, 20/80 | 170 | 183 | 7.9 |
+| new image, 20/80 | 265 | 305 | 8.4 |
+| new image, `auto` (0 on 06) | 352 | 335 | 12.2 |
+| gabesrv10 alone, old image | 284 | 317 | |
+| gabesrv10 alone, new image | 347 | 330 | |
+
+**Using it in the chart:**
+
+- A master that reaches a worker over the Thunderbolt link must run with
+  `hostNetwork`. From the pod network, packets forwarded from `tb-*`
+  (MTU 65520, GRO) into the Calico veth (MTU 1450) are fragmented and dropped
+  (16% retransmits, pp 2.7 t/s).
+- `-ncmoe`/`-ot` patterns that match no tensor of the model (the chart's
+  `nCpuMoe` default on a dense model) don't disable balancing. Patterns that
+  do match keep the memory split.
+
+**In-batch checkpoint capture is for multi-device models only.** On one
+device it cost 12-15% prompt speed. The worst case was the gabesrv10 router
+(Qwen3.8-27B, MTP draft, `--parallel 3`, `-b/-ub 1024`), where QA measured
+0.85x on 1.5K-token prompts. llama-server now captures only when the model
+spans several non-CPU devices (`llama_model_n_devices_used`).
+`LLAMA_SERVER_CKPT_CAPTURE=1` forces it on anyway, and `=0` turns it off.
+
+A capture is read after the next `llama_decode()` has been submitted, and it
+waits on an event instead of synchronizing the context. Slot saves stay
+byte-identical to the split path.
+
+**Direct I/O (`--load-mode dio`)** now goes through a bounce buffer where the
+destination refuses DMA (EFAULT on amdgpu pinned memory). Before, the whole
+file fell back to buffered reads and filled the page cache.
+
+**MoE calibration:** MoE models are timed with `mul_mat_id` over their expert
+shape. gpt-oss-20b on a 3080 Ti:
+
+| | pp | tg |
+|---|---|---|
+| predicted | 1535 | 98.1 |
+| measured | 1796 | 99.6 |
+
+The dense matmul used before was off by about 2x.
+
+**rpc-server admission:** a connection takes a `--max-clients` slot only
+once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
+slot. At most 64 connections wait for their HELLO; the oldest is closed to
+make room. A client refused at the cap gets an all-zero HELLO version and
+reports "all of its client slots are in use".
+
+So for a model that fits on one node, `auto` keeps it there. RPC helps
+throughput only for long-prompt workloads, and only over Thunderbolt:
+over 1 GbE, prefill loses 9-21% and tg ~1.4%.
+
+**`GGML_VK_MAX_NODES_PER_SUBMIT=1` on gabesrv06/10 (B4):** stress-tested
+without it on this build, with the incident profile of 36-51K-token prompts:
+
+- gabesrv10: production Qwen3.8-27B flags (`--parallel 3`, draft-mtp,
+  `-b/-ub 1024`, 786K ctx). 6 prompts, 3 at a time.
+- gabesrv06: production gpt-oss-20b flags. 8 prompts.
+
+No DeviceLost and no amdgpu reset/timeout in dmesg. Both hosts already run
+`amdgpu.lockup_timeout=10000`, and each submit is capped far below that.
+The env can go from the 06/10 values. Keep it on gfx90c (gabesrv01/04),
+where the incident happened and the 2 s default timeout applies.
+
+**Not done, measured:**
+
+- **The KQ mask over RPC** costs ~0.13% of tg at 12K context over LAN
+  (below the 1% bar).
+- **`-sm tensor`** aborts on qwen35 hybrid ("view of permuted tensor not
+  implemented", `ggml-backend-meta.cpp:702`). It would also need an
+  all-reduce per layer over RPC.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on

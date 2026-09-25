@@ -1,0 +1,138 @@
+From b917b2aecc358ca03766d41ddf39f08e5818f861 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 23 Sep 2026 21:34:33 -0500
+Subject: [PATCH] rpc : don't reject a client because a just-closed probe still
+ holds a slot
+
+Found in the live gabesrv06/gabesrv10 test: with --max-clients 4 and
+two masters plus one held client connected, a TCP connect+close probe
+followed immediately by a real client got the real client rejected
+("Rejected client ...: 4 of 4 connections in use"). The probe's thread
+hadn't seen EOF yet, so its slot was still counted. A rejected
+llama-server client aborts, so a k8s tcpSocket probe racing a master
+connect at the cap could take the master down.
+
+At the cap, reap finished connections for up to 500 ms before
+rejecting. Probes release their slot within microseconds; a server
+that is genuinely full still rejects, just slightly later, and only
+while it is full.
+
+test-rpc-server-multiclient gains a probe-hello case (connect+close,
+then immediately connect+HELLO, 50 times at cap-1), which fails on the
+first iteration without this change.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp        | 26 +++++++++++++++++++-------
+ tests/test-rpc-server-multiclient.cpp | 25 +++++++++++++++++++++++++
+ tests/test-rpc-server-multiclient.sh  |  5 +++++
+ 3 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e55d1c3c1..0b2f672aa 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -23,6 +23,7 @@
+ #include <atomic>
+ #include <thread>
+ #include <list>
++#include <chrono>
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -2280,15 +2281,26 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
+             }
+             continue; // transient (aborted handshake, EINTR, fd/memory pressure); keep serving
+         }
+-        for (auto it = conns.begin(); it != conns.end(); ) {
+-            if ((*it)->done.load()) {
+-                (*it)->thread.join();
+-                it = conns.erase(it);
+-            } else {
+-                ++it;
++        auto reap = [&conns]() {
++            for (auto it = conns.begin(); it != conns.end(); ) {
++                if ((*it)->done.load()) {
++                    (*it)->thread.join();
++                    it = conns.erase(it);
++                } else {
++                    ++it;
++                }
+             }
+-        }
++        };
++        reap();
+         std::string peer = client_socket->peer_address();
++        // A connection that has just closed (e.g. a TCP health probe) keeps its
++        // slot until its thread notices EOF. Give such connections a moment to
++        // finish before rejecting, so a probe racing a real client at the cap
++        // doesn't get the client rejected.
++        for (int i = 0; i < 50 && sparams.max_clients > 0 && conns.size() >= sparams.max_clients; i++) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            reap();
++        }
+         if (sparams.max_clients > 0 && conns.size() >= sparams.max_clients) {
+             printf("Rejected client %s: %zu of %u connections in use\n", peer.c_str(), conns.size(), sparams.max_clients);
+             fflush(stdout);
+diff --git a/tests/test-rpc-server-multiclient.cpp b/tests/test-rpc-server-multiclient.cpp
+index e95efd3c9..9612986e6 100644
+--- a/tests/test-rpc-server-multiclient.cpp
++++ b/tests/test-rpc-server-multiclient.cpp
+@@ -190,6 +190,30 @@ static int mode_hello(const std::string & ep) {
+     return ok ? 0 : 1;
+ }
+ 
++// probe-hello EP N: N times, connect+close (a TCP health probe) and immediately
++// connect again and HELLO; the probe must not hold a slot against the client
++static int mode_probe_hello(const std::string & ep, int n) {
++    for (int i = 0; i < n; i++) {
++        int probe = connect_to(ep);
++        if (probe < 0) {
++            printf("probe-hello: probe connect FAILED\n");
++            return 1;
++        }
++        close(probe);
++        int fd = connect_to(ep);
++        bool ok = fd >= 0 && hello(fd);
++        if (fd >= 0) {
++            close(fd);
++        }
++        if (!ok) {
++            printf("probe-hello: client rejected right after probe %d\n", i);
++            return 1;
++        }
++    }
++    printf("probe-hello: %d ok\n", n);
++    return 0;
++}
++
+ // rejected EP: the server must accept and then immediately close the connection
+ static int mode_rejected(const std::string & ep) {
+     int fd = connect_to(ep);
+@@ -345,6 +369,7 @@ int main(int argc, char ** argv) {
+     auto arg = [&](int i, double def) { return argc > i ? std::atof(argv[i]) : def; };
+ 
+     if (mode == "hello")          { g_timeout_ms = (int) arg(3, 1000); return mode_hello(ep); }
++    if (mode == "probe-hello")    { g_timeout_ms = 2000; return mode_probe_hello(ep, (int) arg(3, 20)); }
+     if (mode == "rejected")       { return mode_rejected(ep); }
+     if (mode == "hold")           { return mode_hold(ep, arg(3, 2.0)); }
+     if (mode == "malformed")      { return mode_malformed(ep); }
+diff --git a/tests/test-rpc-server-multiclient.sh b/tests/test-rpc-server-multiclient.sh
+index 80c4a3422..94e2eabc2 100755
+--- a/tests/test-rpc-server-multiclient.sh
++++ b/tests/test-rpc-server-multiclient.sh
+@@ -99,6 +99,11 @@ sleep 0.5
+ "$client" rejected "$ep" || fail "client over the cap was not rejected"
+ wait "$h1" || fail "held client 1 broken by rejected client"
+ wait "$h2" || fail "held client 2 broken by rejected client"
++# a probe that just closed must not hold a slot against the next real client
++"$client" hold "$ep" 2 >/dev/null & h1=$!
++sleep 0.3
++"$client" probe-hello "$ep" 50 || fail "client rejected right after a probe closed (slot not reaped)"
++wait "$h1" || fail "held client broken by probes"
+ sleep 0.2
+ "$client" hello "$ep" 1000 || fail "slot not freed after clients left"
+ grep -q "Rejected client" "$test_dir/server.log" || fail "no rejection logged"
+-- 
+2.43.0
+
