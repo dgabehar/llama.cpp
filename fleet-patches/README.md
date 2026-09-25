@@ -134,6 +134,10 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0117 | `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
 | 0118 | `74405080c` | chat : drop whitespace between reasoning end tag and content |
 | 0119 | `b098565ad` | fleet: regenerate patch mirror for the round-7 fixes |
+| 0120 | `22a240a7a` | fleet: fix the patch mirror table numbering |
+| 0121 | `3d33f7e68` | fleet: fix the patch mirror table rows |
+| 0122 | `70f0d0168` | llama, common: fix -fit's oversized-context probe hard-aborting the server |
+| 0123 | `1bf5f2473` | server: fix 2 test_completion.py tests broken by test-only bugs, not the server |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
