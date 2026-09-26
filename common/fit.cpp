@@ -22,6 +22,19 @@ void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg) {
     tg = g_last_graph_nodes_tg;
 }
 
+uint32_t common_fit_clamp_ctx_to_free_memory(
+        uint32_t n_ctx_max, uint32_t n_ctx_min_total,
+        int64_t dev_free, int64_t fixed_use, int64_t margin, int64_t bytes_per_ctx) {
+    if (bytes_per_ctx <= 0) {
+        return n_ctx_max; // this device holds none of the KV cache, nothing to clamp
+    }
+    const int64_t budget = dev_free - fixed_use - margin;
+    const uint32_t n_ctx_safe = budget > 0
+        ? (uint32_t) std::min<int64_t>(n_ctx_max, budget / bytes_per_ctx)
+        : n_ctx_min_total;
+    return std::max(n_ctx_safe, n_ctx_min_total);
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -339,12 +352,65 @@ static void common_params_fit_impl(
         if (n_seq_max > 1) {
             LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_seq_max);
-            // a context this large can produce a per-layer KV cache tensor too large for a
-            // device to run an op against (e.g. Vulkan's maxStorageBufferRange) even when it
-            // would otherwise fit in free memory -- llama_init_from_model() catches that and
-            // returns nullptr, which common_get_device_memory_data_impl() turns into this
-            // exception. Back off geometrically until the probe actually succeeds instead of
-            // letting an oversized probe abort llama_params_fit entirely.
+
+            // A per-op size ceiling (e.g. Vulkan's maxStorageBufferRange) is not the only way
+            // building a context this large can go wrong. On a UMA device the per-layer KV
+            // cache tensors can each pass that per-op check individually and still add up to
+            // more real memory than the device can actually back -- that fails as an uncaught
+            // driver exception or a kernel-level allocation stall, neither of which is a
+            // catchable std::runtime_error. So size the probe from real measured memory use
+            // first, rather than relying only on catching a failure this class of device may
+            // never throw in the first place.
+            //
+            // n_ctx_min_total is small enough to always be safe to build, so measure there to
+            // get a real (not per-op-limited) bytes-per-ctx figure, then use it and each
+            // device's own free memory to clamp the probe before ever trying the full size.
+            if (n_ctx_max > n_ctx_min_total && n_ctx_min_total > 0) {
+                llama_context_params cparams_min = *cparams;
+                cparams_min.n_ctx = n_ctx_min_total;
+                std::vector<ggml_backend_dev_t> devs_min;
+                dmds_t dmds_min = common_get_device_memory_data_impl(
+                    path_model, mparams, &cparams_min, devs_min, hp_ngl, hp_nct, hp_nex, log_level);
+
+                const size_t nd_min = devs_min.size();
+                // an integrated/UMA device's GTT pool is carved from the same physical RAM the
+                // host reports free -- its own "free" figure can be stale or ignore what other
+                // processes on the host are actually holding (a known gap on AMD APUs, and by
+                // the same GTT-pool mechanism potentially any other iGPU), so never trust it
+                // past what the host itself currently has free:
+                const int64_t host_free = dmds_min.back().free;
+                uint32_t n_ctx_safe = n_ctx_max;
+                for (size_t id = 0; id < dmds_min.size(); id++) {
+                    if (nd_min > 0 && id >= nd_min) {
+                        break; // dmds_min has a trailing host entry devices don't index into margins_s
+                    }
+                    // margins_s has one entry per device, or a single host entry when nd_min == 0:
+                    const size_t margin_idx = nd_min == 0 ? 0 : id;
+                    const llama_device_memory_data & dmd_min = dmds_min[id];
+                    const int64_t bytes_per_ctx = dmd_min.mb.context / n_ctx_min_total;
+                    int64_t dev_free = dmd_min.free;
+                    if (nd_min > 0 && ggml_backend_dev_type(devs_min[id]) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        dev_free = std::min(dev_free, host_free);
+                    }
+                    const int64_t fixed_use = dmd_min.mb.total() - dmd_min.mb.context;
+                    const uint32_t n_ctx_safe_id = common_fit_clamp_ctx_to_free_memory(
+                        n_ctx_max, n_ctx_min_total, dev_free, fixed_use, (int64_t) margins_s[margin_idx], bytes_per_ctx);
+                    n_ctx_safe = std::min(n_ctx_safe, n_ctx_safe_id);
+                }
+                n_ctx_safe = std::max(n_ctx_safe, n_ctx_min_total);
+
+                if (n_ctx_safe < cparams->n_ctx) {
+                    LOG_WRN("%s: clamping the auto-context probe from %" PRIu32 " to %" PRIu32
+                        " so the projected KV cache fits the devices' free memory\n",
+                        __func__, cparams->n_ctx, n_ctx_safe);
+                    cparams->n_ctx = n_ctx_safe;
+                }
+            }
+
+            // The clamp above is an estimate from a linear extrapolation off a small context, so
+            // still back off geometrically on an actual failure: a per-op size ceiling can still
+            // reject a tensor the estimate thought would fit, and llama_init_from_model() turns
+            // that into a normal, catchable exception via common_get_device_memory_data_impl().
             for (;;) {
                 try {
                     dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
