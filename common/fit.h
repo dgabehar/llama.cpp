@@ -70,6 +70,24 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
                            uint32_t & hp_ngl,
                      ggml_log_level   log_level);
 
+// Clamp a candidate context size so its projected KV cache memory use on one device -- linearly
+// extrapolated from bytes_per_ctx, a real measurement taken at a small, always-safe-to-build
+// context -- does not exceed that device's free memory minus a margin and whatever else it is
+// already using (fixed_use, e.g. model weights and compute buffers). Used to size --fit's
+// auto-context probe from measured memory up front, instead of only reacting to an allocation
+// failure: a per-op size ceiling is not the only way an oversized probe can go wrong, and on a
+// UMA device individual KV cache tensors can pass such a check while still not fitting in real
+// memory once summed across layers.
+// Returns n_ctx_max unchanged if bytes_per_ctx <= 0 (this device holds none of the KV cache), and
+// never returns less than n_ctx_min_total.
+uint32_t common_fit_clamp_ctx_to_free_memory(
+                           uint32_t   n_ctx_max,
+                           uint32_t   n_ctx_min_total,
+                            int64_t   dev_free,
+                            int64_t   fixed_use,
+                            int64_t   margin,
+                            int64_t   bytes_per_ctx);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,
