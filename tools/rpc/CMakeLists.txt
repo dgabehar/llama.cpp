@@ -23,6 +23,15 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
             $<TARGET_FILE:test-rpc-server-multiclient>)
     set_property(TEST test-rpc-server-multiclient PROPERTY LABELS main)
     set_property(TEST test-rpc-server-multiclient PROPERTY TIMEOUT 120)
+
+    add_executable(test-rpc-client-timeout ${PROJECT_SOURCE_DIR}/tests/test-rpc-client-timeout.cpp)
+    target_link_libraries(test-rpc-client-timeout PRIVATE ggml ggml-rpc)
+    add_test(
+        NAME test-rpc-client-timeout
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-client-timeout.sh
+            $<TARGET_FILE:test-rpc-client-timeout>)
+    set_property(TEST test-rpc-client-timeout PROPERTY LABELS main)
+    set_property(TEST test-rpc-client-timeout PROPERTY TIMEOUT 60)
 endif()
 
 if(LLAMA_TOOLS_INSTALL)
