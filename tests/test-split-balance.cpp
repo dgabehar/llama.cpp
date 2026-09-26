@@ -268,6 +268,72 @@ static void test_calibrate_context_memory_budget() {
     CHECK(p.size() == 1 && p[0].s_decode_byte > 0, "calibration ran out of context memory");
 }
 
+// Regression test for the tg-predict-fix root cause: calibrate_device times a layer's decode ops
+// (weight matmuls, attention, GDN) together as one graph call. A layer with few such ops is a much
+// shorter graph than one with many, so on a backend whose per-submit cost only shows up once a graph
+// is long enough (GGML_VK_MAX_NODES_PER_SUBMIT=1's amdgpu ring-depth effect being the motivating case),
+// a naive per-layer timing would rate a thin layer's ops cheaper per byte than a wide layer's, purely
+// from graph length, not real throughput. The fix repeats a layer's decode ops (n_rep, in
+// calibrate_device) until the graph is as long as the untimed-op probe's n_chain, then divides by the
+// repeat count. This test can't reproduce the submit-cost effect itself on the CPU backend (it is
+// Vulkan/driver-specific), but it does verify the repeat-and-normalize mechanism is bias-free: two
+// models with the same total decode bytes, split across a different number of weight tensors (1 vs 8,
+// so very different n_rep), must calibrate to close to the same decode rate on a backend with no
+// per-submit cost of its own.
+static void test_decode_replication_normalizes_rate() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the decode-replication test\n");
+        return;
+    }
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto make_model = [](int n_weights) {
+        const int64_t E = 4096;
+        // n_weights tensors of E x (rows/n_weights), so total decode bytes stay ~constant as
+        // n_weights varies -- only the op count (and so n_rep) changes. Large enough (~150 MB
+        // total) that repeated reads don't ride an unrealistic CPU-cache-residency speedup --
+        // real model layers don't fit in cache either, so this keeps the comparison to what the
+        // repeat-and-normalize math actually does, not an artifact of undersized synthetic weights.
+        const int64_t rows_total = 65536;
+        common_split_calib_model m;
+        m.n_embd = E;
+        common_split_calib_layer l;
+        l.share = 1.0;
+        for (int i = 0; i < n_weights; i++) {
+            l.weights.push_back(cw(E, rows_total / n_weights, GGML_TYPE_Q4_K));
+        }
+        m.layers = { l };
+        double bytes = 0.0;
+        for (const auto & w : l.weights) {
+            bytes += ggml_row_size(w.type, w.ne[0]) * w.ne[1];
+        }
+        m.layer_bytes = bytes;
+        m.layer_flops = 2.0 * E * rows_total;
+        return m;
+    };
+
+    auto m_thin = make_model(1);  // n1_decode = 1  -> n_rep = 256
+    auto m_wide = make_model(8);  // n1_decode = 8  -> n_rep = 32
+
+    auto p_thin = common_split_balance_calibrate({ cpu }, m_thin, wl, "", false);
+    auto p_wide = common_split_balance_calibrate({ cpu }, m_wide, wl, "", false);
+    CHECK(p_thin.size() == 1 && p_thin[0].s_decode_byte > 0, "thin-layer calibration failed");
+    CHECK(p_wide.size() == 1 && p_wide[0].s_decode_byte > 0, "wide-layer calibration failed");
+    if (p_thin.size() != 1 || p_wide.size() != 1) {
+        return;
+    }
+
+    const double ratio = p_thin[0].s_decode_byte / p_wide[0].s_decode_byte;
+    CHECK(ratio > 0.4 && ratio < 2.5,
+          "a layer's op count should not bias its calibrated decode rate this much (thin/wide s_decode_byte ratio %.3g)",
+          ratio);
+}
+
 int main() {
     const auto shape = qwen27b();
     // device order as llama.cpp lists them: RPC first, then the local GPU
@@ -358,6 +424,7 @@ int main() {
     test_calibrate_cpu();
     test_byte_scale_affects_prefill();
     test_calibrate_context_memory_budget();
+    test_decode_replication_normalizes_rate();
 
     if (n_fail == 0) {
         printf("test-split-balance: OK\n");
