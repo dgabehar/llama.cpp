@@ -1,0 +1,26 @@
+From 11b60fcc7f705cbc29bf2dffe59a67469536fed6 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Sat, 26 Sep 2026 03:27:16 -0500
+Subject: [PATCH] fleet: fix the 0131 row title in the patch mirror table
+
+Assisted-by: Claude Opus 5.5
+---
+ fleet-patches/README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fleet-patches/README.md b/fleet-patches/README.md
+index d5a538b507..50c2ea51a3 100644
+--- a/fleet-patches/README.md
++++ b/fleet-patches/README.md
+@@ -145,7 +145,7 @@ re-derive the equivalent change against the new upstream code, `git am
+ | 0128 | `dd5756d58` | common : split-balance: calibrate a layer's decode ops long enough to pay the real per-submit cost |
+ | 0129 | `d7e7f3668` | ggml-rpc: give the RPC client a bounded receive timeout and keepalive |
+ | 0130 | `6ce68d49c` | fleet: regenerate patch mirror for the split-balance decode calibration and RPC client timeout fixes |
+-| 0131 | `8e37aa9a8` | FLEET.md: document the long-prompt pp measurement method for split-balance QA |
++| 0131 | `8e37aa9a8` | FLEET.md: root-cause the round-9 pp regression as a QA measurement bug |
+ 
+ 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
+ (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
+-- 
+2.43.0
+
