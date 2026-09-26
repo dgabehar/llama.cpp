@@ -31,6 +31,40 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
+// The RPC *server* protects itself from a vanished/idle client with
+// set_recv_timeout() during the handshake and set_keepalive() afterward (see
+// rpc_serve_client and ggml_backend_rpc_start_server_ex below). Before this
+// fix, the *client* side (rpc_dispatcher, used by the master to talk to each
+// RPC worker) set neither: socket_t::connect() leaves the connection with no
+// receive timeout and no TCP keepalive at all, and every dispatcher call goes
+// through rpc_dispatcher::send(), which blocks on future.wait() with no
+// deadline. A worker that goes catastrophically slow or unresponsive (e.g.
+// straining under an oversized/lopsided layer share from the memory-split
+// fallback) or that silently stops responding (network partition, a hung
+// peer that never crashes cleanly enough to close its socket) then wedges
+// the calling thread forever -- observed as split-balance calibration or a
+// real model load hanging indefinitely, recoverable only by killing the
+// whole process from outside. Give the client the same bounded-wait
+// protection the server already has for itself: a generous per-call receive
+// timeout (bounds any single blocking recv(), not overall idle time between
+// requests -- a client with no request in flight never calls recv() at all)
+// plus TCP keepalive to catch a truly dead peer even between requests.
+// GGML_RPC_CLIENT_TIMEOUT_SEC=0 restores the old unbounded-wait behavior.
+static int rpc_client_timeout_sec() {
+    static const int v = [] {
+        const char * s = std::getenv("GGML_RPC_CLIENT_TIMEOUT_SEC");
+        if (!s) {
+            return 180;
+        }
+        try {
+            return std::stoi(s);
+        } catch (...) {
+            return 180;
+        }
+    }();
+    return v;
+}
+
 
 namespace fs = std::filesystem;
 
@@ -552,6 +586,24 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+    }
+    // Bound every blocking recv() on this connection -- handshake and all
+    // traffic after it -- instead of leaving it able to wait forever. This
+    // only bounds an individual wait *while a request is outstanding*; a
+    // client with nothing in flight never calls recv() and is unaffected,
+    // matching the server's own "a connected client may stay idle for as
+    // long as it likes" policy for the reverse direction. See
+    // rpc_client_timeout_sec()'s comment for why this exists.
+    const int timeout_sec = rpc_client_timeout_sec();
+    if (timeout_sec > 0) {
+        if (!sock->set_recv_timeout(timeout_sec)) {
+            GGML_LOG_WARN("[%s] failed to set the RPC client receive timeout for %s\n", __func__, endpoint.c_str());
+        }
+        const int idle     = std::max(1, timeout_sec / 6);
+        const int interval = std::max(1, idle / 3);
+        if (!sock->set_keepalive(idle, interval, 3)) {
+            GGML_LOG_WARN("[%s] failed to enable TCP keepalive for %s\n", __func__, endpoint.c_str());
+        }
     }
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
