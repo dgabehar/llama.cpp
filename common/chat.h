@@ -290,6 +290,8 @@ struct common_chat_params {
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
+    // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
+    std::vector<std::string>            no_empty_reply_inert;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
 };

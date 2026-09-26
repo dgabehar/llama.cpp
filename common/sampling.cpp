@@ -108,11 +108,109 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+
+// Empty-reply guard: masks the EOG tokens until the reply holds something besides whitespace and the
+// `inert` tokens (reasoning tags). It sits beside the grammar and the reasoning budget, not in the chain:
+// it must only see generated tokens (the chain also accepts the prompt), and it is cloned/copied with the
+// sampler, so speculative-decoding rollbacks restore its state too.
+struct common_empty_reply_guard {
+    const llama_vocab *      vocab;
+    std::vector<llama_token> eog;
+    std::vector<llama_token> inert;
+    bool                     seen_output = false;
+};
+
+static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
+    return "empty-reply-guard";
+}
+
+static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (common_empty_reply_guard *) smpl->ctx;
+    if (ctx->seen_output || llama_vocab_is_eog(ctx->vocab, token)) {
+        return;
+    }
+    if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
+        return;
+    }
+    const std::string piece = common_token_to_piece(ctx->vocab, token, false);
+    // a control token that renders as nothing is not an answer either, but is not a whitespace token
+    // the model can legitimately chain, so treat anything else than plain whitespace as output
+    const bool blank = piece.find_first_not_of(" \t\r\n") == std::string::npos && !piece.empty();
+    if (!blank) {
+        ctx->seen_output = true;
+    }
+}
+
+static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
+    if (ctx->seen_output) {
+        return;
+    }
+    // never mask the last candidate standing
+    size_t n_other = 0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) == ctx->eog.end() &&
+            cur_p->data[i].logit != -INFINITY) {
+            n_other++;
+        }
+    }
+    if (n_other == 0) {
+        return;
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) != ctx->eog.end()) {
+            cur_p->data[i].logit = -INFINITY;
+        }
+    }
+}
+
+static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
+    ((common_empty_reply_guard *) smpl->ctx)->seen_output = false;
+}
+
+static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl);
+
+static void common_empty_reply_guard_free(struct llama_sampler * smpl) {
+    delete (common_empty_reply_guard *) smpl->ctx;
+}
+
+static struct llama_sampler_i common_empty_reply_guard_i = {
+    /* .name              = */ common_empty_reply_guard_name,
+    /* .accept            = */ common_empty_reply_guard_accept,
+    /* .apply             = */ common_empty_reply_guard_apply,
+    /* .reset             = */ common_empty_reply_guard_reset,
+    /* .clone             = */ common_empty_reply_guard_clone,
+    /* .free              = */ common_empty_reply_guard_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl) {
+    return llama_sampler_init(&common_empty_reply_guard_i,
+            new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
+}
+
+static struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert) {
+    auto * ctx = new common_empty_reply_guard { vocab, {}, inert, false };
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        if (llama_vocab_is_eog(vocab, id)) {
+            ctx->eog.push_back(id);
+        }
+    }
+    return llama_sampler_init(&common_empty_reply_guard_i, ctx);
+}
+
 struct common_sampler {
     common_params_sampling params;
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
+    struct llama_sampler * eguard; // empty-reply guard, see above
     struct llama_sampler * chain;
 
     ring_buffer<llama_token> prev;
@@ -205,6 +303,7 @@ struct common_sampler * common_sampler_init(
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * eguard  = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -337,6 +436,10 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    if (params.no_empty_reply) {
+        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert);
+    }
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -424,10 +527,17 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    if (eguard && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with the empty-reply guard, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
+        /* .eguard  = */ eguard,
         /* .chain   = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
@@ -444,6 +554,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
 
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
+    llama_sampler_free(gsmpl->eguard);
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
@@ -493,6 +604,10 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
         llama_sampler_accept(gsmpl->grmr, token);
     }
 
+    if (gsmpl->eguard && is_generated) {
+        llama_sampler_accept(gsmpl->eguard, token);
+    }
+
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
@@ -511,6 +626,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .eguard  = */ llama_sampler_clone(gsmpl->eguard),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
@@ -525,9 +641,11 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+    GGML_ASSERT((src->eguard == nullptr) == (dst->eguard == nullptr));
 
     llama_sampler_copy(src->grmr,    dst->grmr);
     llama_sampler_copy(src->rbudget, dst->rbudget);
+    llama_sampler_copy(src->eguard,  dst->eguard);
     llama_sampler_copy(src->chain,   dst->chain);
 
     dst->params     = src->params;
@@ -616,6 +734,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT(!gsmpl->eguard  && "using the empty-reply guard in combination with backend sampling is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -630,6 +749,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
+    llama_sampler_apply(gsmpl->eguard, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
@@ -661,6 +781,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     gsmpl->set_logits(ctx, idx);
 
     llama_sampler_apply(rbudget,  &cur_p);
+    llama_sampler_apply(gsmpl->eguard, &cur_p);
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);

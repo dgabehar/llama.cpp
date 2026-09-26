@@ -5048,6 +5048,108 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reasoning("Reasoning text.")
             .expect_content("Answer text.")
             .run();
+
+        // ---- IFM's official K2-Horizon-7B Q4_K_M weights (fleet, 2026-09-26). The raw texts below are
+        // real model output (opencode session "Hello Horizon K2 Test" and a local llama-server run of the
+        // same weights with an opencode-shaped request), after the "<ifm|think_faster>\n" generation prompt.
+        static common_chat_tool bash_tool{
+            /* .name = */ "bash",
+            /* .description = */ "Executes a bash command",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The command to run" }
+                },
+                "required": ["command"]
+            })",
+        };
+
+        // 1. The model starts the tool call while still "thinking", without any close tag
+        //    (msg_0df03c9b0001QF0KWHl3gi5liJ: finish=stop, 0 output tokens, the whole call sat in
+        //    reasoning_content and the client ended the turn). With tools offered the tool-call start
+        //    ends the reasoning.
+        {
+            const std::string cmd =
+                "for d in /home/dgabehar/src/*/deploy /home/dgabehar/src/*/k8s /home/dgabehar/src/*/manifests; do\n"
+                "  if [ -d \"$d\" ] && ls \"$d\" 2>/dev/null | grep -q deployment; then\n"
+                "    echo \"=== $d\"; ls \"$d\"; echo;\n"
+                "  fi\n"
+                "done";
+            tst.test("\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>" + cmd +
+                     "</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                .template_kwarg("reasoning_effort", "\"low\"")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ bash_tool })
+                .expect_reasoning("")
+                .expect_tool_calls({
+                    { "bash", json{{ "command", cmd }}.dump(), "" },
+                })
+                .run();
+        }
+        tst.test("<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                 "<ifm|arg_value>find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40</ifm|arg_value>\n"
+                 "</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ bash_tool })
+            .expect_reasoning("")
+            .expect_tool_calls({
+                { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40"})", "" },
+            })
+            .run();
+
+        // ... but real thinking before the tool-call start stays reasoning
+        tst.test("The glob matched nothing, retry with find.<ifm|tool_calls>\n<ifm|tool_call>bash\n"
+                 "<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ bash_tool })
+            .expect_reasoning("The glob matched nothing, retry with find.")
+            .expect_tool_calls({
+                { "bash", R"({"command":"ls"})", "" },
+            })
+            .run();
+
+        // 2. The model repeats the reasoning open tag as its first output, though the template already
+        //    opened it (msg_0df04eb43001Wt7NMifUGZD7Wf and 11 more turns: reasoning_content was the
+        //    literal "<ifm|think>"). The redundant open tag is consumed, whichever variant it is.
+        tst.test("<ifm|think>\n</ifm|think><ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                 "<ifm|arg_value>find /home/dgabehar/src -maxdepth 3 -name \"deployment*.yaml\" 2>/dev/null | head -30</ifm|arg_value>\n"
+                 "</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ bash_tool })
+            .expect_reasoning("")
+            .expect_tool_calls({
+                { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 3 -name \"deployment*.yaml\" 2>/dev/null | head -30"})", "" },
+            })
+            .run();
+
+        // (msg_0df04a1c7001gmFPCxqyUtTVHs: the repeated open tag, then an answer)
+        tst.test("<ifm|think>\n</ifm|think>I ran a glob over `~/src/*/manifests` and the shell errored out.\n\nLet me redo it.")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("")
+            .expect_content("I ran a glob over `~/src/*/manifests` and the shell errored out.\n\nLet me redo it.")
+            .run();
+
+        for (const char * open : { "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>" }) {
+            tst.test(std::string(open) + "\nCount the files first.\n</ifm|think_faster>\nThere are 3.")
+                .template_kwarg("reasoning_effort", "\"low\"")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Count the files first.")
+                .expect_content("There are 3.")
+                .run();
+        }
+
+        // 3. A short real reply (msg_0df014f90001frJ9TjWhIERdfc, 8 output tokens) is untouched.
+        tst.test("</ifm|think_faster>Hello!")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ bash_tool })
+            .expect_reasoning("")
+            .expect_content("Hello!")
+            .run();
     }
 
     // Kimi-K2-Thinking tests - custom parser
