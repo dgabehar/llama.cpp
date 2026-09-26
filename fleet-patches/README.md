@@ -145,7 +145,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0128 | `dd5756d58` | common : split-balance: calibrate a layer's decode ops long enough to pay the real per-submit cost |
 | 0129 | `d7e7f3668` | ggml-rpc: give the RPC client a bounded receive timeout and keepalive |
 | 0130 | `6ce68d49c` | fleet: regenerate patch mirror for the split-balance decode calibration and RPC client timeout fixes |
-| 0131 | `8e37aa9a8` | FLEET.md: document the long-prompt pp measurement method for split-balance QA |
+| 0131 | `8e37aa9a8` | FLEET.md: root-cause the round-9 pp regression as a QA measurement bug |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
