@@ -88,6 +88,15 @@ uint32_t common_fit_clamp_ctx_to_free_memory(
                             int64_t   margin,
                             int64_t   bytes_per_ctx);
 
+// An integrated GPU's own reported free memory is carved from the same physical RAM the host
+// reports free, and can ignore what every other process on the host is currently holding (a known
+// gap on AMD APUs, and by the same GTT-pool mechanism potentially any other iGPU). Returns
+// dev_free unchanged if is_igpu is false, otherwise the smaller of dev_free and host_free.
+int64_t common_fit_cap_igpu_free(
+                            int64_t   dev_free,
+                            int64_t   host_free,
+                               bool   is_igpu);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,

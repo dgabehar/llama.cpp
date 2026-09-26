@@ -1,9 +1,13 @@
-// Tests common_fit_clamp_ctx_to_free_memory(), the pure sizing computation --fit's auto-context
-// probe uses to clamp its starting size from measured free memory, instead of only reacting to
-// an allocation failure. See common/fit.cpp and common/fit.h for the real usage.
+// Tests two pure sizing computations --fit's auto-context probe uses:
+// - common_fit_clamp_ctx_to_free_memory(): clamps a candidate context size from measured free
+//   memory, instead of only reacting to an allocation failure.
+// - common_fit_cap_igpu_free(): caps an integrated GPU's own reported free memory to the host's,
+//   since an iGPU's figure is carved from host RAM and can ignore what else is using it.
+// See common/fit.cpp and common/fit.h for the real usage.
 
 #include "fit.h"
 
+#include <cinttypes>
 #include <cstdio>
 
 static int n_fail = 0;
@@ -74,6 +78,24 @@ int main() {
             /*dev_free=*/ 4 * GiB + 5000 * 1024 + 100, /*fixed_use=*/ 4 * GiB, /*margin=*/ 0,
             /*bytes_per_ctx=*/ 1024);
         CHECK(n_ctx == 5000, "expected floor-divided 5000, got %u", n_ctx);
+    }
+
+    // common_fit_cap_igpu_free(): not an iGPU -- passthrough regardless of host_free:
+    {
+        const int64_t dev_free = common_fit_cap_igpu_free(/*dev_free=*/ 32 * GiB, /*host_free=*/ 1 * GiB, /*is_igpu=*/ false);
+        CHECK(dev_free == 32 * GiB, "expected passthrough, got %" PRId64, dev_free);
+    }
+
+    // common_fit_cap_igpu_free(): an iGPU reporting more free than the host actually has -- capped:
+    {
+        const int64_t dev_free = common_fit_cap_igpu_free(/*dev_free=*/ 20 * GiB, /*host_free=*/ 8 * GiB, /*is_igpu=*/ true);
+        CHECK(dev_free == 8 * GiB, "expected the host's figure, got %" PRId64, dev_free);
+    }
+
+    // common_fit_cap_igpu_free(): an iGPU reporting less than the host has -- its own figure stands:
+    {
+        const int64_t dev_free = common_fit_cap_igpu_free(/*dev_free=*/ 4 * GiB, /*host_free=*/ 8 * GiB, /*is_igpu=*/ true);
+        CHECK(dev_free == 4 * GiB, "expected the device's own figure, got %" PRId64, dev_free);
     }
 
     if (n_fail == 0) {

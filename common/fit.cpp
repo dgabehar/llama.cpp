@@ -35,6 +35,28 @@ uint32_t common_fit_clamp_ctx_to_free_memory(
     return std::max(n_ctx_safe, n_ctx_min_total);
 }
 
+int64_t common_fit_cap_igpu_free(int64_t dev_free, int64_t host_free, bool is_igpu) {
+    return is_igpu ? std::min(dev_free, host_free) : dev_free;
+}
+
+// Applies common_fit_cap_igpu_free() to every integrated-GPU device in dmds, using dmds.back()
+// (the host entry every common_get_device_memory_data_impl() result carries) as host_free. Every
+// place in this file that makes a sizing decision from a dmds_t's .free must go through this
+// first, or an iGPU's over-reported free memory can defeat the cap for that one decision even
+// though others already apply it.
+static void common_fit_cap_igpu_free_to_host(
+        std::vector<llama_device_memory_data> & dmds,
+        const std::vector<ggml_backend_dev_t> & devs) {
+    if (devs.empty()) {
+        return;
+    }
+    const int64_t host_free = dmds.back().free;
+    for (size_t id = 0; id < devs.size() && id < dmds.size(); id++) {
+        const bool is_igpu = ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        dmds[id].free = common_fit_cap_igpu_free(dmds[id].free, host_free, is_igpu);
+    }
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -341,6 +363,7 @@ static void common_params_fit_impl(
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    common_fit_cap_igpu_free_to_host(dmds_full, devs);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     uint32_t       n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
@@ -349,86 +372,77 @@ static void common_params_fit_impl(
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {
         cparams->n_ctx = n_ctx_max;
-        if (n_seq_max > 1) {
-            LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
-                __func__, n_ctx_max, n_seq_max);
+        LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequence(s):\n",
+            __func__, n_ctx_max, n_seq_max);
 
-            // A per-op size ceiling (e.g. Vulkan's maxStorageBufferRange) is not the only way
-            // building a context this large can go wrong. On a UMA device the per-layer KV
-            // cache tensors can each pass that per-op check individually and still add up to
-            // more real memory than the device can actually back -- that fails as an uncaught
-            // driver exception or a kernel-level allocation stall, neither of which is a
-            // catchable std::runtime_error. So size the probe from real measured memory use
-            // first, rather than relying only on catching a failure this class of device may
-            // never throw in the first place.
-            //
-            // n_ctx_min_total is small enough to always be safe to build, so measure there to
-            // get a real (not per-op-limited) bytes-per-ctx figure, then use it and each
-            // device's own free memory to clamp the probe before ever trying the full size.
-            if (n_ctx_max > n_ctx_min_total && n_ctx_min_total > 0) {
-                llama_context_params cparams_min = *cparams;
-                cparams_min.n_ctx = n_ctx_min_total;
-                std::vector<ggml_backend_dev_t> devs_min;
-                dmds_t dmds_min = common_get_device_memory_data_impl(
-                    path_model, mparams, &cparams_min, devs_min, hp_ngl, hp_nct, hp_nex, log_level);
+        // A per-op size ceiling (e.g. Vulkan's maxStorageBufferRange) is not the only way
+        // building a context this large can go wrong. On a UMA device the per-layer KV cache
+        // tensors can each pass that per-op check individually and still add up to more real
+        // memory than the device can actually back -- that fails as an uncaught driver exception
+        // or a kernel-level allocation stall, neither of which is a catchable std::runtime_error.
+        // So size the probe from real measured memory use first, rather than relying only on
+        // catching a failure this class of device may never throw in the first place. This
+        // applies regardless of n_seq_max: even a single sequence's native training context can
+        // be large enough to overshoot a small device's real memory.
+        //
+        // n_ctx_min_total is small enough to always be safe to build, so measure there to
+        // get a real (not per-op-limited) bytes-per-ctx figure, then use it and each
+        // device's own free memory to clamp the probe before ever trying the full size.
+        if (n_ctx_max > n_ctx_min_total && n_ctx_min_total > 0) {
+            llama_context_params cparams_min = *cparams;
+            cparams_min.n_ctx = n_ctx_min_total;
+            std::vector<ggml_backend_dev_t> devs_min;
+            dmds_t dmds_min = common_get_device_memory_data_impl(
+                path_model, mparams, &cparams_min, devs_min, hp_ngl, hp_nct, hp_nex, log_level);
+            common_fit_cap_igpu_free_to_host(dmds_min, devs_min);
 
-                const size_t nd_min = devs_min.size();
-                // an integrated/UMA device's GTT pool is carved from the same physical RAM the
-                // host reports free -- its own "free" figure can be stale or ignore what other
-                // processes on the host are actually holding (a known gap on AMD APUs, and by
-                // the same GTT-pool mechanism potentially any other iGPU), so never trust it
-                // past what the host itself currently has free:
-                const int64_t host_free = dmds_min.back().free;
-                uint32_t n_ctx_safe = n_ctx_max;
-                for (size_t id = 0; id < dmds_min.size(); id++) {
-                    if (nd_min > 0 && id >= nd_min) {
-                        break; // dmds_min has a trailing host entry devices don't index into margins_s
-                    }
-                    // margins_s has one entry per device, or a single host entry when nd_min == 0:
-                    const size_t margin_idx = nd_min == 0 ? 0 : id;
-                    const llama_device_memory_data & dmd_min = dmds_min[id];
-                    const int64_t bytes_per_ctx = dmd_min.mb.context / n_ctx_min_total;
-                    int64_t dev_free = dmd_min.free;
-                    if (nd_min > 0 && ggml_backend_dev_type(devs_min[id]) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                        dev_free = std::min(dev_free, host_free);
-                    }
-                    const int64_t fixed_use = dmd_min.mb.total() - dmd_min.mb.context;
-                    const uint32_t n_ctx_safe_id = common_fit_clamp_ctx_to_free_memory(
-                        n_ctx_max, n_ctx_min_total, dev_free, fixed_use, (int64_t) margins_s[margin_idx], bytes_per_ctx);
-                    n_ctx_safe = std::min(n_ctx_safe, n_ctx_safe_id);
+            const size_t nd_min = devs_min.size();
+            uint32_t n_ctx_safe = n_ctx_max;
+            for (size_t id = 0; id < dmds_min.size(); id++) {
+                if (nd_min > 0 && id >= nd_min) {
+                    break; // dmds_min has a trailing host entry devices don't index into margins_s
                 }
-                n_ctx_safe = std::max(n_ctx_safe, n_ctx_min_total);
-
-                if (n_ctx_safe < cparams->n_ctx) {
-                    LOG_WRN("%s: clamping the auto-context probe from %" PRIu32 " to %" PRIu32
-                        " so the projected KV cache fits the devices' free memory\n",
-                        __func__, cparams->n_ctx, n_ctx_safe);
-                    cparams->n_ctx = n_ctx_safe;
-                }
+                // margins_s has one entry per device, or a single host entry when nd_min == 0:
+                const size_t margin_idx = nd_min == 0 ? 0 : id;
+                const llama_device_memory_data & dmd_min = dmds_min[id];
+                const int64_t bytes_per_ctx = dmd_min.mb.context / n_ctx_min_total;
+                const int64_t fixed_use = dmd_min.mb.total() - dmd_min.mb.context;
+                const uint32_t n_ctx_safe_id = common_fit_clamp_ctx_to_free_memory(
+                    n_ctx_max, n_ctx_min_total, dmd_min.free, fixed_use, (int64_t) margins_s[margin_idx], bytes_per_ctx);
+                n_ctx_safe = std::min(n_ctx_safe, n_ctx_safe_id);
             }
+            n_ctx_safe = std::max(n_ctx_safe, n_ctx_min_total);
 
-            // The clamp above is an estimate from a linear extrapolation off a small context, so
-            // still back off geometrically on an actual failure: a per-op size ceiling can still
-            // reject a tensor the estimate thought would fit, and llama_init_from_model() turns
-            // that into a normal, catchable exception via common_get_device_memory_data_impl().
-            for (;;) {
-                try {
-                    dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                    break;
-                } catch (const std::runtime_error & e) {
-                    if (cparams->n_ctx <= n_ctx_min_total) {
-                        throw;
-                    }
-                    const uint32_t n_ctx_prev = cparams->n_ctx;
-                    cparams->n_ctx = std::max(n_ctx_min_total, cparams->n_ctx / 2);
-                    LOG_WRN("%s: failed to probe device memory at n_ctx = %" PRIu32 ", retrying at %" PRIu32 ": %s\n",
-                        __func__, n_ctx_prev, cparams->n_ctx, e.what());
-                }
+            if (n_ctx_safe < cparams->n_ctx) {
+                LOG_WRN("%s: clamping the auto-context probe from %" PRIu32 " to %" PRIu32
+                    " so the projected KV cache fits the devices' free memory\n",
+                    __func__, cparams->n_ctx, n_ctx_safe);
+                cparams->n_ctx = n_ctx_safe;
             }
-            // the probe may have had to back off below the originally requested max, use
-            // whatever size actually worked as the new ceiling for the rest of this function:
-            n_ctx_max = cparams->n_ctx;
         }
+
+        // The clamp above is an estimate from a linear extrapolation off a small context, so
+        // still back off geometrically on an actual failure: a per-op size ceiling can still
+        // reject a tensor the estimate thought would fit, and llama_init_from_model() turns
+        // that into a normal, catchable exception via common_get_device_memory_data_impl().
+        for (;;) {
+            try {
+                dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                break;
+            } catch (const std::runtime_error & e) {
+                if (cparams->n_ctx <= n_ctx_min_total) {
+                    throw;
+                }
+                const uint32_t n_ctx_prev = cparams->n_ctx;
+                cparams->n_ctx = std::max(n_ctx_min_total, cparams->n_ctx / 2);
+                LOG_WRN("%s: failed to probe device memory at n_ctx = %" PRIu32 ", retrying at %" PRIu32 ": %s\n",
+                    __func__, n_ctx_prev, cparams->n_ctx, e.what());
+            }
+        }
+        common_fit_cap_igpu_free_to_host(dmds_full, devs);
+        // the probe may have had to back off below the originally requested max, use
+        // whatever size actually worked as the new ceiling for the rest of this function:
+        n_ctx_max = cparams->n_ctx;
     }
     add_extra_memory(dmds_full);
 
@@ -778,6 +792,7 @@ static void common_params_fit_impl(
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        common_fit_cap_igpu_free_to_host(dmds_cpu_moe, devs);
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
