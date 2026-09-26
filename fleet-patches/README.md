@@ -168,6 +168,8 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0134 | `8ff5aa4e3` | fleet: regenerate patch mirror for the pp measurement-method doc |
 | 0135 | `11b60fcc7` | fleet: fix the 0131 row title in the patch mirror table |
 | 0136 | `c4d2d91de` | FLEET.md: document the RPC client receive timeout |
+| 0137 | `207bfad2a` | fleet: regenerate patch mirror after merging fleet-patches; rebuild the table from the patch files |
+| 0138 | `1ea0f1029` | chat, sampling: K2-Horizon official weights: tool call in reasoning, repeated open tag, empty first-token stop |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

@@ -259,6 +259,12 @@ struct analyze_reasoning : analyze_base {
     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
     std::vector<std::string> end_alts; // other tags that also close the reasoning (the model may emit any of them)
+    // other open tags the model may emit again right after the (already opened) reasoning start; consumed
+    // and dropped, so a redundant repeat of the open tag never ends up as reasoning text
+    std::vector<std::string> start_alts;
+    // when the request offers tools: a tag that ends the reasoning without a close tag before it (the model
+    // starts its tool call while still "thinking"); it is left in the input for the tool-call parser
+    std::vector<std::string> implicit_ends_with_tools;
 
     analyze_reasoning() = default;
     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
@@ -399,6 +405,7 @@ struct autoparser {
 
     // Preserved tokens for tokenizer (union of all non-empty markers)
     std::vector<std::string> preserved_tokens;
+    std::vector<std::string> no_empty_reply_inert; // see common_chat_params::no_empty_reply_inert
     std::vector<std::string> additional_stops;  // literal stop strings (e.g. Laguna </assistant>) caught however tokenized
 
     autoparser() = default;

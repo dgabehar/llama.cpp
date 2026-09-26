@@ -587,6 +587,60 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   closed the reasoning, so the dropped remainder is never decoded. Neither
   applies with `reasoning_format: none`, which returns the raw text.
 
+- **K2-Horizon-7B official IFM weights: three output quirks** (2026-09-26,
+  branch `k2-official-parse`). Symptoms in opencode via LiteLLM: "it kept
+  stopping" (finish=stop, 0 tokens, the whole tool call inside
+  `reasoning_content`; or a 1-token stop with nothing at all), and a literal
+  `<ifm|think>` as `reasoning_content` on most turns. Evidence: opencode DB
+  copy `/home/dgabehar/k2-evidence/opencode.db`, session
+  `ses_f20feb08dffeFXf2LgNbTMHzCd`. Reproduced locally (3080 Ti, opencode-shaped
+  requests built from that session, `-fa on -ctk/-ctv q4_0 --spec-type ngram-mod`,
+  reasoning_effort low) with the raw text from `/completion`. What the model
+  really emits after the template's `<ifm|think_faster>\n`:
+  - `</ifm|think_faster>` + answer or `<ifm|tool_calls>` (the normal case,
+    ~70%);
+  - `<ifm|tool_calls>...` with NO close tag at all (~20% in agentic turns with
+    tool results in the history): the parser was still inside reasoning, so the
+    call became `reasoning_content`, nothing was emitted, and the client saw a
+    plain stop. Fix: `analyze_reasoning::implicit_ends_with_tools` -- with tools
+    offered, `<ifm|tool_calls>` ends the reasoning (zero-width, the tool parser
+    then reads it);
+  - `<ifm|think>\n</ifm|think>...` (the "high" open tag repeated, then closed):
+    the parser only knew the start tag of the effort in the prompt, so the
+    repeat landed in `reasoning_content`. Fix: `analyze_reasoning::start_alts`,
+    repeated open tags (any of the three) after the start are consumed. The
+    generation prompt's own `\n` sits between them, hence `space()` before each;
+  - an end-of-turn token as the very FIRST token (id 1 `<|ifm|endoftext|>` or
+    id 250019 `<|ifm|im_end|>`, both EOG): 1 output token, empty reply. It is
+    the model, not the parser: measured 4-12% first-token probability (temp 1,
+    no truncation) after an empty assistant turn in the history, i.e. it
+    cascades once problem 1 has put empty turns into the conversation. The
+    "close tag then EOG" variant is ~0.2-3%. Fix: sampler-side
+    `common_params_sampling::no_empty_reply` (`common_sampler::eguard` in
+    `common/sampling.cpp`): EOG tokens are masked until a token that is neither
+    whitespace nor one of the reasoning tags has been generated. Fed from the
+    K2 workaround via `common_chat_params::no_empty_reply_inert` -> the
+    `no_empty_reply_inert` request field. It sits beside the grammar and the
+    reasoning budget rather than in the chain because the chain also accepts
+    prompt tokens (a first attempt in the chain saw "output" before generation
+    started and never masked anything).
+  Numbers (42 opencode-shaped runs per row, stream and non-stream each, low):
+  official file before the fix 13 leaks / 9 tool calls stuck in reasoning / 9
+  empty stops; after 0 / 0 / 0. The community quant is NOT clean in this
+  harness either (before: 15 / 4 / 4), so the quirks are model behavior, not a
+  regression of the official weights; the earlier "0 in 359 messages" on the old
+  quant does not reproduce with an opencode-shaped 16k-token context and
+  temperature 0.6. The two GGUFs have identical tokenizer, EOG/special-token
+  metadata and chat template (only the imatrix keys differ), so there is no
+  file-level difference to work around. Tests: `tests/test-chat.cpp` K2 block
+  ("official weights" cases, real raw output, streaming + non-streaming).
+  Known remaining edge: with NO tools offered, a `<ifm|tool_calls>` right after
+  the open tag still ends up in `reasoning_content` (harmless, no leak into
+  content). A required tool argument the model leaves out (opencode's bash has
+  `description` optional, but a schema requiring it) makes the server return
+  500 "does not match the expected peg-native format" -- schema strictness, not
+  a K2 issue.
+
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
