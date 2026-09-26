@@ -52,6 +52,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         }
     }
 
+    if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && !autoparser.no_empty_reply_inert.empty()) {
+        data.no_empty_reply_inert = autoparser.no_empty_reply_inert;
+    }
+
     std::string parser_generation_prompt = data.generation_prompt;
 
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
@@ -155,15 +159,36 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     }
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
-        if (!end.empty() && !end_alts.empty()) {
+        const bool request_has_tools = ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty();
+        const bool has_implicit_ends = request_has_tools && !implicit_ends_with_tools.empty();
+        if (!end.empty() && (!end_alts.empty() || has_implicit_ends)) {
             std::vector<std::string>       ends = { trim_whitespace(end) };
             std::vector<common_peg_parser> closers = { p.optspace(end) };
             for (const auto & alt : end_alts) {
                 ends.push_back(trim_whitespace(alt));
                 closers.push_back(p.optspace(alt));
             }
+            if (has_implicit_ends) {
+                // zero-width: the tag itself belongs to what follows the reasoning
+                for (const auto & tag : implicit_ends_with_tools) {
+                    ends.push_back(tag);
+                    closers.push_back(p.peek(p.literal(tag)));
+                }
+            }
             auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
-            return p.optional(start.empty() ? body : p.optspace(start) + body);
+            if (start.empty()) {
+                return p.optional(body);
+            }
+            auto opening = p.optspace(start);
+            if (!start_alts.empty()) {
+                // the generation prompt's own newline after the open tag comes first, hence the space()
+                std::vector<common_peg_parser> repeats = { p.literal(trim_whitespace(start)) };
+                for (const auto & alt : start_alts) {
+                    repeats.push_back(p.literal(trim_whitespace(alt)));
+                }
+                opening = opening + p.zero_or_more(p.space() + p.choice(repeats));
+            }
+            return p.optional(opening + body);
         }
         if (!end.empty()) {
             if (!start.empty()) {

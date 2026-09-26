@@ -240,8 +240,18 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               analysis.reasoning.start = "<ifm|think_faster>";
               analysis.reasoning.end   = "</ifm|think_faster>";
               analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
+              // The official weights often repeat the open tag as their first output ("<ifm|think>" with
+              // the "high" tag, whatever the template opened) and sometimes start the tool call without
+              // closing the reasoning at all (seen live 2026-09-26): both are consumed by the reasoning parser.
+              analysis.reasoning.start_alts = { "<ifm|think>", "<ifm|think_fast>" };
+              analysis.reasoning.implicit_ends_with_tools = { "<ifm|tool_calls>" };
               analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
               analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>" };
+              // With the reasoning open tag already in the prompt, the official weights sometimes end the
+              // turn with their very first token (EOG): 1 output token, no content, and the client takes it
+              // for a finished turn. The reply must hold something before an EOG token is allowed.
+              analysis.no_empty_reply_inert = { "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|think>", "</ifm|think>",
+                                                "<ifm|think_fast>", "</ifm|think_fast>" };
               analysis.preserved_tokens.push_back("<ifm|think_faster>");
               analysis.preserved_tokens.push_back("</ifm|think_faster>");
               // Not the registered start/end pair (see comment above), but still real

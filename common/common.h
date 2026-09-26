@@ -296,6 +296,13 @@ struct common_params_sampling {
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
+    // Never let the reply end (EOG tokens masked) before a token other than `no_empty_reply_inert` and
+    // whitespace has been generated. The chat template handling turns this on for models that, after a
+    // reasoning open tag already in the prompt, sometimes emit an end-of-turn token straight away (an
+    // empty stop the client takes for a finished turn): `no_empty_reply_inert` are their reasoning tags.
+    bool                      no_empty_reply = false;
+    std::vector<llama_token>  no_empty_reply_inert;
+
     bool backend_sampling = false;
 
     // print the parameters into a string
