@@ -504,6 +504,48 @@ where the incident happened and the 2 s default timeout applies.
   implemented", `ggml-backend-meta.cpp:702`). It would also need an
   all-reduce per layer over RPC.
 
+## RPC client receive timeout (added 2026-09-26)
+
+`rpc_dispatcher`, the RPC client that a llama-server master uses for each
+`--rpc` worker, had no receive timeout and no TCP keepalive.
+`socket_t::connect()` sets neither, and every dispatcher call blocks in
+`std::future::wait()` with no deadline. The server side already drops dead
+or idle clients, but nothing protected the client from a worker that
+accepts a request and then stops answering without closing the socket.
+The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
+`future.wait()`, and the log freezes with no `predicted` line.
+
+- **Fix:** `rpc_dispatcher::start()` sets `SO_RCVTIMEO` and TCP keepalive on
+  the client socket right after `connect()`, before the HELLO handshake.
+  - The timeout bounds only a `recv()` made while a request is
+    outstanding, so an idle client is never cut off.
+  - Default 180 s. `GGML_RPC_CLIENT_TIMEOUT_SEC` overrides it, and `0`
+    restores the old unbounded behavior.
+  - On timeout the master logs `Lost the connection to the RPC server` /
+    `recv failed` and aborts through the existing `RPC_STATUS_ASSERT`. So a
+    dead worker now causes a pod restart, not a wedged pod.
+- **How it was found:** QA round 8 (R1) saw K2-Horizon-7B hang the RPC
+  transfer against two CPU-only `rpc-server` workers. That happened while
+  the workstation was thrashing under OOM. On a clean machine the hang
+  would not reproduce by just loading or calibrating. The mechanism was
+  proved by SIGSTOP-ing one worker mid-transfer: the master hung before
+  the fix and failed within the timeout after it.
+- **Regression test:** `tests/test-rpc-client-timeout.{cpp,sh}`, label
+  `main`. A stub server completes the handshake and then goes silent, and
+  the client must fail within the window.
+- **Before raising or disabling the timeout:** the 180 s bound is per
+  request/response exchange, not per model load. The largest single
+  exchange in practice is one weight chunk or one ubatch compute, and both
+  are far shorter. If a real workload ever hits it, increase
+  `GGML_RPC_CLIENT_TIMEOUT_SEC` for that release rather than setting it
+  to 0.
+- **Not done:** making RPC errors recoverable instead of aborting, which
+  would mean replacing `RPC_STATUS_ASSERT`'s `GGML_ABORT` at every call
+  site. Aborting is acceptable under k8s, which restarts the pod.
+- **ASan gotcha:** `test-rpc-multi-server` and `test-rpc-server-multiclient`
+  report the RPC backend's intentionally never-freed registries as leaks.
+  Run ctest under ASan with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **Views over transposed tensors** (2026-09-24, `41b2ad40d`): `ggml_view_*`
