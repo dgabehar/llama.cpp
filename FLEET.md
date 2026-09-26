@@ -397,6 +397,83 @@ right amount for K2-Horizon-7B, Qwen3.5-4B and gpt-oss-20b); the severity on
 gfx90c itself needs the cluster QA loop (Dawn) to confirm against a real
 `--split-balance auto` start with the env var set.
 
+**pp "regression" after `dd5756d58` (round 9 QA, 2026-09-26) was a QA
+measurement bug, not a cost-model bug.** Round 9 (`layer-calibration-dawn-qa-
+round9-2026-09-26.md` section 1, gabesrv01 master + gabesrv07 RPC worker,
+`GGML_VK_MAX_NODES_PER_SUBMIT=1`) reported pp off by -74% to -93% (e.g.
+K2-Horizon-7B: predicted 197, measured 50.8) on the same 3 models whose tg
+the decode-calibration fix had just brought inside +8-18%. That pp figure
+came from **one `/completion` call with a short, few-dozen-token prompt**
+(`n_predict 64, fresh prompt`) -- `prompt_per_second` from a prompt that
+short is dominated by the fixed per-request cost (slot init, batch build,
+one graph submit/fence), not steady-state prefill throughput, so it reads
+far below the model's real rate. Reproduced live on the identical
+gabesrv01+07/r9-image setup: an 17-18 token prompt measured `prompt_per_
+second` 23-73 t/s on K2-Horizon-7B and Qwen3.5-4B (matching round 9's 50.8 /
+20.5 almost exactly), while a fresh, genuinely long prompt (~2400 tokens,
+`cache_prompt: false`, median of 5 reps) on the *same pod, same calibration,
+same placement* measured:
+
+| model | predicted pp4096 | short-prompt (~18 tok) pp | long-prompt (~2400 tok) pp, median of 5 |
+|---|---|---|---|
+| K2-Horizon-7B | 202 | 23-73 (med. 72.7), matches round 9's 50.8 | 119.8-190.0 (med. 138.3, -32%) |
+| Qwen3.5-4B | 309 | 23-27 (med. 27.1), matches round 9's 20.5 | 197.4-281.5 (med. 281.0, -9%) |
+
+So with a realistic prompt the error collapses from -74%/-93% to -9%/-32% --
+Qwen3.5-4B lands inside the test plan's +-25% dense bar outright, and
+K2-Horizon-7B's best individual rep is -6%, with the median dragged down by
+real run-to-run throughput variance on this iGPU under
+`GGML_VK_MAX_NODES_PER_SUBMIT=1` (successive identical requests measured
+~120 t/s and ~190 t/s in a roughly bimodal pattern, unexplained by node CPU
+load, which stayed under 1.0 loadavg throughout) rather than by anything the
+cost model gets wrong. Code-level suspects named for this investigation were
+checked and are NOT the cause: `9ecf429da`'s `byte_scale` is already applied
+to prefill (`common/split-balance.cpp`, the `case 1`/`case 2` lines in
+`calibrate_device`), and the untimed-op probe already has a ubatch-sized,
+256-node-long prefill variant (`t_op_pp`, built from `x_hop` rather than a
+single-token view) mirroring the one `vk-calib-overrate` added for decode --
+prefill's own real hardware numbers above confirm that probe is adequate,
+unlike decode's before `dd5756d58`. No code change follows from this: the
+existing cost model is accurate to within the same ballpark FLEET.md already
+documents for other hardware (the 3080 Ti's post-`9ecf429da` +-9%).
+
+**Corrected pp measurement method for QA** (supersedes the single-short-
+prompt method used through round 9): measure `prompt_per_second` from the
+server's own `/completion` response over a **fresh prompt of at least 2000
+tokens** (`cache_prompt: false`, new content per rep so llama.cpp's prefix
+cache can't shortcut it), and take the **median of at least 5 reps**, not
+one -- a single rep on this class of hardware can land anywhere in a ~50%
+band. `llama-bench -p 2048` on the same placement is the ideal cross-check
+but is **not available in the `llamacpp-rpc-server` runtime image**
+(`/app` ships only `llama-server` and `rpc-server`, no `llama-bench`
+binary) -- a local build (e.g. this repo's own `build/bin/llama-bench`) is
+the only way to run it, and only reaches non-fleet hardware unless a debug
+image is built specifically for it.
+
+**Placement verified correct for Qwen3.5-4B** (round 9 flagged the `auto`
+placement change -- old 9/23 (worker/master) split vs new 0/32 all-master --
+as a literal violation of that round's "placement unchanged" pass criterion
+and asked for confirmation this isn't leaving throughput on the table).
+Forced the old split back with `-ts 9,23` on the identical gabesrv01+07/r9
+pod and measured both ways:
+
+| placement | tg (n_predict 64) | pp (median of 5, ~2400-tok prompt) |
+|---|---|---|
+| `auto` (0/32, all-master) | 13.23 (round 9) | 281.0 |
+| forced `-ts 9,23` (old split) | 10.41 | 164.8 |
+
+`auto`'s new choice is faster on **both** axes -- +27% tg, +70% pp -- not a
+regression. This confirms `dd5756d58`'s own reasoning: once decode
+calibration correctly prices RPC0's real per-hop cost under
+`GGML_VK_MAX_NODES_PER_SUBMIT=1`, keeping this pairing's layers off the RPC
+worker is the right call, not a side effect to work around. gpt-oss-20b's
+half of this same check was **not** run here -- its GGUF was not staged in
+`/var/tmp/dawn` on gabesrv01/07 at the time of this investigation (only
+`m6/{K2-Horizon-7B,Qwen3.5-4B,Qwen_Qwen3-1.7B}-*.gguf` were present) -- the
+same conclusion very likely holds (same worker/master pair, same underlying
+fix), but treat it as unverified until re-run once the model is staged
+again.
+
 **rpc-server admission:** a connection takes a `--max-clients` slot only
 once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
 slot. At most 64 connections wait for their HELLO; the oldest is closed to
