@@ -138,6 +138,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0121 | `3d33f7e68` | fleet: fix the patch mirror table rows |
 | 0122 | `70f0d0168` | llama, common: fix -fit's oversized-context probe hard-aborting the server |
 | 0123 | `1bf5f2473` | server: fix 2 test_completion.py tests broken by test-only bugs, not the server |
+| 0124 | `3a61a3dfd` | fleet: regenerate patch mirror for the -fit abort and server test fixes |
+| 0125 | `ae3897657` | common: size -fit's auto-context probe from measured free memory, not just a caught exception |
+| 0126 | `ccc60e62a` | common: close the n_seq_max == 1 gap in --fit's auto-context probe, cap iGPU free memory consistently |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
