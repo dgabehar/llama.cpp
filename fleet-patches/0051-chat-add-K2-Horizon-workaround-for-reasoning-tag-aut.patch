@@ -42,7 +42,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 38 insertions(+)
 
 diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
-index a7e370578..e2e20fda0 100644
+index a7e370578f..e2e20fda03 100644
 --- a/common/chat-diff-analyzer.cpp
 +++ b/common/chat-diff-analyzer.cpp
 @@ -201,6 +201,44 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar

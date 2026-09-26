@@ -1,4 +1,4 @@
-From e9319f635dd783673a4e07233f5f168160795a69 Mon Sep 17 00:00:00 2001
+From 0ab13d2bbb5b1df189f9726f392a5fea4d952a9d Mon Sep 17 00:00:00 2001
 From: dgabehar <dgabehar@gmail.com>
 Date: Fri, 25 Sep 2026 14:24:15 -0500
 Subject: [PATCH] server : don't update the prompt cache of a busy slot picked
@@ -29,10 +29,10 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 50 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 880c18f74..c21b56a59 100644
+index 20ba6c806f..a17a284467 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1630,6 +1630,13 @@ private:
+@@ -1664,6 +1664,13 @@ private:
              ret = get_slot_by_id(task.id_slot);
              if (ret) {
                  SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
@@ -46,7 +46,7 @@ index 880c18f74..c21b56a59 100644
              }
          }
  
-@@ -1715,6 +1722,9 @@ private:
+@@ -1749,6 +1756,9 @@ private:
              // cache prompts only for completion tasks
              update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -57,7 +57,7 @@ index 880c18f74..c21b56a59 100644
                  SRV_TRC("%s", "updating prompt cache\n");
  
 diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
-index a36186617..ba64808af 100644
+index a361866176..ba64808af6 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
 @@ -676,3 +676,43 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):

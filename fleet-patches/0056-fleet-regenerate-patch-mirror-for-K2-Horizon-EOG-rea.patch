@@ -125,7 +125,7 @@ Assisted-by: Claude Sonnet
  create mode 100644 fleet-patches/0055-conversion-fix-flake8-lint-violations-in-k2_horizon..patch
 
 diff --git a/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch b/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch
-index 5999b381b..f169b3b55 100644
+index 5999b381ba..f169b3b557 100644
 --- a/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch
 +++ b/fleet-patches/0001-grammar-translate-PCRE-shorthand-escapes-d-w-s-to-GB.patch
 @@ -1,4 +1,4 @@
@@ -175,7 +175,7 @@ index 5999b381b..f169b3b55 100644
                               }
                               char next = sub_pattern[i + 1];
 diff --git a/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch b/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch
-index 7fc88e999..3b7c59c60 100644
+index 7fc88e9994..3b7c59c606 100644
 --- a/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch
 +++ b/fleet-patches/0002-server-fix-slot-save-restore-losing-checkpoint-based.patch
 @@ -1,4 +1,4 @@
@@ -185,7 +185,7 @@ index 7fc88e999..3b7c59c60 100644
  Date: Wed, 9 Sep 2026 20:53:28 -0500
  Subject: [PATCH] server: fix slot save/restore losing checkpoint-based cache
 diff --git a/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch b/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch
-index df35cc33b..724eb2cad 100644
+index df35cc33bb..724eb2cad7 100644
 --- a/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch
 +++ b/fleet-patches/0003-common-guard-checkpoint-update_dft-against-an-empty-.patch
 @@ -1,4 +1,4 @@
@@ -195,7 +195,7 @@ index df35cc33b..724eb2cad 100644
  Date: Wed, 9 Sep 2026 20:53:47 -0500
  Subject: [PATCH] common: guard checkpoint update_dft against an empty draft
 diff --git a/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch b/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch
-index 4bf0fbad2..45c5d065d 100644
+index 4bf0fbad23..45c5d065d8 100644
 --- a/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch
 +++ b/fleet-patches/0004-ggml-alloc-finalize-view-init-in-a-pass-after-all-bu.patch
 @@ -1,4 +1,4 @@
@@ -205,7 +205,7 @@ index 4bf0fbad2..45c5d065d 100644
  Date: Wed, 9 Sep 2026 20:54:43 -0500
  Subject: [PATCH] ggml-alloc: finalize view init in a pass after all buft
 diff --git a/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch b/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch
-index 36d24f778..29c7507b5 100644
+index 36d24f7788..29c7507b5d 100644
 --- a/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch
 +++ b/fleet-patches/0005-ci-add-sync-with-upstream-workflow-mirror-of-the-mas.patch
 @@ -1,4 +1,4 @@
@@ -215,7 +215,7 @@ index 36d24f778..29c7507b5 100644
  Date: Wed, 9 Sep 2026 20:59:11 -0500
  Subject: [PATCH] ci: add sync-with-upstream workflow (mirror of the master
 diff --git a/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch b/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch
-index 310859aa4..c88db71ab 100644
+index 310859aa40..c88db71ab5 100644
 --- a/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch
 +++ b/fleet-patches/0006-fix-repair-YAML-block-scalar-indentation-bug-in-sync.patch
 @@ -1,4 +1,4 @@
@@ -225,7 +225,7 @@ index 310859aa4..c88db71ab 100644
  Date: Wed, 9 Sep 2026 21:01:01 -0500
  Subject: [PATCH] fix: repair YAML block-scalar indentation bug in sync
 diff --git a/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch b/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch
-index 448248972..8689014cc 100644
+index 4482489723..8689014cc8 100644
 --- a/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch
 +++ b/fleet-patches/0007-server-include-id_slot-in-OAI-compatible-chat-comple.patch
 @@ -1,4 +1,4 @@
@@ -235,7 +235,7 @@ index 448248972..8689014cc 100644
  Date: Thu, 10 Sep 2026 16:57:55 -0500
  Subject: [PATCH] server: include id_slot in OAI-compatible chat completion
 diff --git a/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch b/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch
-index 53c4e1b4f..0ae672585 100644
+index 53c4e1b4f8..0ae672585c 100644
 --- a/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch
 +++ b/fleet-patches/0008-ggml-add-GGML_OP_SSM_CONV_SPLIT-CPU-Vulkan-to-skip-t.patch
 @@ -1,4 +1,4 @@
@@ -524,7 +524,7 @@ diff --git a/fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet
 similarity index 99%
 rename from fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
 rename to fleet-patches/0009-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
-index 4b4e7381e..20163428d 100644
+index 4b4e7381e3..20163428d3 100644
 --- a/fleet-patches/0010-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
 +++ b/fleet-patches/0009-fleet-mirror-fork-patches-to-disk-document-fleet-wor.patch
 @@ -1,4 +1,4 @@
@@ -535,7 +535,7 @@ index 4b4e7381e..20163428d 100644
  Subject: [PATCH] fleet: mirror fork patches to disk, document fleet workflow
 diff --git a/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch b/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch
 deleted file mode 100644
-index bbaae9340..000000000
+index bbaae9340e..0000000000
 --- a/fleet-patches/0009-fleet-revert-qwen3-coder-complex-type-parsing-regres.patch
 +++ /dev/null
 @@ -1,4917 +0,0 @@
@@ -5460,7 +5460,7 @@ diff --git a/fleet-patches/0011-server-disable-speculative-decoding-for-grammar-
 similarity index 98%
 rename from fleet-patches/0011-server-disable-speculative-decoding-for-grammar-cons.patch
 rename to fleet-patches/0010-server-disable-speculative-decoding-for-grammar-cons.patch
-index d2fde1ac3..5325953a5 100644
+index d2fde1ac3a..5325953a5d 100644
 --- a/fleet-patches/0011-server-disable-speculative-decoding-for-grammar-cons.patch
 +++ b/fleet-patches/0010-server-disable-speculative-decoding-for-grammar-cons.patch
 @@ -1,4 +1,4 @@
@@ -5473,7 +5473,7 @@ diff --git a/fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_
 similarity index 96%
 rename from fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 rename to fleet-patches/0011-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
-index 7cdbf27f2..1978b6516 100644
+index 7cdbf27f2d..1978b65164 100644
 --- a/fleet-patches/0012-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 +++ b/fleet-patches/0011-qwen3-coder-bound-xml-arg-string-with-until_one_of-n.patch
 @@ -1,4 +1,4 @@
@@ -5499,7 +5499,7 @@ diff --git a/fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-gramm
 similarity index 99%
 rename from fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
 rename to fleet-patches/0012-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
-index 18471c18c..4252ded21 100644
+index 18471c18c2..4252ded21b 100644
 --- a/fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
 +++ b/fleet-patches/0012-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
 @@ -1,4 +1,4 @@
@@ -5512,7 +5512,7 @@ diff --git a/fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-n
 similarity index 95%
 rename from fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
 rename to fleet-patches/0013-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
-index 832868abc..d5b22c880 100644
+index 832868abc0..d5b22c8808 100644
 --- a/fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
 +++ b/fleet-patches/0013-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
 @@ -1,4 +1,4 @@
@@ -5560,7 +5560,7 @@ diff --git a/fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-awar
 similarity index 99%
 rename from fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
 rename to fleet-patches/0014-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
-index d77846c8b..b4af6fa45 100644
+index d77846c8be..b4af6fa456 100644
 --- a/fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
 +++ b/fleet-patches/0014-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
 @@ -1,4 +1,4 @@
@@ -5573,7 +5573,7 @@ diff --git a/fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch b/fl
 similarity index 96%
 rename from fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch
 rename to fleet-patches/0015-model-K2-Horizon-gguf-conversion-code.patch
-index d9b27a44b..086252b7a 100644
+index d9b27a44b8..086252b7aa 100644
 --- a/fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch
 +++ b/fleet-patches/0015-model-K2-Horizon-gguf-conversion-code.patch
 @@ -1,4 +1,4 @@
@@ -5666,7 +5666,7 @@ diff --git a/fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.
 similarity index 95%
 rename from fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
 rename to fleet-patches/0016-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
-index 7ac1fb934..49364f3a5 100644
+index 7ac1fb9344..49364f3a55 100644
 --- a/fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
 +++ b/fleet-patches/0016-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
 @@ -1,4 +1,4 @@
@@ -5782,7 +5782,7 @@ diff --git a/fleet-patches/0018-model-K2-Horizon-compute-graph.patch b/fleet-pat
 similarity index 98%
 rename from fleet-patches/0018-model-K2-Horizon-compute-graph.patch
 rename to fleet-patches/0017-model-K2-Horizon-compute-graph.patch
-index a4b934d8e..dd9578bd9 100644
+index a4b934d8e7..dd9578bd94 100644
 --- a/fleet-patches/0018-model-K2-Horizon-compute-graph.patch
 +++ b/fleet-patches/0017-model-K2-Horizon-compute-graph.patch
 @@ -1,4 +1,4 @@
@@ -5808,7 +5808,7 @@ diff --git a/fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-re
 similarity index 84%
 rename from fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
 rename to fleet-patches/0018-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
-index 5f9546b5d..faff85b7f 100644
+index 5f9546b5d6..faff85b7f7 100644
 --- a/fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
 +++ b/fleet-patches/0018-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
 @@ -1,4 +1,4 @@
@@ -5929,7 +5929,7 @@ diff --git a/fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-sa
 similarity index 99%
 rename from fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-safete.patch
 rename to fleet-patches/0019-model-K2-Horizon-chat-template-and-accomodate-safete.patch
-index 4aaf71f5d..731fad726 100644
+index 4aaf71f5d5..731fad7263 100644
 --- a/fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-safete.patch
 +++ b/fleet-patches/0019-model-K2-Horizon-chat-template-and-accomodate-safete.patch
 @@ -1,4 +1,4 @@
@@ -5951,7 +5951,7 @@ diff --git a/fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-s
 similarity index 98%
 rename from fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
 rename to fleet-patches/0020-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
-index 6d9e8668c..112037dce 100644
+index 6d9e8668c2..112037dce0 100644
 --- a/fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
 +++ b/fleet-patches/0020-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
 @@ -1,4 +1,4 @@
@@ -5964,7 +5964,7 @@ diff --git a/fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-arc
 similarity index 99%
 rename from fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
 rename to fleet-patches/0021-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
-index 43dca6b5d..92caaeb99 100644
+index 43dca6b5d2..92caaeb995 100644
 --- a/fleet-patches/0022-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
 +++ b/fleet-patches/0021-fleet-regenerate-patch-mirror-for-K2-Horizon-archite.patch
 @@ -1,4 +1,4 @@
@@ -5977,7 +5977,7 @@ diff --git a/fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-
 similarity index 96%
 rename from fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-for-.patch
 rename to fleet-patches/0022-fleet-patches-reference-upstream-tracking-issue-for-.patch
-index 46d56f9f9..c7b488f72 100644
+index 46d56f9f91..c7b488f721 100644
 --- a/fleet-patches/0023-fleet-patches-reference-upstream-tracking-issue-for-.patch
 +++ b/fleet-patches/0022-fleet-patches-reference-upstream-tracking-issue-for-.patch
 @@ -1,4 +1,4 @@
@@ -5990,7 +5990,7 @@ diff --git a/fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-dif
 similarity index 98%
 rename from fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
 rename to fleet-patches/0023-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
-index 0ea01c846..c5b546939 100644
+index 0ea01c846d..c5b5469395 100644
 --- a/fleet-patches/0024-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
 +++ b/fleet-patches/0023-server-end-generation-cleanly-on-a-tool-call-diff-in.patch
 @@ -1,4 +1,4 @@
@@ -6034,7 +6034,7 @@ diff --git a/fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parse
 similarity index 97%
 rename from fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
 rename to fleet-patches/0024-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
-index 2012830a3..3aea3907f 100644
+index 2012830a36..3aea3907f9 100644
 --- a/fleet-patches/0025-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
 +++ b/fleet-patches/0024-FLEET.md-flag-pre-existing-qwen3-coder-peg-parser-te.patch
 @@ -1,4 +1,4 @@
@@ -6047,7 +6047,7 @@ diff --git a/fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call
 similarity index 99%
 rename from fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
 rename to fleet-patches/0025-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
-index 091d41620..8675bf27a 100644
+index 091d416203..8675bf27a9 100644
 --- a/fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
 +++ b/fleet-patches/0025-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
 @@ -1,4 +1,4 @@
@@ -6060,7 +6060,7 @@ diff --git a/fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_
 similarity index 96%
 rename from fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
 rename to fleet-patches/0026-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
-index 68eed53f7..99ef998a3 100644
+index 68eed53f73..99ef998a38 100644
 --- a/fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
 +++ b/fleet-patches/0026-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
 @@ -1,4 +1,4 @@
@@ -6098,7 +6098,7 @@ diff --git a/fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-
 similarity index 99%
 rename from fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-empt.patch
 rename to fleet-patches/0027-server-bound-slot-action-queue-wait-and-explain-empt.patch
-index b076d9316..fc52bef1f 100644
+index b076d93162..fc52bef1f8 100644
 --- a/fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-empt.patch
 +++ b/fleet-patches/0027-server-bound-slot-action-queue-wait-and-explain-empt.patch
 @@ -1,4 +1,4 @@
@@ -6129,7 +6129,7 @@ diff --git a/fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-ti
 similarity index 99%
 rename from fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
 rename to fleet-patches/0028-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
-index d2102b9b6..cb90516a7 100644
+index d2102b9b60..cb90516a74 100644
 --- a/fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
 +++ b/fleet-patches/0028-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
 @@ -1,4 +1,4 @@
@@ -6142,7 +6142,7 @@ diff --git a/fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fo
 similarity index 97%
 rename from fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
 rename to fleet-patches/0029-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
-index c6dc4f448..8b89a2679 100644
+index c6dc4f448c..8b89a26799 100644
 --- a/fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
 +++ b/fleet-patches/0029-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
 @@ -1,4 +1,4 @@
@@ -6155,7 +6155,7 @@ diff --git a/fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N
 similarity index 97%
 rename from fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
 rename to fleet-patches/0030-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
-index dfcbef6ad..cc6d90f48 100644
+index dfcbef6ad7..cc6d90f480 100644
 --- a/fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
 +++ b/fleet-patches/0030-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
 @@ -1,4 +1,4 @@
@@ -6217,7 +6217,7 @@ diff --git a/fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-
 similarity index 97%
 rename from fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
 rename to fleet-patches/0031-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
-index bd708ea81..4b947766a 100644
+index bd708ea812..4b947766a1 100644
 --- a/fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
 +++ b/fleet-patches/0031-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
 @@ -1,4 +1,4 @@
@@ -6288,7 +6288,7 @@ diff --git a/fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-
 similarity index 94%
 rename from fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-loca.patch
 rename to fleet-patches/0032-llama-model-weighted-per-layer-CPU-split-across-loca.patch
-index 0fd12c98c..1ee0185c4 100644
+index 0fd12c98c9..1ee0185c49 100644
 --- a/fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-loca.patch
 +++ b/fleet-patches/0032-llama-model-weighted-per-layer-CPU-split-across-loca.patch
 @@ -1,4 +1,4 @@
@@ -6386,7 +6386,7 @@ diff --git a/fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-a
 similarity index 95%
 rename from fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-aware.patch
 rename to fleet-patches/0033-llama-context-make-backend_cpu-locality-domain-aware.patch
-index 180b3dfad..f87c3c88a 100644
+index 180b3dfad3..f87c3c88ae 100644
 --- a/fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-aware.patch
 +++ b/fleet-patches/0033-llama-context-make-backend_cpu-locality-domain-aware.patch
 @@ -1,4 +1,4 @@
@@ -6443,7 +6443,7 @@ diff --git a/fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch 
 similarity index 98%
 rename from fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch
 rename to fleet-patches/0034-tests-cover-the-CPU-locality-domain-split.patch
-index 697c53d7e..88fd8770c 100644
+index 697c53d7e0..88fd8770c3 100644
 --- a/fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch
 +++ b/fleet-patches/0034-tests-cover-the-CPU-locality-domain-split.patch
 @@ -1,4 +1,4 @@
@@ -6471,7 +6471,7 @@ diff --git a/fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-dom
 similarity index 98%
 rename from fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
 rename to fleet-patches/0035-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
-index 98a712676..5b251a063 100644
+index 98a7126769..5b251a0632 100644
 --- a/fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
 +++ b/fleet-patches/0035-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
 @@ -1,4 +1,4 @@
@@ -6493,7 +6493,7 @@ diff --git a/fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-reso
 similarity index 97%
 rename from fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
 rename to fleet-patches/0036-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
-index c87b75dd0..1ed95d745 100644
+index c87b75dd0f..1ed95d7456 100644
 --- a/fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
 +++ b/fleet-patches/0036-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
 @@ -1,4 +1,4 @@
@@ -6506,7 +6506,7 @@ diff --git a/fleet-patches/0038-fleet-regenerate-patch-mirror-for-CPU-locality-d
 similarity index 99%
 rename from fleet-patches/0038-fleet-regenerate-patch-mirror-for-CPU-locality-domai.patch
 rename to fleet-patches/0037-fleet-regenerate-patch-mirror-for-CPU-locality-domai.patch
-index 8c98b37e2..7cefda015 100644
+index 8c98b37e22..7cefda0156 100644
 --- a/fleet-patches/0038-fleet-regenerate-patch-mirror-for-CPU-locality-domai.patch
 +++ b/fleet-patches/0037-fleet-regenerate-patch-mirror-for-CPU-locality-domai.patch
 @@ -1,4 +1,4 @@
@@ -6519,7 +6519,7 @@ diff --git a/fleet-patches/0039-fix-route-ggml_backend_cpu_device_get_locality_m
 similarity index 94%
 rename from fleet-patches/0039-fix-route-ggml_backend_cpu_device_get_locality_mask-.patch
 rename to fleet-patches/0038-fix-route-ggml_backend_cpu_device_get_locality_mask-.patch
-index de1ef525f..6fb9db053 100644
+index de1ef525f0..6fb9db053e 100644
 --- a/fleet-patches/0039-fix-route-ggml_backend_cpu_device_get_locality_mask-.patch
 +++ b/fleet-patches/0038-fix-route-ggml_backend_cpu_device_get_locality_mask-.patch
 @@ -1,4 +1,4 @@
@@ -6567,7 +6567,7 @@ diff --git a/fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_D
 similarity index 99%
 rename from fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
 rename to fleet-patches/0039-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
-index c57734dc4..d7c0e5056 100644
+index c57734dc45..d7c0e50567 100644
 --- a/fleet-patches/0040-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
 +++ b/fleet-patches/0039-fleet-regenerate-patch-mirror-for-GGML_BACKEND_DL-li.patch
 @@ -1,4 +1,4 @@
@@ -6580,7 +6580,7 @@ diff --git a/fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggm
 similarity index 95%
 rename from fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
 rename to fleet-patches/0040-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
-index 845a6ead5..9ee8c12e5 100644
+index 845a6ead5d..9ee8c12e57 100644
 --- a/fleet-patches/0041-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
 +++ b/fleet-patches/0040-fix-don-t-reject-a-GPU-s-host-buffer-type-in-ggml_ba.patch
 @@ -1,4 +1,4 @@
@@ -6606,7 +6606,7 @@ diff --git a/fleet-patches/0042-fleet-regenerate-patch-mirror-for-GPU-host-buft-
 similarity index 99%
 rename from fleet-patches/0042-fleet-regenerate-patch-mirror-for-GPU-host-buft-fix.patch
 rename to fleet-patches/0041-fleet-regenerate-patch-mirror-for-GPU-host-buft-fix.patch
-index bc2b28a1a..7f4bda121 100644
+index bc2b28a1ac..7f4bda1213 100644
 --- a/fleet-patches/0042-fleet-regenerate-patch-mirror-for-GPU-host-buft-fix.patch
 +++ b/fleet-patches/0041-fleet-regenerate-patch-mirror-for-GPU-host-buft-fix.patch
 @@ -1,4 +1,4 @@
@@ -6619,7 +6619,7 @@ diff --git a/fleet-patches/0043-FLEET.md-document-the-2026-09-18-CPU-split-rollo
 similarity index 97%
 rename from fleet-patches/0043-FLEET.md-document-the-2026-09-18-CPU-split-rollout-o.patch
 rename to fleet-patches/0042-FLEET.md-document-the-2026-09-18-CPU-split-rollout-o.patch
-index 68a92097a..2aa6f12b4 100644
+index 68a92097a0..2aa6f12b48 100644
 --- a/fleet-patches/0043-FLEET.md-document-the-2026-09-18-CPU-split-rollout-o.patch
 +++ b/fleet-patches/0042-FLEET.md-document-the-2026-09-18-CPU-split-rollout-o.patch
 @@ -1,4 +1,4 @@
@@ -6632,7 +6632,7 @@ diff --git a/fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup
 similarity index 99%
 rename from fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup.patch
 rename to fleet-patches/0043-fleet-regenerate-patch-mirror-for-outage-writeup.patch
-index f201b4f52..57250a902 100644
+index f201b4f52e..57250a902f 100644
 --- a/fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup.patch
 +++ b/fleet-patches/0043-fleet-regenerate-patch-mirror-for-outage-writeup.patch
 @@ -1,4 +1,4 @@
@@ -6645,7 +6645,7 @@ diff --git a/fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-l
 similarity index 97%
 rename from fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-line-.patch
 rename to fleet-patches/0044-fix-correct-units-in-CPU-split-calibration-log-line-.patch
-index c5665525f..2d8222d12 100644
+index c5665525fc..2d8222d128 100644
 --- a/fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-line-.patch
 +++ b/fleet-patches/0044-fix-correct-units-in-CPU-split-calibration-log-line-.patch
 @@ -1,4 +1,4 @@
@@ -6658,7 +6658,7 @@ diff --git a/fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-lo
 similarity index 99%
 rename from fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
 rename to fleet-patches/0045-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
-index 0a15d48af..5f0a55f81 100644
+index 0a15d48af1..5f0a55f819 100644
 --- a/fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
 +++ b/fleet-patches/0045-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
 @@ -1,4 +1,4 @@
@@ -6671,7 +6671,7 @@ diff --git a/fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitte
 similarity index 99%
 rename from fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
 rename to fleet-patches/0046-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
-index ce189fc3b..ed36d1eb9 100644
+index ce189fc3be..ed36d1eb91 100644
 --- a/fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
 +++ b/fleet-patches/0046-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
 @@ -1,4 +1,4 @@
@@ -6684,7 +6684,7 @@ diff --git a/fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverag
 similarity index 99%
 rename from fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
 rename to fleet-patches/0047-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
-index aab7d8a3d..b7c5f6c8e 100644
+index aab7d8a3d5..b7c5f6c8e3 100644
 --- a/fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
 +++ b/fleet-patches/0047-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
 @@ -1,4 +1,4 @@
@@ -6697,7 +6697,7 @@ diff --git a/fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty
 similarity index 96%
 rename from fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
 rename to fleet-patches/0048-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
-index 557d9a826..e3f12e8ed 100644
+index 557d9a8269..e3f12e8edb 100644
 --- a/fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
 +++ b/fleet-patches/0048-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
 @@ -1,4 +1,4 @@
@@ -6721,7 +6721,7 @@ index 557d9a826..e3f12e8ed 100644
                   regex_exprs = {
 diff --git a/fleet-patches/0049-fleet-regenerate-patch-mirror-for-K2-Horizon-tokeniz.patch b/fleet-patches/0049-fleet-regenerate-patch-mirror-for-K2-Horizon-tokeniz.patch
 new file mode 100644
-index 000000000..53def027f
+index 0000000000..53def027f5
 --- /dev/null
 +++ b/fleet-patches/0049-fleet-regenerate-patch-mirror-for-K2-Horizon-tokeniz.patch
 @@ -0,0 +1,14037 @@
@@ -20764,7 +20764,7 @@ index 000000000..53def027f
 +
 diff --git a/fleet-patches/0050-vocab-recognize-K2-Horizon-s-ifm-im_end-as-an-EOG-to.patch b/fleet-patches/0050-vocab-recognize-K2-Horizon-s-ifm-im_end-as-an-EOG-to.patch
 new file mode 100644
-index 000000000..77ed30c67
+index 0000000000..77ed30c672
 --- /dev/null
 +++ b/fleet-patches/0050-vocab-recognize-K2-Horizon-s-ifm-im_end-as-an-EOG-to.patch
 @@ -0,0 +1,55 @@
@@ -20825,7 +20825,7 @@ index 000000000..77ed30c67
 +
 diff --git a/fleet-patches/0051-chat-add-K2-Horizon-workaround-for-reasoning-tag-aut.patch b/fleet-patches/0051-chat-add-K2-Horizon-workaround-for-reasoning-tag-aut.patch
 new file mode 100644
-index 000000000..33ab1cb5c
+index 0000000000..33ab1cb5c9
 --- /dev/null
 +++ b/fleet-patches/0051-chat-add-K2-Horizon-workaround-for-reasoning-tag-aut.patch
 @@ -0,0 +1,95 @@
@@ -20926,7 +20926,7 @@ index 000000000..33ab1cb5c
 +
 diff --git a/fleet-patches/0052-tests-skip-test-cpu-device-split-on-non-Linux-platfo.patch b/fleet-patches/0052-tests-skip-test-cpu-device-split-on-non-Linux-platfo.patch
 new file mode 100644
-index 000000000..5a05f6947
+index 0000000000..5a05f69475
 --- /dev/null
 +++ b/fleet-patches/0052-tests-skip-test-cpu-device-split-on-non-Linux-platfo.patch
 @@ -0,0 +1,70 @@
@@ -21002,7 +21002,7 @@ index 000000000..5a05f6947
 +
 diff --git a/fleet-patches/0053-tests-fix-stale-expected-output-in-the-shorthand-cla.patch b/fleet-patches/0053-tests-fix-stale-expected-output-in-the-shorthand-cla.patch
 new file mode 100644
-index 000000000..0d465c361
+index 0000000000..0d465c3619
 --- /dev/null
 +++ b/fleet-patches/0053-tests-fix-stale-expected-output-in-the-shorthand-cla.patch
 @@ -0,0 +1,67 @@
@@ -21075,7 +21075,7 @@ index 000000000..0d465c361
 +
 diff --git a/fleet-patches/0054-tests-loosen-slot-action-timeout-test-s-join-timeout.patch b/fleet-patches/0054-tests-loosen-slot-action-timeout-test-s-join-timeout.patch
 new file mode 100644
-index 000000000..3a60f5161
+index 0000000000..3a60f5161b
 --- /dev/null
 +++ b/fleet-patches/0054-tests-loosen-slot-action-timeout-test-s-join-timeout.patch
 @@ -0,0 +1,66 @@
@@ -21147,7 +21147,7 @@ index 000000000..3a60f5161
 +
 diff --git a/fleet-patches/0055-conversion-fix-flake8-lint-violations-in-k2_horizon..patch b/fleet-patches/0055-conversion-fix-flake8-lint-violations-in-k2_horizon..patch
 new file mode 100644
-index 000000000..e985c0f84
+index 0000000000..e985c0f842
 --- /dev/null
 +++ b/fleet-patches/0055-conversion-fix-flake8-lint-violations-in-k2_horizon..patch
 @@ -0,0 +1,74 @@

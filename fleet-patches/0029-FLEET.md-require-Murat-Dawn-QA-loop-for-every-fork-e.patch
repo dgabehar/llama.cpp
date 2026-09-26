@@ -17,7 +17,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 17 insertions(+)
 
 diff --git a/FLEET.md b/FLEET.md
-index dd0024e57..58dbcb20b 100644
+index dd0024e57c..58dbcb20be 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -45,6 +45,23 @@ applies to this fork too, not just upstream contributions (`AGENTS.md`'s

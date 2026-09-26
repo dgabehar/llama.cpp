@@ -26,7 +26,7 @@ Assisted-by: Claude Opus 5.5
  5 files changed, 173 insertions(+), 34 deletions(-)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 0b2f672aa..ddaa3f899 100644
+index 0b2f672aaf..ddaa3f8993 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -24,6 +24,7 @@
@@ -223,7 +223,7 @@ index 0b2f672aa..ddaa3f899 100644
          });
          conns.push_back(std::move(conn));
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index 8819e0d03..cfe06236b 100644
+index 8819e0d03e..cfe06236b3 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
 @@ -697,6 +697,25 @@ bool socket_t::set_keepalive(int idle_sec, int interval_sec, int count) {
@@ -253,7 +253,7 @@ index 8819e0d03..cfe06236b 100644
      sockaddr_storage addr = {};
      socklen_t addr_len = sizeof(addr);
 diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
-index 1b4ad83ff..270d20f80 100644
+index 1b4ad83fff..270d20f801 100644
 --- a/ggml/src/ggml-rpc/transport.h
 +++ b/ggml/src/ggml-rpc/transport.h
 @@ -28,6 +28,10 @@ struct socket_t {
@@ -268,7 +268,7 @@ index 1b4ad83ff..270d20f80 100644
  
      void get_caps(uint8_t * local_caps);
 diff --git a/tests/test-rpc-server-multiclient.cpp b/tests/test-rpc-server-multiclient.cpp
-index 9612986e6..83cf46aa2 100644
+index 9612986e69..83cf46aa2c 100644
 --- a/tests/test-rpc-server-multiclient.cpp
 +++ b/tests/test-rpc-server-multiclient.cpp
 @@ -214,19 +214,45 @@ static int mode_probe_hello(const std::string & ep, int n) {
@@ -329,7 +329,7 @@ index 9612986e6..83cf46aa2 100644
      if (mode == "malformed")      { return mode_malformed(ep); }
      if (mode == "fin-close")      { return mode_fin_close(ep); }
 diff --git a/tests/test-rpc-server-multiclient.sh b/tests/test-rpc-server-multiclient.sh
-index 94e2eabc2..ef3046fa7 100755
+index 94e2eabc21..ef3046fa70 100755
 --- a/tests/test-rpc-server-multiclient.sh
 +++ b/tests/test-rpc-server-multiclient.sh
 @@ -35,9 +35,19 @@ wait_for_port() {

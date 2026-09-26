@@ -1,0 +1,362 @@
+From ae3897657d0513f3667fdad20082a4d35ce99680 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 21:15:06 -0500
+Subject: [PATCH] common: size -fit's auto-context probe from measured free
+ memory, not just a caught exception
+
+70f0d0168 made -fit catch the KV-cache-tensor-too-large exception
+(ggml_backend_dev_supports_op rejecting an oversized per-op tensor,
+e.g. Vulkan's maxStorageBufferRange) and back off geometrically. That
+covers a discrete GPU with a low per-op ceiling but no other memory
+surprises. On a UMA device the per-op check is not the problem: each
+layer's K/V tensor can pass it individually while the KV cache still
+adds up to more real memory than the device can back once actually
+allocated and zero-initialized.
+
+Reproduced locally on this workstation's Intel UHD 770 iGPU (Vulkan,
+UMA -- same class of device as the gfx90c/680M this was found on,
+per QA round 8 section R1b): K2-Horizon-7B with no -c, so llama-server
+uses its huge native n_ctx_train (524288) times n_parallel=auto. The
+existing fix's per-op check does reject the first probe (2097152) and
+backs off once to 1048576, exactly as designed -- and that is where it
+stops, because backing off further needs a second failure to catch,
+and none was thrown. At that size the real KV-cache buffer is nominally
+allocated fine, but zero-initializing it (llama-kv-cache.cpp's
+ggml_backend_buffer_clear right after allocation) touches pages the
+device can't really back. On this UMA backend a host-visible buffer's
+clear is a plain CPU memset (ggml_vk_buffer_memset), so the failure
+surfaces as the kernel's own page-fault path spinning forever
+(dmesg floods with "VM_FAULT_OOM leaked out to the #PF handler",
+never terminating -- worse than a crash, no graceful anything). QA's
+report of the same bug on gfx90c hit the GPU-fillBuffer variant of the
+same clear operation instead, surfacing as a real vk::DeviceLostError
+during command submission. Same root cause, two different failure
+shapes depending on whether the backend's buffer-clear path happens to
+be host-visible-and-UMA or not; neither is something a per-op support
+check could ever catch, because the tensor itself was never the
+problem.
+
+Fix (option a from the brief): before the auto-context probe ever
+tries the full n_ctx_max, take one cheap real measurement at
+n_ctx_min_total (always small enough to be safe) to get a real
+bytes-per-ctx figure, then clamp the probe so projected KV-cache use
+stays inside each device's free memory minus its existing --fit
+margin -- the same free-memory accounting the rest of this function
+already does further down for its own post-probe sizing, just applied
+before building anything instead of after a failure. For an
+integrated/UMA device, also cap its free-memory figure by the host's
+own reported free bytes: a UMA device's GTT pool is carved from host
+RAM, and (per this fleet's own prior finding on AMD APUs) its "free"
+figure is not guaranteed to reflect what every other process on the
+host is actually holding. The existing per-op-exception backoff loop
+is kept, unchanged, as defense in depth for whatever the linear
+estimate misses -- it is a linear extrapolation off one small
+measurement, not exact.
+
+Options b and c from the brief were considered and not used as the
+fix. (b): the probe path does not actually need to stop submitting
+GPU work, because it already does not -- llama_model_params.no_alloc
+routes llama-kv-cache.cpp to a dummy 0-byte buffer during a measurement
+pass, skipping both the real allocation and the clear. The clear that
+actually crashes runs during the real (post-fit) load, which every
+device has to do regardless of --fit; there is nothing to remove
+there. (c): making the Vulkan backend turn a submit failure into a
+catchable error only helps the gfx90c shape. It does nothing for the
+Intel iGPU shape reproduced here, which is a kernel-level page-fault
+stall inside a plain CPU memset, not a C++ exception anything in
+ggml-vulkan.cpp is on the stack for. ggml-vulkan.cpp already logs and
+rethrows vk::DeviceLostError from its own submit paths (see
+ggml_vk_wait_for_fence, vk_queue_handle_*::submit), which is sufficient
+existing defense in depth for that one shape.
+
+Out of scope: the n_ctx_auto && n_seq_max == 1 case (--parallel 1, no
+multiplier) runs its one and only probe with zero exception protection
+at all -- not new, not touched here, and not what the reported bug or
+its verification exercise. Restructuring that would need querying a
+model's n_ctx_train before ever building a context at all, a bigger
+change than this fix's scope.
+
+Verification (workstation only, per the session's hard rule against
+touching cluster nodes after an earlier node-crash incident this
+session -- every run below wrapped in
+`systemd-run --scope -p MemoryMax=10G -p MemorySwapMax=0`, one process
+at a time, `free -g` checked before each):
+- Before this commit, on the Intel UHD 770 iGPU: K2-Horizon-7B with no
+  -c backs off once (2097152 -> 1048576) exactly as 70f0d0168 intends,
+  then hangs forever with dmesg flooding "VM_FAULT_OOM leaked out to
+  the #PF handler" (310+ lines/5s) instead of crashing or recovering.
+  Killed by PID after capturing the log.
+- After this commit, same case, same cap: logs
+  "clamping the auto-context probe from 2097152 to 13863", loads
+  cleanly, and serves a real /v1/chat/completions request
+  (n_ctx_slot=13312 across 4 slots). The 10G cap needed a matching
+  -fitt/--fit-target margin (13000 MiB) to reflect this test's actual
+  memory ceiling, because the clamp trusts the device's own reported
+  free memory (~19-20 GiB, unaffected by this process's own cgroup) --
+  the same way a real deployment sizes -fitt from its container's
+  actual memory limit.
+- Explicit -c 8192 (same model, same cap): identical before and after
+  this commit -- no clamp log line (the new code is gated on
+  n_ctx_auto, which -c disables), n_ctx_slot=8192 exactly as requested,
+  serves a real completion.
+- Could not verify the original 70f0d0168 NVIDIA RTX 3080 Ti case in
+  this session: nvidia-smi and Vulkan both report no NVIDIA device
+  available (driver not loaded in this sandboxed session). The fix
+  does not touch src/llama-kv-cache.cpp or the per-op exception path
+  70f0d0168 added, so that regression test is structurally unaffected
+  by this change; this is not a substitute for actually running it.
+- Could not re-verify on gabesrv01's real gfx90c: an earlier attempt
+  this session to reproduce this same bug there ran the node out of
+  memory (unbounded -c probe, no cap) and took gabesrv01 NotReady,
+  requiring a manual reboot. Per the coordinator's instruction after
+  that incident, no further cluster-node testing was done for this
+  fix; all verification above is workstation-only.
+- ctest -L main: 60/60 (was 59; +1 for the new test below).
+- ctest -R split-balance: 1/1.
+- Added tests/test-fit-clamp.cpp, a new test file (see AGENTS.md's
+  bar for that -- explicitly requested for this fix, and this fork's
+  own maintainer is the one asking): direct unit tests of the new
+  common_fit_clamp_ctx_to_free_memory() pure function extracted from
+  the clamp logic (no free memory, tight budget, zero bytes_per_ctx,
+  floor behavior, floor-division rounding).
+
+Assisted-by: Claude Sonnet 5
+---
+ common/fit.cpp           | 78 +++++++++++++++++++++++++++++++++---
+ common/fit.h             | 18 +++++++++
+ tests/CMakeLists.txt     |  1 +
+ tests/test-fit-clamp.cpp | 85 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 176 insertions(+), 6 deletions(-)
+ create mode 100644 tests/test-fit-clamp.cpp
+
+diff --git a/common/fit.cpp b/common/fit.cpp
+index 155dcd4f54..430d7c687b 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -22,6 +22,19 @@ void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg) {
+     tg = g_last_graph_nodes_tg;
+ }
+ 
++uint32_t common_fit_clamp_ctx_to_free_memory(
++        uint32_t n_ctx_max, uint32_t n_ctx_min_total,
++        int64_t dev_free, int64_t fixed_use, int64_t margin, int64_t bytes_per_ctx) {
++    if (bytes_per_ctx <= 0) {
++        return n_ctx_max; // this device holds none of the KV cache, nothing to clamp
++    }
++    const int64_t budget = dev_free - fixed_use - margin;
++    const uint32_t n_ctx_safe = budget > 0
++        ? (uint32_t) std::min<int64_t>(n_ctx_max, budget / bytes_per_ctx)
++        : n_ctx_min_total;
++    return std::max(n_ctx_safe, n_ctx_min_total);
++}
++
+ // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
+ // enum to identify part of a layer for distributing its tensors:
+ enum common_layer_fraction_t {
+@@ -339,12 +352,65 @@ static void common_params_fit_impl(
+         if (n_seq_max > 1) {
+             LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
+                 __func__, n_ctx_max, n_seq_max);
+-            // a context this large can produce a per-layer KV cache tensor too large for a
+-            // device to run an op against (e.g. Vulkan's maxStorageBufferRange) even when it
+-            // would otherwise fit in free memory -- llama_init_from_model() catches that and
+-            // returns nullptr, which common_get_device_memory_data_impl() turns into this
+-            // exception. Back off geometrically until the probe actually succeeds instead of
+-            // letting an oversized probe abort llama_params_fit entirely.
++
++            // A per-op size ceiling (e.g. Vulkan's maxStorageBufferRange) is not the only way
++            // building a context this large can go wrong. On a UMA device the per-layer KV
++            // cache tensors can each pass that per-op check individually and still add up to
++            // more real memory than the device can actually back -- that fails as an uncaught
++            // driver exception or a kernel-level allocation stall, neither of which is a
++            // catchable std::runtime_error. So size the probe from real measured memory use
++            // first, rather than relying only on catching a failure this class of device may
++            // never throw in the first place.
++            //
++            // n_ctx_min_total is small enough to always be safe to build, so measure there to
++            // get a real (not per-op-limited) bytes-per-ctx figure, then use it and each
++            // device's own free memory to clamp the probe before ever trying the full size.
++            if (n_ctx_max > n_ctx_min_total && n_ctx_min_total > 0) {
++                llama_context_params cparams_min = *cparams;
++                cparams_min.n_ctx = n_ctx_min_total;
++                std::vector<ggml_backend_dev_t> devs_min;
++                dmds_t dmds_min = common_get_device_memory_data_impl(
++                    path_model, mparams, &cparams_min, devs_min, hp_ngl, hp_nct, hp_nex, log_level);
++
++                const size_t nd_min = devs_min.size();
++                // an integrated/UMA device's GTT pool is carved from the same physical RAM the
++                // host reports free -- its own "free" figure can be stale or ignore what other
++                // processes on the host are actually holding (a known gap on AMD APUs, and by
++                // the same GTT-pool mechanism potentially any other iGPU), so never trust it
++                // past what the host itself currently has free:
++                const int64_t host_free = dmds_min.back().free;
++                uint32_t n_ctx_safe = n_ctx_max;
++                for (size_t id = 0; id < dmds_min.size(); id++) {
++                    if (nd_min > 0 && id >= nd_min) {
++                        break; // dmds_min has a trailing host entry devices don't index into margins_s
++                    }
++                    // margins_s has one entry per device, or a single host entry when nd_min == 0:
++                    const size_t margin_idx = nd_min == 0 ? 0 : id;
++                    const llama_device_memory_data & dmd_min = dmds_min[id];
++                    const int64_t bytes_per_ctx = dmd_min.mb.context / n_ctx_min_total;
++                    int64_t dev_free = dmd_min.free;
++                    if (nd_min > 0 && ggml_backend_dev_type(devs_min[id]) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
++                        dev_free = std::min(dev_free, host_free);
++                    }
++                    const int64_t fixed_use = dmd_min.mb.total() - dmd_min.mb.context;
++                    const uint32_t n_ctx_safe_id = common_fit_clamp_ctx_to_free_memory(
++                        n_ctx_max, n_ctx_min_total, dev_free, fixed_use, (int64_t) margins_s[margin_idx], bytes_per_ctx);
++                    n_ctx_safe = std::min(n_ctx_safe, n_ctx_safe_id);
++                }
++                n_ctx_safe = std::max(n_ctx_safe, n_ctx_min_total);
++
++                if (n_ctx_safe < cparams->n_ctx) {
++                    LOG_WRN("%s: clamping the auto-context probe from %" PRIu32 " to %" PRIu32
++                        " so the projected KV cache fits the devices' free memory\n",
++                        __func__, cparams->n_ctx, n_ctx_safe);
++                    cparams->n_ctx = n_ctx_safe;
++                }
++            }
++
++            // The clamp above is an estimate from a linear extrapolation off a small context, so
++            // still back off geometrically on an actual failure: a per-op size ceiling can still
++            // reject a tensor the estimate thought would fit, and llama_init_from_model() turns
++            // that into a normal, catchable exception via common_get_device_memory_data_impl().
+             for (;;) {
+                 try {
+                     dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+diff --git a/common/fit.h b/common/fit.h
+index 1a6785ae35..2ff391b65c 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -70,6 +70,24 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
+                            uint32_t & hp_ngl,
+                      ggml_log_level   log_level);
+ 
++// Clamp a candidate context size so its projected KV cache memory use on one device -- linearly
++// extrapolated from bytes_per_ctx, a real measurement taken at a small, always-safe-to-build
++// context -- does not exceed that device's free memory minus a margin and whatever else it is
++// already using (fixed_use, e.g. model weights and compute buffers). Used to size --fit's
++// auto-context probe from measured memory up front, instead of only reacting to an allocation
++// failure: a per-op size ceiling is not the only way an oversized probe can go wrong, and on a
++// UMA device individual KV cache tensors can pass such a check while still not fitting in real
++// memory once summed across layers.
++// Returns n_ctx_max unchanged if bytes_per_ctx <= 0 (this device holds none of the KV cache), and
++// never returns less than n_ctx_min_total.
++uint32_t common_fit_clamp_ctx_to_free_memory(
++                           uint32_t   n_ctx_max,
++                           uint32_t   n_ctx_min_total,
++                            int64_t   dev_free,
++                            int64_t   fixed_use,
++                            int64_t   margin,
++                            int64_t   bytes_per_ctx);
++
+ // Load a model + context with no_alloc and return the per-device memory breakdown.
+ common_device_memory_data_vec common_get_device_memory_data(
+                          const char * path_model,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index eeae6ec67a..bc928c240d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -283,6 +283,7 @@ llama_build_and_test(test-json-schema.cpp)
+ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+ llama_build_and_test(test-chat-template.cpp)
+ llama_build_and_test(test-split-balance.cpp)
++llama_build_and_test(test-fit-clamp.cpp)
+ # debug tool for chat template differential analysis (not registered as a test, run it manually)
+ llama_build(test-chat-analysis.cpp)
+ llama_build_and_test(test-log.cpp)
+diff --git a/tests/test-fit-clamp.cpp b/tests/test-fit-clamp.cpp
+new file mode 100644
+index 0000000000..db4ecb4176
+--- /dev/null
++++ b/tests/test-fit-clamp.cpp
+@@ -0,0 +1,85 @@
++// Tests common_fit_clamp_ctx_to_free_memory(), the pure sizing computation --fit's auto-context
++// probe uses to clamp its starting size from measured free memory, instead of only reacting to
++// an allocation failure. See common/fit.cpp and common/fit.h for the real usage.
++
++#include "fit.h"
++
++#include <cstdio>
++
++static int n_fail = 0;
++
++#define CHECK(cond, ...) do { if (!(cond)) { n_fail++; fprintf(stderr, "FAIL %s:%d: %s -- ", __FILE__, __LINE__, #cond); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++int main() {
++    constexpr int64_t GiB = 1024 * 1024 * 1024;
++
++    // plenty of free memory -- the full requested context already fits, no clamp:
++    {
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 1'000'000, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 32 * GiB, /*fixed_use=*/ 4 * GiB, /*margin=*/ 1 * GiB,
++            /*bytes_per_ctx=*/ 1024);
++        CHECK(n_ctx == 1'000'000, "expected no clamp, got %u", n_ctx);
++    }
++
++    // free memory can only back a fraction of the requested context -- clamp to what fits:
++    {
++        // budget = 24 - 4 - 1 = 19 GiB; at 128 KiB/ctx that's exactly 155648 units of context
++        const int64_t bytes_per_ctx = 128 * 1024;
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 2'097'152, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 24 * GiB, /*fixed_use=*/ 4 * GiB, /*margin=*/ 1 * GiB,
++            bytes_per_ctx);
++        const int64_t budget = 19 * GiB;
++        const uint32_t expected = (uint32_t) (budget / bytes_per_ctx);
++        CHECK(n_ctx == expected, "expected %u, got %u", expected, n_ctx);
++        CHECK(n_ctx < 2'097'152, "clamp should have reduced n_ctx_max, got %u", n_ctx);
++    }
++
++    // fixed use (model + compute) plus margin already exceeds free memory on their own --
++    // there is no room for any context beyond the floor:
++    {
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 1'000'000, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 4 * GiB, /*fixed_use=*/ 5 * GiB, /*margin=*/ 1 * GiB,
++            /*bytes_per_ctx=*/ 1024);
++        CHECK(n_ctx == 4096, "expected the floor of 4096, got %u", n_ctx);
++    }
++
++    // this device holds none of the KV cache (e.g. every layer lives elsewhere) -- nothing to
++    // clamp, the requested size passes through unchanged regardless of free memory:
++    {
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 2'097'152, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 1 * GiB, /*fixed_use=*/ 0, /*margin=*/ 0,
++            /*bytes_per_ctx=*/ 0);
++        CHECK(n_ctx == 2'097'152, "expected passthrough, got %u", n_ctx);
++    }
++
++    // the clamp never returns less than n_ctx_min_total, even with zero free memory:
++    {
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 1'000'000, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 0, /*fixed_use=*/ 0, /*margin=*/ 0,
++            /*bytes_per_ctx=*/ 1024);
++        CHECK(n_ctx == 4096, "expected the floor of 4096, got %u", n_ctx);
++    }
++
++    // the computed size rounds down (floor division), never over budget, as long as the result
++    // stays above the n_ctx_min_total floor:
++    {
++        // budget = 5000*1024 + 100 bytes at 1024 bytes/ctx -> floor(5000 + 100/1024) = 5000
++        const uint32_t n_ctx = common_fit_clamp_ctx_to_free_memory(
++            /*n_ctx_max=*/ 1'000'000, /*n_ctx_min_total=*/ 4096,
++            /*dev_free=*/ 4 * GiB + 5000 * 1024 + 100, /*fixed_use=*/ 4 * GiB, /*margin=*/ 0,
++            /*bytes_per_ctx=*/ 1024);
++        CHECK(n_ctx == 5000, "expected floor-divided 5000, got %u", n_ctx);
++    }
++
++    if (n_fail == 0) {
++        printf("all tests passed\n");
++    } else {
++        printf("%d test(s) failed\n", n_fail);
++    }
++    return n_fail == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

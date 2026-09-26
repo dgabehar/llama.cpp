@@ -60,7 +60,7 @@ Assisted-by: Claude Sonnet
  4 files changed, 221 insertions(+), 22 deletions(-)
 
 diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
-index dc6453c6e..1a44565fe 100644
+index dc6453c6ea..1a44565fec 100644
 --- a/ggml/include/ggml-cpu.h
 +++ b/ggml/include/ggml-cpu.h
 @@ -138,6 +138,10 @@ extern "C" {
@@ -75,7 +75,7 @@ index dc6453c6e..1a44565fe 100644
  
      GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ef05905cf..03726bc32 100644
+index ef05905cf9..03726bc32e 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -34,6 +34,16 @@ extern "C" {
@@ -96,7 +96,7 @@ index ef05905cf..03726bc32 100644
      // returns true for ops that may require additional memory for fleeting data on some backends,
      // i.e. the backend buffer type's get_alloc_size may return more than ggml_nbytes for the output tensor
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..3f81b8655 100644
+index 20bf965017..3f81b8655c 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -2438,13 +2438,13 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
@@ -132,7 +132,7 @@ index 20bf96501..3f81b8655 100644
  
      GGML_UNUSED(buft);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 1df0f2bb9..e2db18ac7 100644
+index 1df0f2bb92..e2db18ac7e 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,6 +7,7 @@

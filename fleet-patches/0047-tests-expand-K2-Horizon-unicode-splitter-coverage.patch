@@ -8,7 +8,7 @@ Subject: [PATCH] tests: expand K2 Horizon unicode splitter coverage
  1 file changed, 192 insertions(+), 24 deletions(-)
 
 diff --git a/tests/test-unicode.cpp b/tests/test-unicode.cpp
-index 52edf759b..3ea2991fb 100644
+index 52edf759bb..3ea2991fb4 100644
 --- a/tests/test-unicode.cpp
 +++ b/tests/test-unicode.cpp
 @@ -1,40 +1,208 @@

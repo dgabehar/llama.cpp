@@ -18,7 +18,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 95 insertions(+), 26 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index adef60500..2e363bc39 100644
+index adef605000..2e363bc396 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -239,7 +239,8 @@ static bool dev_is_remote(ggml_backend_dev_t dev) {
@@ -261,7 +261,7 @@ index adef60500..2e363bc39 100644
          return;
      }
 diff --git a/common/split-balance.h b/common/split-balance.h
-index ccf98216a..cf6332a09 100644
+index ccf98216af..cf6332a091 100644
 --- a/common/split-balance.h
 +++ b/common/split-balance.h
 @@ -80,7 +80,8 @@ std::vector<uint32_t> common_split_balance_optimize(

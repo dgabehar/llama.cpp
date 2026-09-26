@@ -13,7 +13,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 18 insertions(+)
 
 diff --git a/include/llama.h b/include/llama.h
-index cd456c364..b62c0a5e4 100644
+index cd456c3648..b62c0a5e48 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -603,6 +603,9 @@ extern "C" {
@@ -27,7 +27,7 @@ index cd456c364..b62c0a5e4 100644
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 0950a4c21..09bfc559d 100644
+index 0950a4c214..09bfc559d7 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -35,6 +35,7 @@

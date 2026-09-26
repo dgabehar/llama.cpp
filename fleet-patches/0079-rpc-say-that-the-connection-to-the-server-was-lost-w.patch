@@ -22,7 +22,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
 
 diff --git a/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch b/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
-index 243dc0c07..ae2b0a44e 100644
+index 243dc0c077..ae2b0a44e4 100644
 --- a/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
 +++ b/fleet-patches/0074-common-split-balance-key-the-calibration-cache-by-bu.patch
 @@ -1,4 +1,4 @@
@@ -26740,7 +26740,7 @@ index 243dc0c07..ae2b0a44e 100644
  
 diff --git a/fleet-patches/0075-split-balance-ignore-overrides-that-match-nothing-va.patch b/fleet-patches/0075-split-balance-ignore-overrides-that-match-nothing-va.patch
 new file mode 100644
-index 000000000..c097adb05
+index 0000000000..c097adb053
 --- /dev/null
 +++ b/fleet-patches/0075-split-balance-ignore-overrides-that-match-nothing-va.patch
 @@ -0,0 +1,262 @@
@@ -27008,7 +27008,7 @@ index 000000000..c097adb05
 +
 diff --git a/fleet-patches/0076-server-only-an-explicit-off-value-disables-LLAMA_SER.patch b/fleet-patches/0076-server-only-an-explicit-off-value-disables-LLAMA_SER.patch
 new file mode 100644
-index 000000000..1603254e0
+index 0000000000..1603254e05
 --- /dev/null
 +++ b/fleet-patches/0076-server-only-an-explicit-off-value-disables-LLAMA_SER.patch
 @@ -0,0 +1,35 @@
@@ -27049,7 +27049,7 @@ index 000000000..1603254e0
 +
 diff --git a/fleet-patches/0077-rpc-take-a-client-slot-at-HELLO-bound-the-handshake-.patch b/fleet-patches/0077-rpc-take-a-client-slot-at-HELLO-bound-the-handshake-.patch
 new file mode 100644
-index 000000000..1ca4c040a
+index 0000000000..1ca4c040ad
 --- /dev/null
 +++ b/fleet-patches/0077-rpc-take-a-client-slot-at-HELLO-bound-the-handshake-.patch
 @@ -0,0 +1,379 @@
@@ -27434,7 +27434,7 @@ index 000000000..1ca4c040a
 +
 diff --git a/fleet-patches/0078-FLEET-QA-before-after-table-hostNetwork-for-Thunderb.patch b/fleet-patches/0078-FLEET-QA-before-after-table-hostNetwork-for-Thunderb.patch
 new file mode 100644
-index 000000000..2d86a4a52
+index 0000000000..2d86a4a526
 --- /dev/null
 +++ b/fleet-patches/0078-FLEET-QA-before-after-table-hostNetwork-for-Thunderb.patch
 @@ -0,0 +1,65 @@
@@ -27505,7 +27505,7 @@ index 000000000..2d86a4a52
 +
 diff --git a/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch b/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
 new file mode 100644
-index 000000000..ea7791c86
+index 0000000000..ea7791c863
 --- /dev/null
 +++ b/fleet-patches/0079-rpc-say-that-the-connection-to-the-server-was-lost-w.patch
 @@ -0,0 +1,27 @@
@@ -27537,7 +27537,7 @@ index 000000000..ea7791c86
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index edc8681ef..8a10098fa 100644
+index edc8681ef4..8a10098fa1 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -89,7 +89,11 @@ re-derive the equivalent change against the new upstream code, `git am
@@ -27554,7 +27554,7 @@ index edc8681ef..8a10098fa 100644
  0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
  (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index ddaa3f899..75db11c7c 100644
+index ddaa3f8993..75db11c7cd 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -35,7 +35,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");

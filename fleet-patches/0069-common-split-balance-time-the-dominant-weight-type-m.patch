@@ -21,7 +21,7 @@ Assisted-by: Claude Opus 5.5
  3 files changed, 45 insertions(+), 7 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index aca9f5357..77a9d4b52 100644
+index aca9f5357e..77a9d4b52d 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -56,8 +56,10 @@ double common_split_predict_prefill(
@@ -105,7 +105,7 @@ index aca9f5357..77a9d4b52 100644
      // optimize, then check the choice against real buffer sizes; shrink the cap of any device
      // that would overflow and try again
 diff --git a/common/split-balance.h b/common/split-balance.h
-index 70927fe8d..ccf98216a 100644
+index 70927fe8df..ccf98216af 100644
 --- a/common/split-balance.h
 +++ b/common/split-balance.h
 @@ -46,6 +46,7 @@ struct common_split_workload {
@@ -117,7 +117,7 @@ index 70927fe8d..ccf98216a 100644
  
  // predicted seconds per decoded token / for processing n_prompt tokens, for
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index 556cb7272..1c76c8c0a 100644
+index 556cb7272b..1c76c8c0a3 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -71,6 +71,7 @@ int main() {

@@ -220,11 +220,28 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
       // start/end tag pair per template (no per-request alternation), so if a deployment
       // ever switches reasoning_effort away from "low" fleet-wide, this workaround needs
       // updating to match -- it will not silently adapt.
+      //
+      // The model does not always close with the tag it opened: at "low" it often ends
+      // its thinking with the "high" tag "</ifm|think>" (seen live, 2026-09-25), which left
+      // the whole reply in reasoning_content and content empty. Any of the three close
+      // tags ends the reasoning. It also sometimes answers, emits a second close tag and
+      // starts over with a garbled copy of the answer (Dawn QA round 5: 4/120 replies, all
+      // repeat-back prompts), so a close tag after the reasoning ends the content.
+      //
+      // Round 7 found a second, separate leak: with no tools in the request, the model
+      // sometimes still emits tool-call markup after its answer (e.g. an answer ending
+      // "...answer</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>"), and none
+      // of that is a reasoning tag, so it landed in content verbatim. stray_ends_no_tools
+      // ends content at the same three tags whenever the request has no tools -- with
+      // tools offered, they're real tool-call syntax and analyze_tools parses them instead.
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
               analysis.reasoning.start = "<ifm|think_faster>";
               analysis.reasoning.end   = "</ifm|think_faster>";
+              analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
+              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
+              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>" };
               analysis.preserved_tokens.push_back("<ifm|think_faster>");
               analysis.preserved_tokens.push_back("</ifm|think_faster>");
               // Not the registered start/end pair (see comment above), but still real

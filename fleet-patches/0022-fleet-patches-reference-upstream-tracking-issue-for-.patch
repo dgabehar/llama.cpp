@@ -16,7 +16,7 @@ Assisted-by: Claude Sonnet 5
  1 file changed, 11 insertions(+)
 
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 2d5fab111..108c762ad 100644
+index 2d5fab1117..108c762adb 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -60,6 +60,17 @@ touched. 0021 is this fork's own fix for API drift in `llama_hparams::n_ff_exp`

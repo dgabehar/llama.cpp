@@ -236,9 +236,9 @@ Patches (see `fleet-patches/README.md`):
   - `LLAMA_SERVER_CKPT_CAPTURE=0` restores the old behavior.
   - eagle3 still splits.
 - **common: `--split-balance auto|decode|prefill|memory`**, default `auto`.
-  - At startup it times each device with synthetic matmuls shaped like the
-    model's layers (RPC devices over the normal protocol, so the worker
-    needs no change) and caches the result in
+  - At startup it times each device on the model's own layers (RPC devices
+    over the normal protocol, so the worker needs no change; see
+    "Per-layer calibration" below) and caches the result in
     `~/.cache/llama.cpp/split-balance.json`, keyed by device, model shape
     and build and re-measured after 7 days (`--split-calibrate force` to
     redo it now).
@@ -314,6 +314,166 @@ shape. gpt-oss-20b on a 3080 Ti:
 
 The dense matmul used before was off by about 2x.
 
+**Per-layer calibration (added 2026-09-25):** the calibration times every
+repeating layer kind the model has (hybrid models have several), with the
+real weight shapes and types, the real expert count, flash attention at the
+workload's context, and GDN (`ssm_conv` + `gated_delta_net`). It also times
+a slice of the output layer, which decode runs once per token on the last
+device. The layer's other ops (norms, RoPE, elementwise) are charged per
+node: the fit probe records the real graph's compute node count
+(`llama_graph_n_compute_nodes`) and a chain of small ops measures their cost
+on each device. The fixed cost of a graph run plus readback is measured and
+subtracted.
+
+Layers are grouped by structure, not by weight types. Mixed quants vary the
+types per layer: Qwen3.8 UD-Q4_K_XL has 53 type layouts over 3 structures,
+which took 118 s to calibrate on a 780M worker. Each structure is timed on
+its most common type layout, with decode *and prefill* scaled by the
+structure's mean bytes (added 2026-09-25, pp-predict fix: prefill was left
+unscaled at first, so a structure whose untimed types were the heavier ones
+had its prefill rate under-measured -- both the memory-bound decode matmul
+and the dequant work a prefill matmul pays scale with weight size, not just
+element count). Graphs over 50 ms are timed once per round.
+
+**Busy nodes:** after a warm-up pass each timing runs up to 4 rounds and
+keeps the fastest. A load that lasts the whole calibration slows every round
+alike, so the check is against the cache instead:
+
+- `ref|<device, model, workload>`: the device's last calibration that didn't
+  look busy. It is not keyed by build, so it survives image bumps.
+- A new calibration more than 1.25x slower than the reference logs "probably
+  busy" and is cached for 1 hour.
+- On a cache hit, a device more than 1.25x faster than cached is calibrated
+  again. So is one more than 1.5x slower, as before.
+- After a build change, a device whose quick check is within 10% of its
+  reference reuses it: about 2 s instead of a full calibration.
+- `--split-calibrate force` re-measures without dropping other cache entries.
+
+The cache is `split-balance.json` under `LLAMA_CACHE` (default
+`~/.cache/llama.cpp`). The home-infrastructure chart mounts it on a node-local
+hostPath (`master.calibrationCache`); in a bare container it's lost on every
+restart.
+
+Round 5 of QA found a use-after-free in `read_model_layers`: the GGUF context
+was freed before the per-layer key reads, and 10 of 17 fleet starts crashed.
+An ASan build with two CPU `rpc-server` workers reproduced it on every start.
+
+Predicted vs measured on a 3080 Ti:
+
+| model | pp | tg |
+|---|---|---|
+| gpt-oss-20b | 1745/1915 | 89/103 |
+| Qwen3-1.7B | 8918/7088 | 209/192 |
+| K2-Horizon-7B | 2305/1734 | 60/56 (was 153/56) |
+| Qwen3.5-4B (hybrid) | 3960/2867 | 85/100 (was 232/96) |
+
+pp still reads 20-40% high on three of the four; the error is similar
+across devices, so the chosen split is affected less than the numbers.
+
+**Calibration overrated a Vulkan device 6-8x under `GGML_VK_MAX_NODES_PER_SUBMIT=1`
+(fixed 2026-09-25, `vk-calib-overrate` branch):** on gabesrv01 (gfx90c, where
+production sets the env var as the DeviceLost mitigation above), per-layer
+calibration predicted K2-Horizon-7B tg 7.1 and Qwen3.5-4B tg 10.9, while real
+`llama-server` measured 0.89 and 1.63 -- `auto` put every layer on it. Root
+cause: the untimed-op probe (the `t_op_tg`/`t_op_pp` chain of scale ops that
+prices the layer's norms/RoPE/elementwise nodes per node) was only 64 nodes
+long. On a backend that submits one command buffer per node, that's too short
+to reach the same submit-queue depth a real decode/prefill graph runs at, so
+it measured the cheap, unsaturated per-submit cost instead of the real one --
+the same class of problem `GGML_VK_MAX_NODES_PER_SUBMIT=1`'s own fleet-wide
+note above describes for pipeline parallelism, just inside calibration's own
+timing instead of the real graph. Fixed by lengthening the chain to 256 nodes
+(8x amdgpu's 32-job `sched_jobs` ring), which required accounting for its
+tensors in `calibrate_device`'s `ggml_context` sizing too -- the untouched
+budget was tight enough that a MoE model with an output layer configured
+(gpt-oss-20b) overflowed it and crashed (`GGML_ASSERT` in `ggml_scale` /
+`ggml_new_graph_custom`); `tests/test-split-balance.cpp` gained a regression
+test for that (`test_calibrate_context_memory_budget`, a synthetic one-layer
+MoE model on the CPU backend, no GPU needed). Verified on an RTX 3080 Ti
+Laptop GPU (real per-node submit cost is much smaller there than on gfx90c's
+weak amdgpu ring, so the predicted/measured gap the env var causes is only
+~10-19%, not 6-8x, but it moves in the right direction and by roughly the
+right amount for K2-Horizon-7B, Qwen3.5-4B and gpt-oss-20b); the severity on
+gfx90c itself needs the cluster QA loop (Dawn) to confirm against a real
+`--split-balance auto` start with the env var set.
+
+**pp "regression" after `dd5756d58` (round 9 QA, 2026-09-26) was a QA
+measurement bug, not a cost-model bug.** Round 9 (`layer-calibration-dawn-qa-
+round9-2026-09-26.md` section 1, gabesrv01 master + gabesrv07 RPC worker,
+`GGML_VK_MAX_NODES_PER_SUBMIT=1`) reported pp off by -74% to -93% (e.g.
+K2-Horizon-7B: predicted 197, measured 50.8) on the same 3 models whose tg
+the decode-calibration fix had just brought inside +8-18%. That pp figure
+came from **one `/completion` call with a short, few-dozen-token prompt**
+(`n_predict 64, fresh prompt`) -- `prompt_per_second` from a prompt that
+short is dominated by the fixed per-request cost (slot init, batch build,
+one graph submit/fence), not steady-state prefill throughput, so it reads
+far below the model's real rate. Reproduced live on the identical
+gabesrv01+07/r9-image setup: an 17-18 token prompt measured `prompt_per_
+second` 23-73 t/s on K2-Horizon-7B and Qwen3.5-4B (matching round 9's 50.8 /
+20.5 almost exactly), while a fresh, genuinely long prompt (~2400 tokens,
+`cache_prompt: false`, median of 5 reps) on the *same pod, same calibration,
+same placement* measured:
+
+| model | predicted pp4096 | short-prompt (~18 tok) pp | long-prompt (~2400 tok) pp, median of 5 |
+|---|---|---|---|
+| K2-Horizon-7B | 202 | 23-73 (med. 72.7), matches round 9's 50.8 | 119.8-190.0 (med. 138.3, -32%) |
+| Qwen3.5-4B | 309 | 23-27 (med. 27.1), matches round 9's 20.5 | 197.4-281.5 (med. 281.0, -9%) |
+
+So with a realistic prompt the error collapses from -74%/-93% to -9%/-32% --
+Qwen3.5-4B lands inside the test plan's +-25% dense bar outright, and
+K2-Horizon-7B's best individual rep is -6%, with the median dragged down by
+real run-to-run throughput variance on this iGPU under
+`GGML_VK_MAX_NODES_PER_SUBMIT=1` (successive identical requests measured
+~120 t/s and ~190 t/s in a roughly bimodal pattern, unexplained by node CPU
+load, which stayed under 1.0 loadavg throughout) rather than by anything the
+cost model gets wrong. Code-level suspects named for this investigation were
+checked and are NOT the cause: `9ecf429da`'s `byte_scale` is already applied
+to prefill (`common/split-balance.cpp`, the `case 1`/`case 2` lines in
+`calibrate_device`), and the untimed-op probe already has a ubatch-sized,
+256-node-long prefill variant (`t_op_pp`, built from `x_hop` rather than a
+single-token view) mirroring the one `vk-calib-overrate` added for decode --
+prefill's own real hardware numbers above confirm that probe is adequate,
+unlike decode's before `dd5756d58`. No code change follows from this: the
+existing cost model is accurate to within the same ballpark FLEET.md already
+documents for other hardware (the 3080 Ti's post-`9ecf429da` +-9%).
+
+**Corrected pp measurement method for QA** (supersedes the single-short-
+prompt method used through round 9): measure `prompt_per_second` from the
+server's own `/completion` response over a **fresh prompt of at least 2000
+tokens** (`cache_prompt: false`, new content per rep so llama.cpp's prefix
+cache can't shortcut it), and take the **median of at least 5 reps**, not
+one -- a single rep on this class of hardware can land anywhere in a ~50%
+band. `llama-bench -p 2048` on the same placement is the ideal cross-check
+but is **not available in the `llamacpp-rpc-server` runtime image**
+(`/app` ships only `llama-server` and `rpc-server`, no `llama-bench`
+binary) -- a local build (e.g. this repo's own `build/bin/llama-bench`) is
+the only way to run it, and only reaches non-fleet hardware unless a debug
+image is built specifically for it.
+
+**Placement verified correct for Qwen3.5-4B** (round 9 flagged the `auto`
+placement change -- old 9/23 (worker/master) split vs new 0/32 all-master --
+as a literal violation of that round's "placement unchanged" pass criterion
+and asked for confirmation this isn't leaving throughput on the table).
+Forced the old split back with `-ts 9,23` on the identical gabesrv01+07/r9
+pod and measured both ways:
+
+| placement | tg (n_predict 64) | pp (median of 5, ~2400-tok prompt) |
+|---|---|---|
+| `auto` (0/32, all-master) | 13.23 (round 9) | 281.0 |
+| forced `-ts 9,23` (old split) | 10.41 | 164.8 |
+
+`auto`'s new choice is faster on **both** axes -- +27% tg, +70% pp -- not a
+regression. This confirms `dd5756d58`'s own reasoning: once decode
+calibration correctly prices RPC0's real per-hop cost under
+`GGML_VK_MAX_NODES_PER_SUBMIT=1`, keeping this pairing's layers off the RPC
+worker is the right call, not a side effect to work around. gpt-oss-20b's
+half of this same check was **not** run here -- its GGUF was not staged in
+`/var/tmp/dawn` on gabesrv01/07 at the time of this investigation (only
+`m6/{K2-Horizon-7B,Qwen3.5-4B,Qwen_Qwen3-1.7B}-*.gguf` were present) -- the
+same conclusion very likely holds (same worker/master pair, same underlying
+fix), but treat it as unverified until re-run once the model is staged
+again.
+
 **rpc-server admission:** a connection takes a `--max-clients` slot only
 once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
 slot. At most 64 connections wait for their HELLO; the oldest is closed to
@@ -344,7 +504,88 @@ where the incident happened and the 2 s default timeout applies.
   implemented", `ggml-backend-meta.cpp:702`). It would also need an
   all-reduce per layer over RPC.
 
+## RPC client receive timeout (added 2026-09-26)
+
+`rpc_dispatcher`, the RPC client that a llama-server master uses for each
+`--rpc` worker, had no receive timeout and no TCP keepalive.
+`socket_t::connect()` sets neither, and every dispatcher call blocks in
+`std::future::wait()` with no deadline. The server side already drops dead
+or idle clients, but nothing protected the client from a worker that
+accepts a request and then stops answering without closing the socket.
+The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
+`future.wait()`, and the log freezes with no `predicted` line.
+
+- **Fix:** `rpc_dispatcher::start()` sets `SO_RCVTIMEO` and TCP keepalive on
+  the client socket right after `connect()`, before the HELLO handshake.
+  - The timeout bounds only a `recv()` made while a request is
+    outstanding, so an idle client is never cut off.
+  - Default 180 s. `GGML_RPC_CLIENT_TIMEOUT_SEC` overrides it, and `0`
+    restores the old unbounded behavior.
+  - On timeout the master logs `Lost the connection to the RPC server` /
+    `recv failed` and aborts through the existing `RPC_STATUS_ASSERT`. So a
+    dead worker now causes a pod restart, not a wedged pod.
+- **How it was found:** QA round 8 (R1) saw K2-Horizon-7B hang the RPC
+  transfer against two CPU-only `rpc-server` workers. That happened while
+  the workstation was thrashing under OOM. On a clean machine the hang
+  would not reproduce by just loading or calibrating. The mechanism was
+  proved by SIGSTOP-ing one worker mid-transfer: the master hung before
+  the fix and failed within the timeout after it.
+- **Regression test:** `tests/test-rpc-client-timeout.{cpp,sh}`, label
+  `main`. A stub server completes the handshake and then goes silent, and
+  the client must fail within the window.
+- **Before raising or disabling the timeout:** the 180 s bound is per
+  request/response exchange, not per model load. The largest single
+  exchange in practice is one weight chunk or one ubatch compute, and both
+  are far shorter. If a real workload ever hits it, increase
+  `GGML_RPC_CLIENT_TIMEOUT_SEC` for that release rather than setting it
+  to 0.
+- **Not done:** making RPC errors recoverable instead of aborting, which
+  would mean replacing `RPC_STATUS_ASSERT`'s `GGML_ABORT` at every call
+  site. Aborting is acceptable under k8s, which restarts the pod.
+- **ASan gotcha:** `test-rpc-multi-server` and `test-rpc-server-multiclient`
+  report the RPC backend's intentionally never-freed registries as leaks.
+  Run ctest under ASan with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+
+- **Views over transposed tensors** (2026-09-24, `41b2ad40d`): `ggml_view_*`
+  always gives dim 0 the element stride, so slicing a transposed tensor
+  along dim 0 with more than one element reads the wrong memory. The
+  SSM_CONV_SPLIT patch's `build_conv_window` did this, and saved a garbage
+  conv state after every multi-token ubatch. draft-mtp verification (a
+  3-token ubatch) hit it on every step: Qwen3.8 leaked repeated `</think>`
+  and draft acceptance fell to ~0.37. To slice one, view the untransposed
+  tensor and transpose the view. A useful check for any speculative
+  decoding change: re-score its output with the plain target model and
+  count emitted tokens the target gives p < 0.002 (22 broken, 0 fixed).
+
+- **Prompt cache update on a busy slot** (2026-09-25, `0ab13d2bb`, upstream
+  bug, still in upstream master): a request pinned with `id_slot` to a slot
+  that is still generating is deferred, but slot selection first ran the
+  prompt cache update on that slot, loading the cached prompt that best
+  matches the pinned request into the running task. The running task then
+  finished on another conversation's context. Any model, any
+  `--cache-ram` > 0 (the default), triggered by the LiteLLM slot-persistence
+  hook's `id_slot` pins. Symptom: a reply that quotes another client's
+  conversation, and a slot whose `n_tokens` at release does not equal its
+  prompt plus generated tokens. When testing a server fix against an
+  unfixed binary, copy the whole `bin/` directory: `llama-server` loads
+  `libllama-server-impl.so` through its build-tree RUNPATH, so a copied
+  binary alone runs whatever library is currently built.
+
+- **K2-Horizon reasoning tags** (2026-09-25, `8519f34e6`): the template
+  opens the reasoning with the tag for the request's `reasoning_effort`, but
+  the model does not always close with the same one. At the fleet's "low"
+  it often ends with the "high" tag `</ifm|think>`. The parser workaround in
+  `chat-diff-analyzer.cpp` accepts all three close tags (`end_alts`).
+  Symptom when it breaks: empty `content`, the whole reply plus a raw
+  `</ifm|...>` tag in `reasoning_content`. The model also sometimes answers,
+  emits a second close tag and starts over with a garbled copy. Content ends
+  at any close tag after the reasoning (`analyze_content::stray_ends`), and
+  generation stops there too. The server gets the same tags as
+  `stop_after_reasoning`: stop strings that count only once one of them has
+  closed the reasoning, so the dropped remainder is never decoded. Neither
+  applies with `reasoning_format: none`, which returns the raw text.
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
@@ -442,3 +683,45 @@ where the incident happened and the 2 s default timeout applies.
   `ctx.is_lenient()`, so `SEQUENCE`/`REPEAT` correctly stay pending instead
   of hard-failing. Confirmed via the same before/after
   build-and-run-test-chat method as `35e651927`.
+
+- **`-fit`'s own oversized-context probe aborted the whole server on a
+  laptop with an RTX 3080 Ti + an Intel iGPU** (2026-09-25, `fit-abort`
+  branch), on plain default startup (`llama-server -m K2-Horizon-7B...
+  --jinja -c 8192`, no special flags) -- not upstream-tracked. Not actually
+  about having two GPUs: reproduced identically with `--device Vulkan1`
+  alone (still crashed), and this fork's own device-selection code already
+  drops the iGPU whenever a discrete GPU is present (`gpus.empty()` check in
+  `llama_prepare_model_devices`, `src/llama.cpp` -- upstream PR #23897), so
+  K2-Horizon-7B was already running on the 3080 Ti alone either way. Root
+  cause: llama-server's `n_parallel=auto` picked 4, and K2-Horizon-7B's
+  native `n_ctx_train` is 524288, so `-fit`'s own auto-context measurement
+  probed at `524288 * 4 = 2097152`. With `kv_unified`, layer 0's K cache
+  tensor at that size is `1024 * 2097152 * 2 bytes = 4294967296` -- exactly
+  one byte over Vulkan's `maxStorageBufferRange` (`4294967295` on this
+  GPU). `ggml_backend_vk_device_supports_op` correctly rejects the op for
+  being oversized, `ggml_backend_sched_backend_id_from_cur` finds no backend
+  willing to run it, and hits the "pre-allocated tensor ... that cannot run
+  the operation" `GGML_ABORT` (`ggml-backend.cpp:941`) -- a hard process
+  abort, not a catchable error, the first time that KV cache tensor is
+  scheduled (traced live with gdb: `ggml_backend_supports_buft` returns true
+  for the GPU backend, `ggml_backend_supports_op` is what returns false).
+  Same mechanism would hit any backend with a per-op size ceiling and any
+  model whose `n_ctx_train * n_parallel` crosses it; Vulkan/this GPU is just
+  where the numbers lined up. Fixed two places:
+  - `src/llama-kv-cache.cpp`: check `ggml_backend_dev_supports_op` on each
+    layer's K/V tensor right after creating it, before it becomes a
+    pre-allocated leaf the scheduler can hard-abort on. Throws a normal,
+    descriptive `std::runtime_error` instead (already caught by
+    `llama_init_from_model`'s existing try/catch, which logs it and returns
+    `nullptr` -- this alone turns the abort into a clean failed-to-load
+    instead of a crash, for both `--fit`'s probe and a real model load).
+  - `common/fit.cpp`: `common_params_fit_impl`'s auto-context measurement
+    (`n_ctx_auto && n_seq_max > 1`) now catches that failure and backs off
+    geometrically (halving, floored at `n_ctx_min_total`) until the probe
+    succeeds, so `-fit` actually finds a working context size instead of
+    just failing to start. Verified: K2-Horizon-7B and Qwen3.5-4B both start
+    clean on default flags (no `-c`, no `--device`, no `-fit off`) after the
+    fix; K2-Horizon-7B's probe now logs one backoff (2097152 -> 1048576) and
+    settles on a real `n_ctx` sized by the existing free-memory-margin logic
+    (unchanged). `ctest -L main` (59/59) and `ctest -R split-balance` (1/1)
+    both pass.

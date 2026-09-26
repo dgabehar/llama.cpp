@@ -20,7 +20,7 @@ Assisted-by: Claude Sonnet
 
 diff --git a/fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch b/fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
 new file mode 100644
-index 000000000..18471c18c
+index 0000000000..18471c18c2
 --- /dev/null
 +++ b/fleet-patches/0013-fleet-regenerate-patch-mirror-document-MTP-grammar-c.patch
 @@ -0,0 +1,7326 @@
@@ -7352,7 +7352,7 @@ index 000000000..18471c18c
 +
 diff --git a/fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch b/fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
 new file mode 100644
-index 000000000..832868abc
+index 0000000000..832868abc0
 --- /dev/null
 +++ b/fleet-patches/0014-vulkan-occupancy-aware-S-M-L-tile-selector-for-non-c.patch
 @@ -0,0 +1,151 @@
@@ -7508,7 +7508,7 @@ index 000000000..832868abc
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 52a0249da..11637a915 100644
+index 52a0249da4..11637a9151 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -44,6 +44,7 @@ re-derive the equivalent change against the new upstream code, `git am

@@ -30,7 +30,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0061-tests-add-test-rpc-server-multiclient.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index 0045a190c..b80ceeef4 100644
+index 0045a190cb..b80ceeef4d 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -119,6 +119,54 @@ obvious from the code alone. Flag this caveat to Murat/Dawn explicitly when
@@ -90,7 +90,7 @@ index 0045a190c..b80ceeef4 100644
  - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
 diff --git a/fleet-patches/0056-fleet-regenerate-patch-mirror-for-K2-Horizon-EOG-rea.patch b/fleet-patches/0056-fleet-regenerate-patch-mirror-for-K2-Horizon-EOG-rea.patch
 new file mode 100644
-index 000000000..3829d18ee
+index 0000000000..3829d18eed
 --- /dev/null
 +++ b/fleet-patches/0056-fleet-regenerate-patch-mirror-for-K2-Horizon-EOG-rea.patch
 @@ -0,0 +1,21230 @@
@@ -21326,7 +21326,7 @@ index 000000000..3829d18ee
 +
 diff --git a/fleet-patches/0057-rpc-serve-each-client-connection-on-its-own-thread.patch b/fleet-patches/0057-rpc-serve-each-client-connection-on-its-own-thread.patch
 new file mode 100644
-index 000000000..af3b214fe
+index 0000000000..af3b214fe6
 --- /dev/null
 +++ b/fleet-patches/0057-rpc-serve-each-client-connection-on-its-own-thread.patch
 @@ -0,0 +1,49 @@
@@ -21381,7 +21381,7 @@ index 000000000..af3b214fe
 +
 diff --git a/fleet-patches/0058-rpc-serialize-backend-compute-across-connection-thre.patch b/fleet-patches/0058-rpc-serialize-backend-compute-across-connection-thre.patch
 new file mode 100644
-index 000000000..d22fa7725
+index 0000000000..d22fa77258
 --- /dev/null
 +++ b/fleet-patches/0058-rpc-serialize-backend-compute-across-connection-thre.patch
 @@ -0,0 +1,47 @@
@@ -21434,7 +21434,7 @@ index 000000000..d22fa7725
 +
 diff --git a/fleet-patches/0059-rpc-per-connection-backends-tracked-connections-clie.patch b/fleet-patches/0059-rpc-per-connection-backends-tracked-connections-clie.patch
 new file mode 100644
-index 000000000..b7398c618
+index 0000000000..b7398c6188
 --- /dev/null
 +++ b/fleet-patches/0059-rpc-per-connection-backends-tracked-connections-clie.patch
 @@ -0,0 +1,677 @@
@@ -22117,7 +22117,7 @@ index 000000000..b7398c618
 +
 diff --git a/fleet-patches/0060-rpc-keep-one-bad-client-from-taking-down-the-whole-s.patch b/fleet-patches/0060-rpc-keep-one-bad-client-from-taking-down-the-whole-s.patch
 new file mode 100644
-index 000000000..a0a317050
+index 0000000000..a0a3170503
 --- /dev/null
 +++ b/fleet-patches/0060-rpc-keep-one-bad-client-from-taking-down-the-whole-s.patch
 @@ -0,0 +1,277 @@
@@ -22400,7 +22400,7 @@ index 000000000..a0a317050
 +
 diff --git a/fleet-patches/0061-tests-add-test-rpc-server-multiclient.patch b/fleet-patches/0061-tests-add-test-rpc-server-multiclient.patch
 new file mode 100644
-index 000000000..e65c0e72b
+index 0000000000..e65c0e72bc
 --- /dev/null
 +++ b/fleet-patches/0061-tests-add-test-rpc-server-multiclient.patch
 @@ -0,0 +1,545 @@
@@ -22950,7 +22950,7 @@ index 000000000..e65c0e72b
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 8501def9d..761c55df2 100644
+index 8501def9df..761c55df29 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -28,50 +28,63 @@ resolved (read the patch's own commit message for *why* the change exists,

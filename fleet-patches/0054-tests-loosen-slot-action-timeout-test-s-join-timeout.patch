@@ -31,7 +31,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 10 insertions(+), 3 deletions(-)
 
 diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
-index 9b39acb6b..1240a459e 100644
+index 9b39acb6b9..1240a459e2 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
 @@ -254,7 +254,7 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():

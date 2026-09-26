@@ -1,0 +1,110 @@
+From 74405080c025ca0a833bb08ed9773a8084bae593 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 17:18:13 -0500
+Subject: [PATCH] chat : drop whitespace between reasoning end tag and content
+
+K2-Horizon (and any other tag-based reasoning model) can leave a plain
+formatting newline right after its reasoning close tag, most visibly
+when the reasoning block itself is empty at low effort. The generated
+PEG parser had nothing consuming that gap: analyze_content::build_parser
+went straight from the reasoning parser's closer into the content
+capture, so the newline landed at the front of "content" instead of
+being dropped like the whitespace already discarded from a
+whitespace-only reasoning_content.
+
+Reproduced live: 2/10 requests to K2-Horizon-7B (reasoning_effort low,
+reasoning_format auto) returned content starting with "\n". The other
+8/10 returned correct content, some prefixed with the model's own ": "
+text, which must not be stripped.
+
+Fix: consume optional whitespace with p.space() right after the
+reasoning parser, before content starts -- the same pattern already
+used for the JSON response-format path in build_parser. Applied to
+both analyze_content::build_parser branches (always-wrapped and
+stray-ends), gated on ctx.extracting_reasoning so a model with no
+reasoning tags at all keeps any leading whitespace it genuinely emits.
+
+Added test-chat.cpp cases: empty reasoning + newline, empty reasoning +
+": " (must be preserved), non-empty reasoning + double newline. Live
+recheck after the fix: 0/10 leading-whitespace content.
+
+Assisted-by: Claude Sonnet 5
+---
+ common/chat-auto-parser-generator.cpp | 14 +++++++++++---
+ tests/test-chat.cpp                   | 28 +++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index c86b890002..ac367fd5eb 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -183,7 +183,10 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+ 
+     if (is_always_wrapped()) {
+         if (ctx.extracting_reasoning) {
+-            return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
++            // p.space() drops any whitespace the model leaves between the reasoning end tag
++            // and the content start tag (e.g. an empty K2-Horizon reasoning block followed by
++            // a formatting newline) so it never lands at the front of content.
++            return ctx.reasoning_parser + p.space() + start + p.content(p.until(end)) + end + p.end();
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
+@@ -195,8 +198,13 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+         ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
+     }
+ 
+-    if (!ends.empty() && ctx.extracting_reasoning) {
+-        return ctx.reasoning_parser + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
++    if (ctx.extracting_reasoning) {
++        // Same whitespace-drop as above: only when reasoning was actually parsed out, so a
++        // model with no reasoning tags at all keeps any leading whitespace it genuinely emits.
++        if (!ends.empty()) {
++            return ctx.reasoning_parser + p.space() + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
++        }
++        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
+     }
+     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
+ }
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 80bc3b72ae..bbfda51a17 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -5020,6 +5020,34 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect_reasoning("Thinking.")
+             .expect_content("The sky is blue.")
+             .run();
++
++        // Empty reasoning block (low effort closes immediately), then a formatting newline
++        // before the real answer (seen live, 2026-09-25): the newline must not leak into
++        // content, and the whitespace-only reasoning block reports no reasoning_content.
++        tst.test("</ifm|think_faster>\nbuild-cache-07.example.net")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("")
++            .expect_content("build-cache-07.example.net")
++            .run();
++
++        // Empty reasoning block, then the model's own ": " prefix (real text, not
++        // formatting whitespace) -- must be preserved verbatim at the start of content.
++        tst.test("</ifm|think_faster>: build-cache-07.example.net")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("")
++            .expect_content(": build-cache-07.example.net")
++            .run();
++
++        // Non-empty reasoning followed by a double newline before the answer: same
++        // whitespace-drop applies regardless of whether the reasoning body was empty.
++        tst.test("Reasoning text.</ifm|think_faster>\n\nAnswer text.")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("Reasoning text.")
++            .expect_content("Answer text.")
++            .run();
+     }
+ 
+     // Kimi-K2-Thinking tests - custom parser
+-- 
+2.43.0
+

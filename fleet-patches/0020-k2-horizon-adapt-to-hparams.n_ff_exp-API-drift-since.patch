@@ -19,7 +19,7 @@ Assisted-by: Claude Sonnet 5
  1 file changed, 6 insertions(+), 6 deletions(-)
 
 diff --git a/src/models/k2-horizon.cpp b/src/models/k2-horizon.cpp
-index ac901da50..97488d1c6 100644
+index ac901da50a..97488d1c67 100644
 --- a/src/models/k2-horizon.cpp
 +++ b/src/models/k2-horizon.cpp
 @@ -10,7 +10,7 @@ void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {

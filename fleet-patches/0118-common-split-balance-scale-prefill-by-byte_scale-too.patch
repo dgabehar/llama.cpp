@@ -1,0 +1,162 @@
+From 9ecf429da6279c84709e9b806884181f2c5fa14c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 16:36:08 -0500
+Subject: [PATCH] common : split-balance: scale prefill by byte_scale too, not
+ just decode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Layer kinds are grouped by structure and calibrated on one representative
+weight-type layout; byte_scale corrects the calibrated rate for the kind's
+real mean bytes when its layers mix quant types (e.g. Qwen3.5's alternating
+Q4_K/Q6_K attn_v and ffn_down). Decode applied this correction from the
+start; prefill silently didn't, so a kind whose untimed types were the
+heavier ones had its prefill compute rate under-measured, and pp prediction
+read high wherever that mattered -- QA logged +21-24% on Qwen3.5-4B and MoE
+2-device splits, a regression from +11% before the layer-kind grouping
+landed.
+
+Locally, the CPU RPC worker is too slow relative to the RTX 3080 Ti for
+either --split-balance auto or prefill to choose it for any real layer
+share, so only a single-device (Vulkan1) split was reachable for
+verification. On that split, predicted vs measured pp2048 is within ±9%
+before this change and improves slightly after it (Qwen3.5-4B: 8.9% -> 7.3%;
+Qwen3-1.7B: 2.1% -> -3.8%, still well inside tolerance); tg is unaffected by
+construction, since the decode path is untouched. The byte_scale magnitudes
+measured on these two local GGUFs (0.95-1.07) are modest, so this change
+alone likely isn't the full story behind the cluster's larger regression --
+that probably needs a real multi-device pipeline (comparable-speed devices)
+to fully reproduce, which this laptop's GPU+CPU-RPC pairing can't provide.
+The fix is still correct on its own terms: it closes a real, documented
+asymmetry between decode and prefill scaling, verified with a new
+regression test that fails without it.
+
+Added test-split-balance.cpp coverage that calibrates a model with and
+without an inflated byte_scale on one layer kind and checks that the
+calibrated prefill rate moves accordingly (it didn't, before this change).
+
+Assisted-by: Claude Sonnet 5
+---
+ FLEET.md                     |  8 +++++--
+ common/split-balance.cpp     |  6 ++---
+ common/split-balance.h       |  4 +++-
+ tests/test-split-balance.cpp | 44 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index cd36b75b5f..c7774b1323 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -328,8 +328,12 @@ subtracted.
+ Layers are grouped by structure, not by weight types. Mixed quants vary the
+ types per layer: Qwen3.8 UD-Q4_K_XL has 53 type layouts over 3 structures,
+ which took 118 s to calibrate on a 780M worker. Each structure is timed on
+-its most common type layout, with decode scaled by the structure's mean
+-bytes. Graphs over 50 ms are timed once per round.
++its most common type layout, with decode *and prefill* scaled by the
++structure's mean bytes (added 2026-09-25, pp-predict fix: prefill was left
++unscaled at first, so a structure whose untimed types were the heavier ones
++had its prefill rate under-measured -- both the memory-bound decode matmul
++and the dequant work a prefill matmul pays scale with weight size, not just
++element count). Graphs over 50 ms are timed once per round.
+ 
+ **Busy nodes:** after a warm-up pass each timing runs up to 4 rounds and
+ keeps the fastest. A load that lasts the whole calibration slows every round
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+index 1b24cf59e8..aac7b166c8 100644
+--- a/common/split-balance.cpp
++++ b/common/split-balance.cpp
+@@ -721,9 +721,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
+             case 3: out.s_output_byte = t.best / (double) ggml_nbytes(out_w); break;
+             case 4: t_op_tg = t.best / n_chain; break;
+             case 5: t_op_pp = t.best / n_chain; break;
+-            case 0: t_decode  += t.share * t.best * t.byte_scale; break;
+-            case 1: t_prefill += t.share * t.best;             break;
+-            case 2: t_prefill += t.share * t.best / exp_scale; break;
++            case 0: t_decode  += t.share * t.best * t.byte_scale;             break;
++            case 1: t_prefill += t.share * t.best * t.byte_scale;             break;
++            case 2: t_prefill += t.share * t.best * t.byte_scale / exp_scale; break;
+         }
+     }
+     // the layer's other ops: its real node count minus the ops timed above (their helper copies excluded)
+diff --git a/common/split-balance.h b/common/split-balance.h
+index 6ee75fe4c4..a6460f23ee 100644
+--- a/common/split-balance.h
++++ b/common/split-balance.h
+@@ -85,7 +85,9 @@ struct common_split_calib_layer {
+     std::vector<common_split_calib_weight> weights;
+     double   share      = 1.0;
+     // mean weight bytes of the layers of this kind / bytes of the timed one: layers that differ only in
+-    // weight types (mixed quants) are one kind, timed on its most common types, decode scaled by bytes
++    // weight types (mixed quants) are one kind, timed on its most common types, decode and prefill scaled
++    // by bytes (both the memory-bound decode matmul and the quantized dequant work a prefill matmul pays
++    // scale with weight size, not just element count)
+     double   byte_scale = 1.0;
+     uint32_t n_head     = 0; // 0: no attention op in this layer
+     uint32_t n_head_kv  = 0;
+diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
+index 044a30ec0d..2007a5e18f 100644
+--- a/tests/test-split-balance.cpp
++++ b/tests/test-split-balance.cpp
+@@ -193,6 +193,49 @@ static void test_calibrate_cpu() {
+     std::filesystem::remove(cache);
+ }
+ 
++// Regression test: grouped layer kinds are timed on one representative weight-type layout, and
++// byte_scale corrects for the kind's real mean bytes when its layers mix quant types. Decode
++// (memory-bound) applied this scale from the start; prefill (compute-bound) silently didn't, so a
++// kind whose untimed types were the heavier ones had its prefill rate under-measured -- this is what
++// made the fork's pp prediction read high after grouping landed. Prefill must react to byte_scale too.
++static void test_byte_scale_affects_prefill() {
++    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    if (cpu == nullptr) {
++        fprintf(stderr, "no CPU device, skipping the byte_scale/prefill test\n");
++        return;
++    }
++    common_split_workload wl;
++    wl.n_prompt = 256;
++    wl.n_gen    = 16;
++    wl.n_ubatch = 64;
++    wl.n_batch  = 256;
++
++    auto m_base = tiny_model();
++    auto p_base = common_split_balance_calibrate({ cpu }, m_base, wl, "", false);
++    CHECK(p_base.size() == 1 && p_base[0].s_prefill_flop > 0, "baseline calibration failed");
++    if (p_base.size() != 1) {
++        return;
++    }
++
++    // the gdn kind is half the model's layers (share 0.5); scaling its byte_scale up a lot must move
++    // the aggregate calibrated rate by a clearly-measurable amount if prefill reacts to it at all
++    auto m_scaled = m_base;
++    m_scaled.layers[1].byte_scale = 3.0;
++    auto p_scaled = common_split_balance_calibrate({ cpu }, m_scaled, wl, "", false);
++    CHECK(p_scaled.size() == 1 && p_scaled[0].s_prefill_flop > 0, "scaled-model calibration failed");
++    if (p_scaled.size() != 1) {
++        return;
++    }
++
++    CHECK(p_scaled[0].s_prefill_flop > p_base[0].s_prefill_flop * 1.2,
++          "byte_scale must raise the calibrated prefill rate too, not just decode (got %.6g vs %.6g)",
++          p_scaled[0].s_prefill_flop, p_base[0].s_prefill_flop);
++    // sanity check: decode should react to the same knob (this direction already worked pre-fix)
++    CHECK(p_scaled[0].s_decode_byte > p_base[0].s_decode_byte * 1.2,
++          "sanity: byte_scale should also raise the decode rate (got %.6g vs %.6g)",
++          p_scaled[0].s_decode_byte, p_base[0].s_decode_byte);
++}
++
+ int main() {
+     const auto shape = qwen27b();
+     // device order as llama.cpp lists them: RPC first, then the local GPU
+@@ -281,6 +324,7 @@ int main() {
+     }
+ 
+     test_calibrate_cpu();
++    test_byte_scale_affects_prefill();
+ 
+     if (n_fail == 0) {
+         printf("test-split-balance: OK\n");
+-- 
+2.43.0
+

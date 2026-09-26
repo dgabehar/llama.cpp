@@ -19,7 +19,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0063-rpc-don-t-reject-a-client-because-a-just-closed-prob.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index b80ceeef4..d330b9eb9 100644
+index b80ceeef4d..d330b9eb9a 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -131,7 +131,7 @@ Aug-2026 worker liveness-kill problem (the chart's `failureThreshold: 45`
@@ -76,7 +76,7 @@ index b80ceeef4..d330b9eb9 100644
  
 diff --git a/fleet-patches/0062-fleet-regenerate-patch-mirror-document-rpc-server-mu.patch b/fleet-patches/0062-fleet-regenerate-patch-mirror-document-rpc-server-mu.patch
 new file mode 100644
-index 000000000..d29bc5a80
+index 0000000000..d29bc5a805
 --- /dev/null
 +++ b/fleet-patches/0062-fleet-regenerate-patch-mirror-document-rpc-server-mu.patch
 @@ -0,0 +1,23088 @@
@@ -23170,7 +23170,7 @@ index 000000000..d29bc5a80
 +
 diff --git a/fleet-patches/0063-rpc-don-t-reject-a-client-because-a-just-closed-prob.patch b/fleet-patches/0063-rpc-don-t-reject-a-client-because-a-just-closed-prob.patch
 new file mode 100644
-index 000000000..04c4cd63e
+index 0000000000..04c4cd63e2
 --- /dev/null
 +++ b/fleet-patches/0063-rpc-don-t-reject-a-client-because-a-just-closed-prob.patch
 @@ -0,0 +1,138 @@
@@ -23313,7 +23313,7 @@ index 000000000..04c4cd63e
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 761c55df2..2dc6083a7 100644
+index 761c55df29..2dc6083a7a 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -81,6 +81,7 @@ re-derive the equivalent change against the new upstream code, `git am

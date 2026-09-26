@@ -1507,6 +1507,11 @@ class peg_test_builder {
         return *this;
     }
 
+    peg_test_builder & template_kwarg(const std::string & key, const std::string & json_value) {
+        tc_.params.chat_template_kwargs[key] = json_value;
+        return *this;
+    }
+
     peg_test_builder & parallel_tool_calls(bool val) {
         tc_.params.parallel_tool_calls = val;
         return *this;
@@ -4949,6 +4954,99 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 // custom delimiter: the payload itself contains )"
                 { "python", R"JSON({"code":"print('hey')"})JSON", "" },
             })
+            .run();
+    }
+
+    // K2-Horizon: reasoning tags depend on reasoning_effort; at "low" the model may close
+    // its thinking with any of the three effort tags
+    {
+        auto tst = peg_tester("models/templates/k2-horizon.jinja", detailed_debug);
+
+        for (const char * close : { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" }) {
+            tst.test(std::string("3:40 + 2:55 = 6:35.") + close + "6:35 PM.")
+                .template_kwarg("reasoning_effort", "\"low\"")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("3:40 + 2:55 = 6:35.")
+                .expect_content("6:35 PM.")
+                .run();
+        }
+
+        // a second close tag after the answer: the garbled restart after it is dropped
+        tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Repeat it.")
+            .expect_content("git.example.com")
+            .run();
+
+        // No tools offered, but the model hallucinates tool-call markup after its answer
+        // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
+        // kept, and the markup itself is dropped like a stray reasoning close tag.
+        tst.test("Reasoning here.</ifm|think_faster>Sure, the address is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Reasoning here.")
+            .expect_content("Sure, the address is git.example.co")
+            .run();
+
+        // Same stray tool-call markup, but content starts after a real reasoning block.
+        tst.test("3:40 + 2:55 = 6:35.</ifm|think_faster>6:35 PM.</ifm|tool_call></ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("3:40 + 2:55 = 6:35.")
+            .expect_content("6:35 PM.")
+            .run();
+
+        // Same markup, but tools ARE offered this time: it's real tool-call syntax now, not a
+        // stray leak, and must still parse as a tool call rather than getting cut from content.
+        tst.test("Let me look that up.</ifm|think_faster>"
+                 "<ifm|tool_calls>\n<ifm|tool_call>special_function\n"
+                 "<ifm|arg_key>arg1</ifm|arg_key>\n<ifm|arg_value>1</ifm|arg_value>\n"
+                 "</ifm|tool_call>\n</ifm|tool_calls>")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect_reasoning("Let me look that up.")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+            })
+            .run();
+
+        // Plain answer, no reasoning close-tag repeat, no tool markup, no tools offered:
+        // unaffected by either stray_ends list.
+        tst.test("Thinking.</ifm|think_faster>The sky is blue.")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Thinking.")
+            .expect_content("The sky is blue.")
+            .run();
+
+        // Empty reasoning block (low effort closes immediately), then a formatting newline
+        // before the real answer (seen live, 2026-09-25): the newline must not leak into
+        // content, and the whitespace-only reasoning block reports no reasoning_content.
+        tst.test("</ifm|think_faster>\nbuild-cache-07.example.net")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("")
+            .expect_content("build-cache-07.example.net")
+            .run();
+
+        // Empty reasoning block, then the model's own ": " prefix (real text, not
+        // formatting whitespace) -- must be preserved verbatim at the start of content.
+        tst.test("</ifm|think_faster>: build-cache-07.example.net")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("")
+            .expect_content(": build-cache-07.example.net")
+            .run();
+
+        // Non-empty reasoning followed by a double newline before the answer: same
+        // whitespace-drop applies regardless of whether the reasoning body was empty.
+        tst.test("Reasoning text.</ifm|think_faster>\n\nAnswer text.")
+            .template_kwarg("reasoning_effort", "\"low\"")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Reasoning text.")
+            .expect_content("Answer text.")
             .run();
     }
 

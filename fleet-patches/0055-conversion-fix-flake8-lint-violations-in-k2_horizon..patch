@@ -18,7 +18,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/conversion/k2_horizon.py b/conversion/k2_horizon.py
-index 2d7722209..2e62027b1 100644
+index 2d77222095..2e62027b1f 100644
 --- a/conversion/k2_horizon.py
 +++ b/conversion/k2_horizon.py
 @@ -9,6 +9,7 @@ from torch import Tensor

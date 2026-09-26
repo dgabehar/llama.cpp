@@ -39,6 +39,18 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     data.preserved_tokens  = autoparser.preserved_tokens;
     data.additional_stops.insert(data.additional_stops.end(),
         autoparser.additional_stops.begin(), autoparser.additional_stops.end());
+    // the tags that end the content once the reasoning is closed also stop the generation there, so the
+    // dropped remainder is not decoded (and waited for) to EOS; only when the parser extracts reasoning
+    if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && autoparser.reasoning.mode != reasoning_mode::NONE) {
+        data.stops_after_reasoning = autoparser.content.stray_ends;
+        // stray_ends_no_tools are real tool-call syntax once tools are offered, so they must never
+        // stop generation in that case -- only fold them in when this request has none.
+        bool request_has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+        if (!request_has_tools) {
+            data.stops_after_reasoning.insert(data.stops_after_reasoning.end(),
+                autoparser.content.stray_ends_no_tools.begin(), autoparser.content.stray_ends_no_tools.end());
+        }
+    }
 
     std::string parser_generation_prompt = data.generation_prompt;
 
@@ -143,6 +155,16 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
     }
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+        if (!end.empty() && !end_alts.empty()) {
+            std::vector<std::string>       ends = { trim_whitespace(end) };
+            std::vector<common_peg_parser> closers = { p.optspace(end) };
+            for (const auto & alt : end_alts) {
+                ends.push_back(trim_whitespace(alt));
+                closers.push_back(p.optspace(alt));
+            }
+            auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
+            return p.optional(start.empty() ? body : p.optspace(start) + body);
+        }
         if (!end.empty()) {
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
@@ -161,9 +183,28 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
 
     if (is_always_wrapped()) {
         if (ctx.extracting_reasoning) {
-            return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
+            // p.space() drops any whitespace the model leaves between the reasoning end tag
+            // and the content start tag (e.g. an empty K2-Horizon reasoning block followed by
+            // a formatting newline) so it never lands at the front of content.
+            return ctx.reasoning_parser + p.space() + start + p.content(p.until(end)) + end + p.end();
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+    }
+    // stray_ends_no_tools only applies when this request has no tools -- with tools offered they're
+    // real tool-call syntax, parsed by analyze_tools instead, so this path never sees them (build_parser
+    // only calls analyze_content::build_parser once tools are ruled out for this request).
+    std::vector<std::string> ends = stray_ends;
+    if (!(ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty())) {
+        ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
+    }
+
+    if (ctx.extracting_reasoning) {
+        // Same whitespace-drop as above: only when reasoning was actually parsed out, so a
+        // model with no reasoning tags at all keeps any leading whitespace it genuinely emits.
+        if (!ends.empty()) {
+            return ctx.reasoning_parser + p.space() + p.content(p.until_one_of(ends)) + p.optional(p.rest()) + p.end();
+        }
+        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
     }
     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }

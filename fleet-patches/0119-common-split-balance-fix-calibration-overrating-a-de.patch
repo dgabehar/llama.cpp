@@ -1,0 +1,172 @@
+From b4a0f6c8514b59daea16c37e1ea27fb4a80c58ff Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 16:56:24 -0500
+Subject: [PATCH] common : split-balance: fix calibration overrating a device
+ under per-node Vulkan submits
+
+The untimed-op probe (t_op_tg/t_op_pp, a chain of scale ops pricing a
+layer's norms/RoPE/elementwise nodes per node) was only 64 nodes long.
+On a backend that submits one command buffer per node
+(GGML_VK_MAX_NODES_PER_SUBMIT=1, the DeviceLost mitigation this fork
+already carries for gfx90c), that chain is too short to reach the
+submit-queue depth a real decode/prefill graph runs at, so it measured
+the cheap, unsaturated per-submit cost instead of the real one and
+calibration overrated the device -- 6-8x on gfx90c for dense q4_K
+models (K2-Horizon-7B, Qwen3.5-4B), which then put every layer on it
+under --split-balance auto.
+
+Fix: lengthen the chain to 256 nodes (8x amdgpu's 32-job sched_jobs
+ring). This needed calibrate_device's ggml_context sizing to account
+for the chain's own tensors too -- the untouched budget was tight
+enough that a MoE model with an output layer configured (gpt-oss-20b)
+overflowed it and crashed. Added a regression test for that
+(test_calibrate_context_memory_budget, a synthetic one-layer MoE model
+on the CPU backend, no GPU needed).
+
+Verified on an RTX 3080 Ti Laptop GPU: the real per-node submit cost is
+much smaller there than on gfx90c's weak amdgpu ring, so the
+predicted/measured gap the env var causes is only ~10-19%, not 6-8x,
+but it now moves in the right direction and by roughly the right
+amount for K2-Horizon-7B, Qwen3.5-4B and gpt-oss-20b, with no
+regression when the env var is unset. See FLEET.md for the full
+writeup, including what still needs gfx90c hardware to confirm.
+
+Assisted-by: Claude Sonnet 5
+---
+ FLEET.md                     | 27 +++++++++++++++++++++++++++
+ common/split-balance.cpp     | 15 +++++++++++----
+ tests/test-split-balance.cpp | 33 +++++++++++++++++++++++++++++++++
+ 3 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index c7774b1323..9c7a87e834 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -370,6 +370,33 @@ Predicted vs measured on a 3080 Ti:
+ pp still reads 20-40% high on three of the four; the error is similar
+ across devices, so the chosen split is affected less than the numbers.
+ 
++**Calibration overrated a Vulkan device 6-8x under `GGML_VK_MAX_NODES_PER_SUBMIT=1`
++(fixed 2026-09-25, `vk-calib-overrate` branch):** on gabesrv01 (gfx90c, where
++production sets the env var as the DeviceLost mitigation above), per-layer
++calibration predicted K2-Horizon-7B tg 7.1 and Qwen3.5-4B tg 10.9, while real
++`llama-server` measured 0.89 and 1.63 -- `auto` put every layer on it. Root
++cause: the untimed-op probe (the `t_op_tg`/`t_op_pp` chain of scale ops that
++prices the layer's norms/RoPE/elementwise nodes per node) was only 64 nodes
++long. On a backend that submits one command buffer per node, that's too short
++to reach the same submit-queue depth a real decode/prefill graph runs at, so
++it measured the cheap, unsaturated per-submit cost instead of the real one --
++the same class of problem `GGML_VK_MAX_NODES_PER_SUBMIT=1`'s own fleet-wide
++note above describes for pipeline parallelism, just inside calibration's own
++timing instead of the real graph. Fixed by lengthening the chain to 256 nodes
++(8x amdgpu's 32-job `sched_jobs` ring), which required accounting for its
++tensors in `calibrate_device`'s `ggml_context` sizing too -- the untouched
++budget was tight enough that a MoE model with an output layer configured
++(gpt-oss-20b) overflowed it and crashed (`GGML_ASSERT` in `ggml_scale` /
++`ggml_new_graph_custom`); `tests/test-split-balance.cpp` gained a regression
++test for that (`test_calibrate_context_memory_budget`, a synthetic one-layer
++MoE model on the CPU backend, no GPU needed). Verified on an RTX 3080 Ti
++Laptop GPU (real per-node submit cost is much smaller there than on gfx90c's
++weak amdgpu ring, so the predicted/measured gap the env var causes is only
++~10-19%, not 6-8x, but it moves in the right direction and by roughly the
++right amount for K2-Horizon-7B, Qwen3.5-4B and gpt-oss-20b); the severity on
++gfx90c itself needs the cluster QA loop (Dawn) to confirm against a real
++`--split-balance auto` start with the env var set.
++
+ **rpc-server admission:** a connection takes a `--max-clients` slot only
+ once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
+ slot. At most 64 connections wait for their HELLO; the oldest is closed to
+diff --git a/common/split-balance.cpp b/common/split-balance.cpp
+index aac7b166c8..5cc99057b1 100644
+--- a/common/split-balance.cpp
++++ b/common/split-balance.cpp
+@@ -391,6 +391,13 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
+     const double  exp_scale = (double) n_e / std::max<uint32_t>(1, m.n_expert);
+     const int64_t ub_exp    = std::max<int64_t>(1, (int64_t) std::llround(ub * exp_scale));
+ 
++    // what one node costs to submit and run: a chain of scales over one token's activations (dispatch bound)
++    // and over a ubatch of them (memory bound). Long enough that a backend which submits one command buffer
++    // per node (e.g. Vulkan with GGML_VK_MAX_NODES_PER_SUBMIT=1) pays its real per-submit cost here too, not
++    // just the cheap, unsaturated cost a short chain would see -- the same reason the weight/attention/GDN
++    // graphs above are too small to show it on their own (see t_op_tg/t_op_pp below).
++    constexpr int n_chain = 256;
++
+     size_t n_tensors = 16;
+     for (const auto & l : m.layers) {
+         n_tensors += 6 * l.weights.size() + 32;
+@@ -402,7 +409,8 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
+     };
+     ggml_context_ptr wctx { ggml_init(wparams) };          // weights and inputs, allocated once
+     ggml_init_params gparams = {
+-        /* .mem_size   = */ ggml_tensor_overhead() * n_tensors * 4 + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
++        // 2 * n_chain: the untimed-op probe below builds two chains of n_chain scale nodes in this same context
++        /* .mem_size   = */ ggml_tensor_overhead() * (n_tensors * 4 + 2 * n_chain) + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
+         /* .mem_buffer = */ nullptr,
+         /* .no_alloc   = */ true,
+     };
+@@ -632,9 +640,8 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
+         }
+     }
+ 
+-    // what one of the untimed small ops costs: a chain of scales over one token's activations (dispatch bound)
+-    // and over a ubatch of them (memory bound)
+-    constexpr int n_chain = 64;
++    // the untimed-op probe: a chain of scales over one token's activations (dispatch bound) and over a
++    // ubatch of them (memory bound) -- see n_chain's declaration above for why it needs to be this long
+     for (int j = 0; j < 2; j++) {
+         ggml_cgraph * g_ops = ggml_new_graph(gctx.get());
+         ggml_tensor * y = j == 0 ? ggml_view_1d(gctx.get(), x_hop, n_embd, 0) : x_hop;
+diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
+index 2007a5e18f..41de538bc0 100644
+--- a/tests/test-split-balance.cpp
++++ b/tests/test-split-balance.cpp
+@@ -236,6 +236,38 @@ static void test_byte_scale_affects_prefill() {
+           p_scaled[0].s_decode_byte, p_base[0].s_decode_byte);
+ }
+ 
++// a single MoE layer with an output layer configured: this makes calibrate_device build a graph of every
++// kind it can (decode, prefill, prefill_exp, output), leaving little slack in the ggml_context sized for
++// them. Regression test for a context-memory-pool overflow (GGML_ASSERT in ggml_scale/ggml_new_graph_custom)
++// that a too-small budget for the untimed-op probe's chain of scale ops caused.
++static void test_calibrate_context_memory_budget() {
++    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    if (cpu == nullptr) {
++        fprintf(stderr, "no CPU device, skipping the context memory budget test\n");
++        return;
++    }
++    common_split_calib_model m;
++    m.n_embd        = 256;
++    m.n_expert      = 8;
++    m.n_expert_used = 2;
++    common_split_calib_layer l;
++    l.share   = 1.0;
++    l.weights = { cw(256, 256, GGML_TYPE_Q4_K, 8) };
++    m.layers  = { l };
++    m.output  = cw(256, 2048, GGML_TYPE_Q6_K);
++    m.layer_bytes = 1e6;
++    m.layer_flops = 1e6;
++
++    common_split_workload wl;
++    wl.n_prompt = 256;
++    wl.n_gen    = 16;
++    wl.n_ubatch = 64;
++    wl.n_batch  = 256;
++
++    auto p = common_split_balance_calibrate({ cpu }, m, wl, "", false);
++    CHECK(p.size() == 1 && p[0].s_decode_byte > 0, "calibration ran out of context memory");
++}
++
+ int main() {
+     const auto shape = qwen27b();
+     // device order as llama.cpp lists them: RPC first, then the local GPU
+@@ -325,6 +357,7 @@ int main() {
+ 
+     test_calibrate_cpu();
+     test_byte_scale_affects_prefill();
++    test_calibrate_context_memory_budget();
+ 
+     if (n_fail == 0) {
+         printf("test-split-balance: OK\n");
+-- 
+2.43.0
+

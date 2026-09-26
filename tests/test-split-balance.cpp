@@ -2,9 +2,15 @@
 
 #include "split-balance.h"
 
+#include "ggml-backend.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 static int n_fail = 0;
@@ -61,6 +67,271 @@ static std::vector<uint32_t> brute_force(common_split_balance_mode mode, const c
         }
     }
     return best;
+}
+
+static common_split_calib_weight cw(int64_t ne0, int64_t ne1, ggml_type type, int64_t ne2 = 1) {
+    common_split_calib_weight w;
+    w.ne[0] = ne0;
+    w.ne[1] = ne1;
+    w.ne[2] = ne2;
+    w.type  = type;
+    return w;
+}
+
+// a small model with one layer of each kind the calibration builds graphs for: attention, gated delta net
+// (qwen35-style shapes) and experts
+static common_split_calib_model tiny_model() {
+    const int64_t E = 256;
+    common_split_calib_model m;
+    m.n_embd        = E;
+    m.n_expert      = 8;
+    m.n_expert_used = 2;
+
+    common_split_calib_layer attn;
+    attn.share      = 0.25;
+    attn.n_head     = 4;
+    attn.n_head_kv  = 2;
+    attn.head_dim_k = 64;
+    attn.head_dim_v = 64;
+    attn.weights    = { cw(E, 256, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q8_0),
+                        cw(E, E, GGML_TYPE_Q4_K), cw(E, 512, GGML_TYPE_Q4_K), cw(E, 512, GGML_TYPE_Q4_K),
+                        cw(512, E, GGML_TYPE_Q6_K) };
+
+    common_split_calib_layer gdn;
+    gdn.share      = 0.5;
+    gdn.byte_scale = 1.1;
+    gdn.gdn_state  = 32;
+    gdn.gdn_h_k    = 2;
+    gdn.gdn_h_v    = 4;
+    gdn.conv_k     = 4;
+    gdn.conv_ch    = 2 * 2 * 32 + 4 * 32;
+    gdn.weights    = { cw(E, gdn.conv_ch, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 4, GGML_TYPE_F16),
+                       cw(E, 4, GGML_TYPE_F16), cw(128, E, GGML_TYPE_F16), cw(E, 512, GGML_TYPE_Q4_K),
+                       cw(E, 512, GGML_TYPE_Q4_K), cw(512, E, GGML_TYPE_Q6_K) };
+
+    common_split_calib_layer moe = attn;
+    moe.share   = 0.25;
+    moe.weights = { cw(E, 256, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K), cw(E, 128, GGML_TYPE_Q4_K),
+                    cw(E, E, GGML_TYPE_Q4_K), cw(E, 8, GGML_TYPE_F32), cw(E, 256, GGML_TYPE_Q4_K, 8),
+                    cw(E, 256, GGML_TYPE_Q4_K, 8), cw(256, E, GGML_TYPE_Q4_K, 8) };
+
+    m.layers = { attn, gdn, moe };
+    m.output = cw(E, 2048, GGML_TYPE_Q6_K);
+    m.nodes_tg_layer = 20;
+    m.nodes_pp_layer = 20;
+
+    double bytes = 0.0;
+    double flops = 0.0;
+    for (const auto & l : m.layers) {
+        for (const auto & w : l.weights) {
+            bytes += l.share * ggml_row_size(w.type, w.ne[0]) * w.ne[1] * w.ne[2];
+            flops += l.share * 2.0 * w.ne[0] * w.ne[1] * (w.ne[2] > 1 ? m.n_expert_used : 1);
+        }
+    }
+    m.layer_bytes = bytes;
+    m.layer_flops = flops;
+    return m;
+}
+
+static std::string read_file(const std::string & path) {
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// calibration on the CPU device: every layer kind builds and runs, and the cache is hit, falls back to the
+// device's reference entry, and survives a forced calibration
+static void test_calibrate_cpu() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the calibration test\n");
+        return;
+    }
+    const auto m = tiny_model();
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    const std::string cache = (std::filesystem::temp_directory_path() / "test-split-balance-cache.json").string();
+    std::filesystem::remove(cache);
+    {
+        // an unrelated entry, and a malformed one (a string where a number belongs): neither may break a start
+        std::ofstream f(cache);
+        f << R"({"ref|some other device": {"measured_at": 0}, "ref|broken": {"measured_at": "yesterday", "ttl": "x"}})";
+    }
+
+    auto p1 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
+    CHECK(p1.size() == 1 && p1[0].s_decode_byte > 0 && p1[0].s_prefill_flop > 0 && p1[0].s_output_byte > 0,
+          "calibration of the CPU failed");
+    if (p1.size() != 1) {
+        return;
+    }
+    std::string c = read_file(cache);
+    CHECK(c.find("\"ref|CPU") != std::string::npos, "no reference entry written");
+    CHECK(c.find("ref|broken") == std::string::npos, "the malformed entry was not dropped");
+
+    // a cache hit gives the same numbers (unless the quick re-check found the CPU at another speed)
+    auto p2 = common_split_balance_calibrate({ cpu }, m, wl, cache, false);
+    CHECK(p2.size() == 1 && p2[0].s_decode_byte > 0, "cached calibration failed");
+
+    // forced: measured again, the rest of the file is kept
+    auto p3 = common_split_balance_calibrate({ cpu }, m, wl, cache, true);
+    CHECK(p3.size() == 1 && p3[0].s_decode_byte > 0, "forced calibration failed");
+    c = read_file(cache);
+    CHECK(c.find("\"ref|CPU") != std::string::npos, "forced calibration dropped the reference entry");
+
+    // a model only differing in its byte scale is another key; with the reference present the result is either
+    // the reference itself (quick check matched) or a fresh valid calibration
+    auto m2 = m;
+    m2.layers[1].byte_scale = 1.2;
+    auto p4 = common_split_balance_calibrate({ cpu }, m2, wl, cache, false);
+    CHECK(p4.size() == 1 && p4[0].s_decode_byte > 0, "calibration of a second model failed");
+
+    std::filesystem::remove(cache);
+}
+
+// Regression test: grouped layer kinds are timed on one representative weight-type layout, and
+// byte_scale corrects for the kind's real mean bytes when its layers mix quant types. Decode
+// (memory-bound) applied this scale from the start; prefill (compute-bound) silently didn't, so a
+// kind whose untimed types were the heavier ones had its prefill rate under-measured -- this is what
+// made the fork's pp prediction read high after grouping landed. Prefill must react to byte_scale too.
+static void test_byte_scale_affects_prefill() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the byte_scale/prefill test\n");
+        return;
+    }
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto m_base = tiny_model();
+    auto p_base = common_split_balance_calibrate({ cpu }, m_base, wl, "", false);
+    CHECK(p_base.size() == 1 && p_base[0].s_prefill_flop > 0, "baseline calibration failed");
+    if (p_base.size() != 1) {
+        return;
+    }
+
+    // the gdn kind is half the model's layers (share 0.5); scaling its byte_scale up a lot must move
+    // the aggregate calibrated rate by a clearly-measurable amount if prefill reacts to it at all
+    auto m_scaled = m_base;
+    m_scaled.layers[1].byte_scale = 3.0;
+    auto p_scaled = common_split_balance_calibrate({ cpu }, m_scaled, wl, "", false);
+    CHECK(p_scaled.size() == 1 && p_scaled[0].s_prefill_flop > 0, "scaled-model calibration failed");
+    if (p_scaled.size() != 1) {
+        return;
+    }
+
+    CHECK(p_scaled[0].s_prefill_flop > p_base[0].s_prefill_flop * 1.2,
+          "byte_scale must raise the calibrated prefill rate too, not just decode (got %.6g vs %.6g)",
+          p_scaled[0].s_prefill_flop, p_base[0].s_prefill_flop);
+    // sanity check: decode should react to the same knob (this direction already worked pre-fix)
+    CHECK(p_scaled[0].s_decode_byte > p_base[0].s_decode_byte * 1.2,
+          "sanity: byte_scale should also raise the decode rate (got %.6g vs %.6g)",
+          p_scaled[0].s_decode_byte, p_base[0].s_decode_byte);
+}
+
+// a single MoE layer with an output layer configured: this makes calibrate_device build a graph of every
+// kind it can (decode, prefill, prefill_exp, output), leaving little slack in the ggml_context sized for
+// them. Regression test for a context-memory-pool overflow (GGML_ASSERT in ggml_scale/ggml_new_graph_custom)
+// that a too-small budget for the untimed-op probe's chain of scale ops caused.
+static void test_calibrate_context_memory_budget() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the context memory budget test\n");
+        return;
+    }
+    common_split_calib_model m;
+    m.n_embd        = 256;
+    m.n_expert      = 8;
+    m.n_expert_used = 2;
+    common_split_calib_layer l;
+    l.share   = 1.0;
+    l.weights = { cw(256, 256, GGML_TYPE_Q4_K, 8) };
+    m.layers  = { l };
+    m.output  = cw(256, 2048, GGML_TYPE_Q6_K);
+    m.layer_bytes = 1e6;
+    m.layer_flops = 1e6;
+
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto p = common_split_balance_calibrate({ cpu }, m, wl, "", false);
+    CHECK(p.size() == 1 && p[0].s_decode_byte > 0, "calibration ran out of context memory");
+}
+
+// Regression test for the tg-predict-fix root cause: calibrate_device times a layer's decode ops
+// (weight matmuls, attention, GDN) together as one graph call. A layer with few such ops is a much
+// shorter graph than one with many, so on a backend whose per-submit cost only shows up once a graph
+// is long enough (GGML_VK_MAX_NODES_PER_SUBMIT=1's amdgpu ring-depth effect being the motivating case),
+// a naive per-layer timing would rate a thin layer's ops cheaper per byte than a wide layer's, purely
+// from graph length, not real throughput. The fix repeats a layer's decode ops (n_rep, in
+// calibrate_device) until the graph is as long as the untimed-op probe's n_chain, then divides by the
+// repeat count. This test can't reproduce the submit-cost effect itself on the CPU backend (it is
+// Vulkan/driver-specific), but it does verify the repeat-and-normalize mechanism is bias-free: two
+// models with the same total decode bytes, split across a different number of weight tensors (1 vs 8,
+// so very different n_rep), must calibrate to close to the same decode rate on a backend with no
+// per-submit cost of its own.
+static void test_decode_replication_normalizes_rate() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU device, skipping the decode-replication test\n");
+        return;
+    }
+    common_split_workload wl;
+    wl.n_prompt = 256;
+    wl.n_gen    = 16;
+    wl.n_ubatch = 64;
+    wl.n_batch  = 256;
+
+    auto make_model = [](int n_weights) {
+        const int64_t E = 4096;
+        // n_weights tensors of E x (rows/n_weights), so total decode bytes stay ~constant as
+        // n_weights varies -- only the op count (and so n_rep) changes. Large enough (~150 MB
+        // total) that repeated reads don't ride an unrealistic CPU-cache-residency speedup --
+        // real model layers don't fit in cache either, so this keeps the comparison to what the
+        // repeat-and-normalize math actually does, not an artifact of undersized synthetic weights.
+        const int64_t rows_total = 65536;
+        common_split_calib_model m;
+        m.n_embd = E;
+        common_split_calib_layer l;
+        l.share = 1.0;
+        for (int i = 0; i < n_weights; i++) {
+            l.weights.push_back(cw(E, rows_total / n_weights, GGML_TYPE_Q4_K));
+        }
+        m.layers = { l };
+        double bytes = 0.0;
+        for (const auto & w : l.weights) {
+            bytes += ggml_row_size(w.type, w.ne[0]) * w.ne[1];
+        }
+        m.layer_bytes = bytes;
+        m.layer_flops = 2.0 * E * rows_total;
+        return m;
+    };
+
+    auto m_thin = make_model(1);  // n1_decode = 1  -> n_rep = 256
+    auto m_wide = make_model(8);  // n1_decode = 8  -> n_rep = 32
+
+    auto p_thin = common_split_balance_calibrate({ cpu }, m_thin, wl, "", false);
+    auto p_wide = common_split_balance_calibrate({ cpu }, m_wide, wl, "", false);
+    CHECK(p_thin.size() == 1 && p_thin[0].s_decode_byte > 0, "thin-layer calibration failed");
+    CHECK(p_wide.size() == 1 && p_wide[0].s_decode_byte > 0, "wide-layer calibration failed");
+    if (p_thin.size() != 1 || p_wide.size() != 1) {
+        return;
+    }
+
+    const double ratio = p_thin[0].s_decode_byte / p_wide[0].s_decode_byte;
+    CHECK(ratio > 0.4 && ratio < 2.5,
+          "a layer's op count should not bias its calibrated decode rate this much (thin/wide s_decode_byte ratio %.3g)",
+          ratio);
 }
 
 int main() {
@@ -149,6 +420,11 @@ int main() {
             }
         }
     }
+
+    test_calibrate_cpu();
+    test_byte_scale_affects_prefill();
+    test_calibrate_context_memory_budget();
+    test_decode_replication_normalizes_rate();
 
     if (n_fail == 0) {
         printf("test-split-balance: OK\n");

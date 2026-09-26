@@ -68,6 +68,9 @@ struct llama_context {
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
+    // compute nodes of the last reserved single-token (tg) or prompt (pp) graph, -1 before the first reserve
+    int32_t graph_n_compute_nodes(bool single_token) const { return single_token ? n_compute_nodes_tg : n_compute_nodes_pp; }
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
@@ -348,6 +351,10 @@ private:
     std::unique_ptr<llama_batch_allocr> balloc;
 
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
+
+    // nodes that do work (not views/reshapes) in the reserved prompt (pp) and single-token (tg) graphs
+    int32_t n_compute_nodes_pp = -1;
+    int32_t n_compute_nodes_tg = -1;
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers

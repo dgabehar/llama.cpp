@@ -11,7 +11,7 @@ Assisted-by: Codex
  3 files changed, 26 insertions(+), 3 deletions(-)
 
 diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
-index 797969c3b..80892e1c9 100644
+index 797969c3b2..80892e1c98 100644
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -553,7 +553,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
@@ -24,7 +24,7 @@ index 797969c3b..80892e1c9 100644
                  break;
              case LLAMA_VOCAB_PRE_TYPE_WHITESPACE:
 diff --git a/src/unicode.cpp b/src/unicode.cpp
-index d2f166208..10e8b408f 100644
+index d2f166208f..10e8b408fb 100644
 --- a/src/unicode.cpp
 +++ b/src/unicode.cpp
 @@ -520,6 +520,9 @@ static std::vector<size_t> unicode_regex_split_custom_k2_horizon(const std::stri
@@ -60,7 +60,7 @@ index d2f166208..10e8b408f 100644
      static const std::map<std::string, int> k_ucat_enum = {
          { "\\p{N}", unicode_cpt_flags::NUMBER },
 diff --git a/tests/test-unicode.cpp b/tests/test-unicode.cpp
-index 3ea2991fb..72a0f6ed0 100644
+index 3ea2991fb4..72a0f6ed0e 100644
 --- a/tests/test-unicode.cpp
 +++ b/tests/test-unicode.cpp
 @@ -106,7 +106,7 @@ int main() {

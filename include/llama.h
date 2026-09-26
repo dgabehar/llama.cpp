@@ -583,6 +583,10 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // Nodes that do work (views and reshapes excluded) in the graph reserved at context creation, for a
+    // single token (single_token = true) or a full ubatch; -1 if no graph was reserved
+    LLAMA_API int32_t llama_graph_n_compute_nodes(const struct llama_context * ctx, bool single_token);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

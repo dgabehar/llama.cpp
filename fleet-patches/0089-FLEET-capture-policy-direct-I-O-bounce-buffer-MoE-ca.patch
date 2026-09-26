@@ -26,7 +26,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
 
 diff --git a/FLEET.md b/FLEET.md
-index 37cf39778..cf5cc5dc5 100644
+index 37cf39778f..cf5cc5dc53 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -289,6 +289,31 @@ llama-server, median of 3, drift 3%):**
@@ -62,7 +62,7 @@ index 37cf39778..cf5cc5dc5 100644
  once its HELLO arrives, within 10 s. Probes and silent sockets never hold a
  slot. At most 64 connections wait for their HELLO; the oldest is closed to
 diff --git a/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch b/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
-index ab2565bb2..abba3af76 100644
+index ab2565bb20..abba3af765 100644
 --- a/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
 +++ b/fleet-patches/0082-vulkan-find-the-host-RAM-heap-of-an-integrated-GPU-b.patch
 @@ -1,4 +1,4 @@
@@ -27938,7 +27938,7 @@ index ab2565bb2..abba3af76 100644
  --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 diff --git a/fleet-patches/0083-llama-cheaper-state-captures-no-host-side-materializ.patch b/fleet-patches/0083-llama-cheaper-state-captures-no-host-side-materializ.patch
 new file mode 100644
-index 000000000..723ca800a
+index 0000000000..723ca800a1
 --- /dev/null
 +++ b/fleet-patches/0083-llama-cheaper-state-captures-no-host-side-materializ.patch
 @@ -0,0 +1,263 @@
@@ -28207,7 +28207,7 @@ index 000000000..723ca800a
 +
 diff --git a/fleet-patches/0084-llama-add-llama_model_n_devices_used.patch b/fleet-patches/0084-llama-add-llama_model_n_devices_used.patch
 new file mode 100644
-index 000000000..95299978e
+index 0000000000..95299978e2
 --- /dev/null
 +++ b/fleet-patches/0084-llama-add-llama_model_n_devices_used.patch
 @@ -0,0 +1,64 @@
@@ -28277,7 +28277,7 @@ index 000000000..95299978e
 +
 diff --git a/fleet-patches/0085-server-capture-checkpoints-in-batch-only-across-devi.patch b/fleet-patches/0085-server-capture-checkpoints-in-batch-only-across-devi.patch
 new file mode 100644
-index 000000000..3f8f2e822
+index 0000000000..3f8f2e8223
 --- /dev/null
 +++ b/fleet-patches/0085-server-capture-checkpoints-in-batch-only-across-devi.patch
 @@ -0,0 +1,216 @@
@@ -28499,7 +28499,7 @@ index 000000000..3f8f2e822
 +
 diff --git a/fleet-patches/0086-llama-direct-I-O-into-memory-that-refuses-DMA-goes-t.patch b/fleet-patches/0086-llama-direct-I-O-into-memory-that-refuses-DMA-goes-t.patch
 new file mode 100644
-index 000000000..3434420a9
+index 0000000000..3434420a9a
 --- /dev/null
 +++ b/fleet-patches/0086-llama-direct-I-O-into-memory-that-refuses-DMA-goes-t.patch
 @@ -0,0 +1,47 @@
@@ -28552,7 +28552,7 @@ index 000000000..3434420a9
 +
 diff --git a/fleet-patches/0087-split-balance-time-MoE-models-with-routed-expert-mat.patch b/fleet-patches/0087-split-balance-time-MoE-models-with-routed-expert-mat.patch
 new file mode 100644
-index 000000000..fd5ef91ea
+index 0000000000..fd5ef91ea6
 --- /dev/null
 +++ b/fleet-patches/0087-split-balance-time-MoE-models-with-routed-expert-mat.patch
 @@ -0,0 +1,279 @@
@@ -28837,7 +28837,7 @@ index 000000000..fd5ef91ea
 +
 diff --git a/fleet-patches/0088-server-tests-keep-the-slot-busy-longer-than-the-save.patch b/fleet-patches/0088-server-tests-keep-the-slot-busy-longer-than-the-save.patch
 new file mode 100644
-index 000000000..fbf0f9485
+index 0000000000..fbf0f9485e
 --- /dev/null
 +++ b/fleet-patches/0088-server-tests-keep-the-slot-busy-longer-than-the-save.patch
 @@ -0,0 +1,45 @@
@@ -28888,7 +28888,7 @@ index 000000000..fbf0f9485
 +
 diff --git a/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch b/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
 new file mode 100644
-index 000000000..141dcf1c4
+index 0000000000..141dcf1c47
 --- /dev/null
 +++ b/fleet-patches/0089-FLEET-capture-policy-direct-I-O-bounce-buffer-MoE-ca.patch
 @@ -0,0 +1,50 @@
@@ -28943,7 +28943,7 @@ index 000000000..141dcf1c4
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 6ba0a184d..131144ff1 100644
+index 6ba0a184d7..131144ff1e 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -96,7 +96,14 @@ re-derive the equivalent change against the new upstream code, `git am

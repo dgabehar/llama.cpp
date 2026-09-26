@@ -32,56 +32,70 @@ re-derive the equivalent change against the new upstream code, `git am
 
 | # | Commit | Summary |
 |---|---|---|
-| 0001 | `4449b934f` | grammar: translate PCRE shorthand escapes (`\d \w \s`) to GBNF classes |
+| 0001 | `4449b934f` | grammar: translate PCRE shorthand escapes (\d \w \s) to GBNF classes |
 | 0002 | `4790afadf` | server: fix slot save/restore losing checkpoint-based cache reuse |
-| 0003 | `f4ed0a034` | common: guard checkpoint `update_dft` against an empty draft sequence |
+| 0003 | `f4ed0a034` | common: guard checkpoint update_dft against an empty draft sequence |
 | 0004 | `20ac9695d` | ggml-alloc: finalize view init in a pass after all buft max_size splits |
 | 0005 | `cbf6b1831` | ci: add sync-with-upstream workflow (mirror of the master copy) |
 | 0006 | `0323f3340` | fix: repair YAML block-scalar indentation bug in sync workflow |
-| 0007 | `fea69e077` | server: include `id_slot` in OAI-compatible chat completion responses |
-| 0008 | `d0cd6ad32` | ggml: add `GGML_OP_SSM_CONV_SPLIT` (CPU+Vulkan) to skip the per-layer conv-state concat |
+| 0007 | `fea69e077` | server: include id_slot in OAI-compatible chat completion responses |
+| 0008 | `d0cd6ad32` | ggml: add GGML_OP_SSM_CONV_SPLIT (CPU+Vulkan) to skip the per-layer conv-state concat |
 | 0009 | `94fb9b77d` | fleet: mirror fork patches to disk, document fleet workflow separately |
 | 0010 | `0818a8fd3` | server: disable speculative decoding for grammar-constrained requests |
 | 0011 | `b4f77289c` | qwen3-coder: bound xml-arg-string with until_one_of, not a bare until |
+| 0012 | `e6d23f9f8` | fleet: regenerate patch mirror, document MTP+grammar corruption fix |
 | 0013 | `42a54bd31` | vulkan: occupancy-aware S/M/L tile selector for non-coopmat2 path (AMD/Intel) |
+| 0014 | `e64a5125c` | fleet: regenerate patch mirror for occupancy-aware tile heuristic |
 | 0015 | `45c96fc15` | model: K2 Horizon gguf conversion code |
 | 0016 | `3f172ae8f` | model: loading hparams and tensors in k2-horizon.cpp |
 | 0017 | `c6126e292` | model: K2 Horizon compute graph |
 | 0018 | `d12a4910b` | model: K2 Horizon compute graph adjustment and registering tokenizers |
 | 0019 | `f7cf09604` | model: K2 Horizon chat template and accomodate safetensors naming |
 | 0020 | `a8e59d1a4` | k2-horizon: adapt to hparams.n_ff_exp API drift since fork point |
+| 0021 | `c622934d6` | fleet: regenerate patch mirror for K2-Horizon architecture support |
 | 0022 | `017177b59` | fleet-patches: reference upstream tracking issue for K2-Horizon support |
 | 0023 | `8e23577a7` | server: end generation cleanly on a tool-call-diff inconsistency |
 | 0024 | `27e786074` | FLEET.md: flag pre-existing qwen3-coder peg-parser test crash |
+| 0025 | `273035a61` | fleet: regenerate patch mirror, document tool-call-diff clean-stop fix |
 | 0026 | `dc1510e38` | peg-parser: don't prematurely close an until_one_of span on an ambiguous partial delimiter match |
 | 0027 | `c7b01f7db` | server: bound slot-action queue wait, and explain empty child-slot saves |
+| 0028 | `d4b67d9d9` | fleet: regenerate patch mirror for slot-action timeout + PEG until_one_of fix |
 | 0029 | `63877150f` | FLEET.md: require Murat/Dawn QA loop for every fork-exclusive change |
 | 0030 | `4d4b442dd` | ggml-cpu: extend CPU backend device registry to N locality domains |
-| 0031 | `3c3764c39` | common: new `--cpu-split auto|off` flag with startup throughput calibration |
+| 0031 | `3c3764c39` | common: new --cpu-split auto\|off flag with startup throughput calibration |
 | 0032 | `552cd5aba` | llama-model: weighted per-layer CPU split across locality domains |
 | 0033 | `b28e5a923` | llama-context: make backend_cpu locality-domain aware |
 | 0034 | `96c9bf74b` | tests: cover the CPU locality-domain split |
-| 0035 | `97080cf7b` | docs: document `--cpu-split` and the CPU locality-domain split feature |
+| 0035 | `97080cf7b` | docs: document --cpu-split and the CPU locality-domain split feature |
 | 0036 | `31abfbbf7` | docs: record ship-as-is decision + TODO for FA/resolve_fused_ops caveat |
-| 0038 | `ff6e937d3` | fix: route `ggml_backend_cpu_device_get_locality_mask` through the DL proc-address table |
-| 0040 | `3a5e3c498` | fix: don't reject a GPU's host buffer type in `ggml_backend_cpu_device_supports_buft` |
+| 0037 | `c20d2de06` | fleet: regenerate patch mirror for CPU locality-domain split (Track A) |
+| 0038 | `ff6e937d3` | fix: route ggml_backend_cpu_device_get_locality_mask through the DL proc-address table |
+| 0039 | `168e50ae8` | fleet: regenerate patch mirror for GGML_BACKEND_DL link fix |
+| 0040 | `3a5e3c498` | fix: don't reject a GPU's host buffer type in ggml_backend_cpu_device_supports_buft |
+| 0041 | `088c5f3f0` | fleet: regenerate patch mirror for GPU host-buft fix |
 | 0042 | `613de6d57` | FLEET.md: document the 2026-09-18 CPU-split rollout outage and its fix |
-| 0044 | `ff256fe8d` | fix: correct units in CPU split calibration log line (µs, not seconds) |
-| 0046 | `5446ea5cc` | unicode: add the K2-Horizon pre-tokenizer splitter |
+| 0043 | `4592d7301` | fleet: regenerate patch mirror for outage writeup |
+| 0044 | `ff256fe8d` | =?UTF-8?q?fix:=20correct=20units=20in=20CPU=20split=20cal?= =?UTF-8?q?ibration=20log=20line=20(=C2=B5s,=20not=20seconds)?= |
+| 0045 | `d0624ac08` | fleet: regenerate patch mirror for calibration log unit fix |
+| 0046 | `5446ea5cc` | unicode : add the K2-Horizon pre-tokenizer splitter |
 | 0047 | `524c26c7a` | tests: expand K2 Horizon unicode splitter coverage |
 | 0048 | `fe31aa6f8` | unicode: handle K2 Horizon case folding and empty input |
+| 0049 | `d19cd1a92` | fleet: regenerate patch mirror for K2-Horizon tokenizer fixes |
 | 0050 | `184e4d5ac` | vocab: recognize K2-Horizon's <\|ifm\|im_end\|> as an EOG token |
 | 0051 | `4a25953cb` | chat: add K2-Horizon workaround for reasoning-tag auto-detection |
 | 0052 | `3a713c1c4` | tests: skip test-cpu-device-split on non-Linux platforms |
 | 0053 | `0f261f564` | tests: fix stale expected output in the shorthand-class regexp test |
 | 0054 | `07d2e0e67` | tests: loosen slot-action-timeout test's join timeout margin |
 | 0055 | `9fc9046f4` | conversion: fix flake8 lint violations in k2_horizon.py |
+| 0056 | `00c86c6c8` | fleet: regenerate patch mirror for K2-Horizon EOG/reasoning fixes |
 | 0057 | `32038f723` | rpc : serve each client connection on its own thread |
 | 0058 | `a8c9c9973` | rpc : serialize backend compute across connection threads |
 | 0059 | `22ce3a307` | rpc : per-connection backends, tracked connections, client cap, keepalive |
 | 0060 | `52170fc4c` | rpc : keep one bad client from taking down the whole server |
 | 0061 | `727f39e3e` | tests : add test-rpc-server-multiclient |
+| 0062 | `96379dadc` | fleet: regenerate patch mirror, document rpc-server multi-client |
 | 0063 | `b917b2aec` | rpc : don't reject a client because a just-closed probe still holds a slot |
+| 0064 | `7974e0d14` | fleet: regenerate patch mirror, record rpc multi-client live results |
 | 0065 | `b1ff71165` | vulkan : size submit batches from the current graph's flops |
 | 0066 | `d19689876` | llama : restore the worst-case sched plan before large ubatches |
 | 0067 | `2fd18e2a1` | common : --split-balance for speed-aware layer splits |
@@ -89,10 +103,13 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0069 | `4727d61e0` | common : split-balance: time the dominant weight type, model n_batch drains |
 | 0070 | `a0543ca83` | vulkan : keep the flop-sized submits of a graph below the kernel job queue |
 | 0071 | `bed797907` | common : split-balance: model imperfect stage overlap in prefill |
+| 0072 | `570db1ff4` | fleet: document speed-aware split and pipeline fixes |
+| 0073 | `815779ae6` | fleet: patch table: 0065-0071 are fork-only |
 | 0074 | `d7cd53de7` | common : split-balance: key the calibration cache by build, expire after 7 days |
 | 0075 | `980ea324a` | split-balance: ignore overrides that match nothing, validate and re-check the cache, calibrated overheads |
 | 0076 | `8b92aab27` | server: only an explicit off value disables LLAMA_SERVER_CKPT_CAPTURE |
 | 0077 | `46568f521` | rpc: take a client slot at HELLO, bound the handshake, report a full server |
+| 0078 | `bfc5ee295` | FLEET: QA before/after table, hostNetwork for Thunderbolt RPC, rpc-server admission |
 | 0079 | `b32f04a9b` | rpc: say that the connection to the server was lost when a request fails |
 | 0080 | `c3705709a` | vulkan: on integrated GPUs, cap the free memory of host heaps at MemAvailable |
 | 0081 | `9826fa24e` | split-balance: re-check local devices' cached timings too |
@@ -104,13 +121,53 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0087 | `280a0f95f` | split-balance: time MoE models with routed expert matmuls, reject inconsistent entries |
 | 0088 | `32a4c4aa5` | server tests: keep the slot busy longer than the save timeout on fast hardware |
 | 0089 | `139c960bc` | FLEET: capture policy, direct I/O bounce buffer, MoE calibration |
-| 0090 | `41b2ad40d` | models: fix the conv-state window over the transposed new tokens (draft-mtp corruption on qwen35) |
+| 0090 | `41b2ad40d` | models : fix the conv-state window over the transposed new tokens |
 | 0091 | `c0f21d0b1` | vulkan: cap an integrated GPU's total free memory at MemAvailable |
 | 0092 | `f2a024139` | fleet: regenerate patch mirror for the conv-window and UMA memory fixes |
-| 0093 | `adb26194f` | tests: rpc-server multiclient: cast RAND_MAX to float |
+| 0093 | `adb26194f` | tests : rpc-server multiclient: cast RAND_MAX to float |
 | 0094 | `2510ec358` | fleet: regenerate patch mirror for the macOS test build fix |
-| 0095 | `e9319f635` | server: don't update the prompt cache of a busy slot picked by id_slot |
-| 0096 | (this commit) | fleet: regenerate patch mirror |
+| 0095 | `773e1bef6` | common : split-balance: calibrate on the model's own layers |
+| 0096 | `2e3f93153` | fleet: regenerate patch mirror for the per-layer calibration |
+| 0097 | `8519f34e6` | chat : K2-Horizon: accept any effort's close tag as the end of reasoning |
+| 0098 | `a7293a5a4` | fleet: regenerate patch mirror for the K2-Horizon close-tag fix |
+| 0099 | `f418ade54` | FLEET.md: per-layer calibration, the conv-window view bug and K2-Horizon close tags |
+| 0100 | `6828d7429` | fleet: regenerate patch mirror for the FLEET.md notes |
+| 0101 | `a6ded58e6` | common : split-balance: fix the calibration use-after-free, detect busy nodes against a reference |
+| 0102 | `3de07b36f` | chat : K2-Horizon: end content at a close tag after the answer |
+| 0103 | `8294d54c9` | FLEET.md: calibration grouping, busy reference, calibration cache, K2 stray close tag |
+| 0104 | `1313096f9` | fleet: regenerate patch mirror for the round-5 fixes |
+| 0105 | `34da5e374` | common : split-balance: survive malformed cache entries, log why an entry is not used, merge on write |
+| 0106 | `c725c5d7e` | server, chat : stop generating at a stray K2-Horizon close tag; keep reasoning_format none raw |
+| 0107 | `ede0eed18` | FLEET.md: K2 stop_after_reasoning |
+| 0108 | `44e8d0714` | fleet: regenerate patch mirror for the round-6 fixes |
+| 0109 | `649e5e50a` | server : a captured checkpoint may outlive its task: don't read slot.task for it |
+| 0110 | `24e4d819b` | fleet: regenerate patch mirror for the captured-checkpoint fix |
+| 0111 | `0ab13d2bb` | server : don't update the prompt cache of a busy slot picked by id_slot |
+| 0112 | `c4234d605` | FLEET.md: record the busy-slot prompt cache fix |
+| 0113 | `181e60aad` | fleet: regenerate patch mirror for the busy-slot prompt cache fix |
+| 0114 | `e9319f635` | server : don't update the prompt cache of a busy slot picked by id_slot |
+| 0115 | `9010d8b39` | fleet: regenerate patch mirror for the busy-slot prompt cache hotfix |
+| 0116 | `1b177d4e5` | chat : K2-Horizon: don't leak tool-call markup into content with no tools |
+| 0117 | `3a15bf975` | chat : K2-Horizon tests and comment: use a neutral example hostname |
+| 0118 | `9ecf429da` | common : split-balance: scale prefill by byte_scale too, not just decode |
+| 0119 | `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
+| 0120 | `74405080c` | chat : drop whitespace between reasoning end tag and content |
+| 0121 | `b098565ad` | fleet: regenerate patch mirror for the round-7 fixes |
+| 0122 | `22a240a7a` | fleet: fix the patch mirror table numbering |
+| 0123 | `3d33f7e68` | fleet: fix the patch mirror table rows |
+| 0124 | `70f0d0168` | llama, common: fix -fit's oversized-context probe hard-aborting the server |
+| 0125 | `1bf5f2473` | server: fix 2 test_completion.py tests broken by test-only bugs, not the server |
+| 0126 | `3a61a3dfd` | fleet: regenerate patch mirror for the -fit abort and server test fixes |
+| 0127 | `ae3897657` | common: size -fit's auto-context probe from measured free memory, not just a caught exception |
+| 0128 | `ccc60e62a` | common: close the n_seq_max == 1 gap in --fit's auto-context probe, cap iGPU free memory consistently |
+| 0129 | `50ecce74e` | fleet: regenerate patch mirror for the -fit UMA free-memory clamp |
+| 0130 | `dd5756d58` | common : split-balance: calibrate a layer's decode ops long enough to pay the real per-submit cost, not just its own norms/RoPE nodes |
+| 0131 | `d7e7f3668` | ggml-rpc: give the RPC client a bounded receive timeout and keepalive |
+| 0132 | `6ce68d49c` | fleet: regenerate patch mirror for the split-balance decode calibration and RPC client timeout fixes |
+| 0133 | `8e37aa9a8` | FLEET.md: root-cause the round-9 pp regression as a QA measurement bug |
+| 0134 | `8ff5aa4e3` | fleet: regenerate patch mirror for the pp measurement-method doc |
+| 0135 | `11b60fcc7` | fleet: fix the 0131 row title in the patch mirror table |
+| 0136 | `c4d2d91de` | FLEET.md: document the RPC client receive timeout |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

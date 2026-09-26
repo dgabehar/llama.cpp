@@ -1,0 +1,475 @@
+From d7e7f366852534f009014c36f0464f2b2c4a28c3 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Sat, 26 Sep 2026 01:23:12 -0500
+Subject: [PATCH] ggml-rpc: give the RPC client a bounded receive timeout and
+ keepalive
+
+Root cause (QA round 8, R1): K2-Horizon-7B against two CPU rpc-server
+workers under the --split-balance memory-split fallback would hang or
+disconnect, needing an external `timeout` to kill. rpc_dispatcher (the
+RPC *client*, used by a llama-server master to talk to each --rpc
+worker) set no receive timeout and no TCP keepalive on its outbound
+connections: socket_t::connect() leaves both unset, and every
+dispatcher call blocks on std::future::wait() with no deadline. The
+*server* already protects itself this way against a vanished/idle
+client (set_recv_timeout during the handshake, set_keepalive after --
+see rpc_serve_client), but nothing protected the client against a
+worker that accepts a request and then goes silently unresponsive
+without closing the socket (e.g. a worker straining under an
+oversized/lopsided layer share from the memory-split fallback, or any
+other cause of a peer that's alive but stuck). That wedges the calling
+thread -- split-balance calibration or the real model load -- forever.
+
+Reproduced locally (workstation, CPU-only ASan build, two
+ggml-rpc-server workers + llama-server master, K2-Horizon-7B,
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0):
+freezing one worker mid weight-transfer (SIGSTOP, so its socket stays
+open but it never responds -- the same "alive but not answering"
+shape the memory-split fallback can produce under real load) hung the
+master indefinitely with GGML_RPC_CLIENT_TIMEOUT_SEC=0 (old behavior).
+The frozen master's log stops exactly where R1's did (no `predicted`
+line), and its stack sits in rpc_dispatcher::send()'s future.wait().
+With the fix, the same freeze produces the exact log signature R1
+captured -- `ggml-rpc.cpp:...: Lost the connection to the RPC server
+(it exited, restarted or is unreachable) or it sent a malformed
+response` / `recv failed (bytes_recv=0, size_to_recv=8)` -- but bounded
+to the configured timeout instead of hanging forever.
+
+Extensive attempts to reproduce an *unbounded* hang purely from
+calibrating/loading K2-Horizon-7B on this workstation (no frozen peer)
+did not succeed: --split-balance auto calibration and the real model
+load both complete in ~2-2.5 minutes under ASan + 2 CPU workers, and a
+real /completion request works correctly. This points at a genuinely
+unresponsive/wedged peer (memory pressure, thrashing, or the chaotic,
+OOM-killing session QA's own round-8 report documents) as the trigger,
+not a protocol deadlock independent of peer health -- which is exactly
+what this fix bounds.
+
+Fix: rpc_dispatcher::start() now sets SO_RCVTIMEO and TCP keepalive on
+the client connection right after connect(), before the HELLO
+handshake, so the whole connection lifecycle is bounded. This only
+bounds an individual blocking recv() while a request is outstanding --
+a client with nothing in flight never calls recv() and is unaffected,
+mirroring the server's own "a connected client may stay idle for as
+long as it likes" policy for the reverse direction. Default 180s
+(comfortably longer than any single op measured here, including a
+~70s full per-device calibration made of many smaller ops);
+GGML_RPC_CLIENT_TIMEOUT_SEC=0 restores the old unbounded wait.
+
+New regression test tests/test-rpc-client-timeout.{cpp,sh}: a minimal
+hand-rolled RPC "server" completes the real HELLO handshake, then goes
+silent forever on the next request without closing the socket. The
+real client backend (ggml_backend_rpc_get_device_memory) must fail
+within a bounded window (checked against GGML_RPC_CLIENT_TIMEOUT_SEC=2)
+instead of hanging; ctest's own TIMEOUT property is the backstop if a
+future regression reintroduces the unbounded wait.
+
+Verified: ctest -L main 60/60 and ctest -R split-balance 1/1 both pass
+(ASAN_OPTIONS=detect_leaks=0:abort_on_error=1, per this fork's own ASan
+testing convention -- the RPC backend's buffer-type/device registries
+are intentionally never freed, so leak detection must stay off for
+these tests same as the LAYERCAL-05 test plan already specifies).
+
+Assisted-by: Claude Sonnet 5
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp    |  52 ++++++++
+ tests/test-rpc-client-timeout.cpp | 205 ++++++++++++++++++++++++++++++
+ tests/test-rpc-client-timeout.sh  |  83 ++++++++++++
+ tools/rpc/CMakeLists.txt          |   9 ++
+ 4 files changed, 349 insertions(+)
+ create mode 100644 tests/test-rpc-client-timeout.cpp
+ create mode 100644 tests/test-rpc-client-timeout.sh
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 75db11c7cd..62623e20e8 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -31,6 +31,40 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ #define LOG_DBG(...) \
+     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+ 
++// The RPC *server* protects itself from a vanished/idle client with
++// set_recv_timeout() during the handshake and set_keepalive() afterward (see
++// rpc_serve_client and ggml_backend_rpc_start_server_ex below). Before this
++// fix, the *client* side (rpc_dispatcher, used by the master to talk to each
++// RPC worker) set neither: socket_t::connect() leaves the connection with no
++// receive timeout and no TCP keepalive at all, and every dispatcher call goes
++// through rpc_dispatcher::send(), which blocks on future.wait() with no
++// deadline. A worker that goes catastrophically slow or unresponsive (e.g.
++// straining under an oversized/lopsided layer share from the memory-split
++// fallback) or that silently stops responding (network partition, a hung
++// peer that never crashes cleanly enough to close its socket) then wedges
++// the calling thread forever -- observed as split-balance calibration or a
++// real model load hanging indefinitely, recoverable only by killing the
++// whole process from outside. Give the client the same bounded-wait
++// protection the server already has for itself: a generous per-call receive
++// timeout (bounds any single blocking recv(), not overall idle time between
++// requests -- a client with no request in flight never calls recv() at all)
++// plus TCP keepalive to catch a truly dead peer even between requests.
++// GGML_RPC_CLIENT_TIMEOUT_SEC=0 restores the old unbounded-wait behavior.
++static int rpc_client_timeout_sec() {
++    static const int v = [] {
++        const char * s = std::getenv("GGML_RPC_CLIENT_TIMEOUT_SEC");
++        if (!s) {
++            return 180;
++        }
++        try {
++            return std::stoi(s);
++        } catch (...) {
++            return 180;
++        }
++    }();
++    return v;
++}
++
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -553,6 +587,24 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+     if (sock == nullptr) {
+         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     }
++    // Bound every blocking recv() on this connection -- handshake and all
++    // traffic after it -- instead of leaving it able to wait forever. This
++    // only bounds an individual wait *while a request is outstanding*; a
++    // client with nothing in flight never calls recv() and is unaffected,
++    // matching the server's own "a connected client may stay idle for as
++    // long as it likes" policy for the reverse direction. See
++    // rpc_client_timeout_sec()'s comment for why this exists.
++    const int timeout_sec = rpc_client_timeout_sec();
++    if (timeout_sec > 0) {
++        if (!sock->set_recv_timeout(timeout_sec)) {
++            GGML_LOG_WARN("[%s] failed to set the RPC client receive timeout for %s\n", __func__, endpoint.c_str());
++        }
++        const int idle     = std::max(1, timeout_sec / 6);
++        const int interval = std::max(1, idle / 3);
++        if (!sock->set_keepalive(idle, interval, 3)) {
++            GGML_LOG_WARN("[%s] failed to enable TCP keepalive for %s\n", __func__, endpoint.c_str());
++        }
++    }
+     if (!negotiate_hello(sock)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
+diff --git a/tests/test-rpc-client-timeout.cpp b/tests/test-rpc-client-timeout.cpp
+new file mode 100644
+index 0000000000..93413ec027
+--- /dev/null
++++ b/tests/test-rpc-client-timeout.cpp
+@@ -0,0 +1,205 @@
++// Regression test for the RPC *client* hang fixed on 2026-09-26.
++//
++// Root cause: rpc_dispatcher (the RPC client used by a llama-server master
++// to talk to each --rpc worker) set no receive timeout and no TCP keepalive
++// on its connections -- socket_t::connect() leaves both unset, and every
++// dispatcher call blocks on std::future::wait() with no deadline. A worker
++// that completes the HELLO handshake and then goes silently unresponsive
++// (accepts a request but never answers it, without closing the socket --
++// e.g. a CPU rpc-server straining under an oversized/lopsided layer share
++// from the --split-balance memory-split fallback, or any other cause of a
++// peer that's alive but not making progress) wedges the calling thread in
++// rpc_dispatcher::send() forever. This is the mechanism behind the
++// K2-Horizon-7B / two-CPU-rpc-server hang reported in QA round 8 (R1):
++// "no split fits the free memory of the devices, keeping the memory split"
++// followed by a hang in rpc_dispatcher::send()/future.wait() inside
++// ggml_backend_rpc_buffer_set_tensor, needing an external `timeout` to kill.
++//
++// This test reproduces "worker alive, socket open, never answers" without
++// needing a real second rpc-server or the ability to SIGSTOP a process:
++// "server" mode is a minimal hand-rolled stub that completes the real HELLO
++// handshake (so the real client backend connects successfully), then reads
++// the header of the one request that follows and goes silent forever.
++// "client" mode makes one real ggml_backend_rpc_get_device_memory() call
++// against that stub. With GGML_RPC_CLIENT_TIMEOUT_SEC set short by the
++// driver script, the fixed client must abort (via its own recv() timing
++// out) well inside a bounded window instead of hanging -- the driver
++// script asserts on that bound, and ctest's own TIMEOUT property is a
++// second, coarser safety net if a regression reintroduces the old
++// unbounded wait.
++
++#include "ggml-backend.h"
++#include "ggml-rpc.h"
++#include "ggml.h"
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <cinttypes>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++// Wire layout, mirroring ggml/src/ggml-rpc/ggml-rpc.cpp (packed).
++#pragma pack(push, 1)
++struct rpc_msg_hello_req {
++    uint8_t conn_caps[24];
++};
++struct rpc_msg_hello_rsp {
++    uint8_t major;
++    uint8_t minor;
++    uint8_t patch;
++    uint8_t padding;
++    uint8_t conn_caps[24];
++};
++#pragma pack(pop)
++
++static constexpr uint8_t RPC_CMD_HELLO = 14;
++
++static bool read_exact(int fd, void * buf, size_t n) {
++    size_t got = 0;
++    while (got < n) {
++        ssize_t r = read(fd, (char *) buf + got, n - got);
++        if (r <= 0) {
++            return false;
++        }
++        got += (size_t) r;
++    }
++    return true;
++}
++
++static bool write_exact(int fd, const void * buf, size_t n) {
++    size_t sent = 0;
++    while (sent < n) {
++        ssize_t w = write(fd, (const char *) buf + sent, n - sent);
++        if (w <= 0) {
++            return false;
++        }
++        sent += (size_t) w;
++    }
++    return true;
++}
++
++// A minimal RPC "server" that completes the handshake correctly, then goes
++// silent forever on the first real request instead of answering it.
++static int mode_stall_server(int port) {
++    int srv = socket(AF_INET, SOCK_STREAM, 0);
++    if (srv < 0) {
++        perror("socket");
++        return 1;
++    }
++    int on = 1;
++    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++    sockaddr_in addr{};
++    addr.sin_family      = AF_INET;
++    addr.sin_port        = htons((uint16_t) port);
++    addr.sin_addr.s_addr = INADDR_ANY;
++    if (bind(srv, (sockaddr *) &addr, sizeof(addr)) < 0) {
++        perror("bind");
++        return 1;
++    }
++    if (listen(srv, 1) < 0) {
++        perror("listen");
++        return 1;
++    }
++    printf("stall-server: listening on port %d\n", port);
++    fflush(stdout);
++
++    int fd = accept(srv, nullptr, nullptr);
++    if (fd < 0) {
++        perror("accept");
++        return 1;
++    }
++
++    // ---- HELLO request: | cmd(1) | size(8) | rpc_msg_hello_req |
++    uint8_t cmd = 0;
++    if (!read_exact(fd, &cmd, 1) || cmd != RPC_CMD_HELLO) {
++        fprintf(stderr, "stall-server: expected HELLO, got cmd=%u\n", cmd);
++        return 1;
++    }
++    uint64_t req_size = 0;
++    if (!read_exact(fd, &req_size, sizeof(req_size)) || req_size != sizeof(rpc_msg_hello_req)) {
++        fprintf(stderr, "stall-server: bad HELLO request size %" PRIu64 "\n", req_size);
++        return 1;
++    }
++    rpc_msg_hello_req req{};
++    if (!read_exact(fd, &req, sizeof(req))) {
++        fprintf(stderr, "stall-server: failed to read HELLO body\n");
++        return 1;
++    }
++
++    // ---- HELLO response: | size(8) | rpc_msg_hello_rsp | -- answer with a
++    // real, matching protocol version and all-zero conn_caps (no RDMA), so
++    // the real client backend's negotiate_hello() accepts it and proceeds.
++    rpc_msg_hello_rsp rsp{};
++    rsp.major = RPC_PROTO_MAJOR_VERSION;
++    rsp.minor = RPC_PROTO_MINOR_VERSION;
++    rsp.patch = RPC_PROTO_PATCH_VERSION;
++    uint64_t rsp_size = sizeof(rsp);
++    if (!write_exact(fd, &rsp_size, sizeof(rsp_size)) || !write_exact(fd, &rsp, sizeof(rsp))) {
++        fprintf(stderr, "stall-server: failed to send HELLO response\n");
++        return 1;
++    }
++    printf("stall-server: handshake complete, now going silent on the next request\n");
++    fflush(stdout);
++
++    // ---- Next request: read its header (cmd + size), then go silent
++    // forever -- never answer, never close the socket. This is "worker
++    // process alive, connection open, just never responds."
++    if (!read_exact(fd, &cmd, 1)) {
++        fprintf(stderr, "stall-server: peer closed before sending a second request\n");
++        return 1;
++    }
++    if (!read_exact(fd, &req_size, sizeof(req_size))) {
++        return 1;
++    }
++    std::vector<uint8_t> body(req_size);
++    if (req_size > 0 && !read_exact(fd, body.data(), body.size())) {
++        return 1;
++    }
++    printf("stall-server: received cmd=%u, going silent\n", cmd);
++    fflush(stdout);
++    // Sleep well past any sane test timeout. The client's own recv timeout
++    // (this test's whole point) is what must end this, not us.
++    std::this_thread::sleep_for(std::chrono::hours(1));
++    return 0;
++}
++
++// One real RPC client call against the stub above. Expected to fail (abort)
++// once its receive timeout fires, not hang -- the driver script measures
++// how long this process actually took to exit.
++static int mode_client(const std::string & endpoint) {
++    ggml_backend_load_all();
++    size_t free_mem  = 0;
++    size_t total_mem = 0;
++    // GGML_RPC_CLIENT_TIMEOUT_SEC is expected to be set (short) by the
++    // driver script before this process starts.
++    ggml_backend_rpc_get_device_memory(endpoint.c_str(), 0, &free_mem, &total_mem);
++    // Only reached if the stub answered, which it never does by design --
++    // if we get here the test setup is broken, not the fix.
++    fprintf(stderr, "client: unexpectedly got a response (free=%zu total=%zu)\n", free_mem, total_mem);
++    return 1;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s server PORT | %s client ENDPOINT\n", argv[0], argv[0]);
++        return 2;
++    }
++    const std::string mode = argv[1];
++    if (mode == "server") {
++        return mode_stall_server(std::atoi(argv[2]));
++    }
++    if (mode == "client") {
++        return mode_client(argv[2]);
++    }
++    fprintf(stderr, "unknown mode: %s\n", mode.c_str());
++    return 2;
++}
+diff --git a/tests/test-rpc-client-timeout.sh b/tests/test-rpc-client-timeout.sh
+new file mode 100644
+index 0000000000..9b35de636b
+--- /dev/null
++++ b/tests/test-rpc-client-timeout.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++# Driver for test-rpc-client-timeout.cpp -- see that file's header comment
++# for what this proves. Starts the stub "server" (completes the HELLO
++# handshake, then goes silent forever on the next request), then runs the
++# real RPC client against it with a short GGML_RPC_CLIENT_TIMEOUT_SEC and
++# asserts it fails within a bounded window instead of hanging.
++set -uo pipefail
++
++bin=$1
++port=$((40000 + $$ % 10000))
++endpoint="127.0.0.1:${port}"
++test_dir=$(mktemp -d)
++
++cleanup() {
++    kill "${srv_pid:-}" 2>/dev/null || true
++    wait "${srv_pid:-}" 2>/dev/null || true
++    rm -rf "$test_dir"
++}
++trap cleanup EXIT
++
++# Do NOT probe readiness with a bare TCP connect+close (e.g. bash's
++# /dev/tcp): the stub server below calls accept() exactly once and expects
++# that one connection to be the real client's HELLO handshake, not a probe.
++# A connect-then-immediately-close probe would consume that single accept()
++# with a connection that never sends anything, and the stub would exit
++# treating it as a malformed handshake -- wait on its own log line instead.
++wait_for_log() {
++    local pattern=$1
++    for _ in {1..600}; do
++        if grep -q "$pattern" "$test_dir/server.log" 2>/dev/null; then
++            return 0
++        fi
++        sleep 0.05
++    done
++    return 1
++}
++
++"$bin" server "$port" >"$test_dir/server.log" 2>&1 &
++srv_pid=$!
++if ! wait_for_log "listening on port"; then
++    echo "stub server never came up"
++    cat "$test_dir/server.log"
++    exit 1
++fi
++
++# Short client-side timeout so a correct fix finishes this test in seconds;
++# a regression back to the old unbounded wait hangs here instead, and is
++# caught by this test's own ctest TIMEOUT property.
++export GGML_RPC_CLIENT_TIMEOUT_SEC=2
++
++t0=$(date +%s.%N)
++"$bin" client "$endpoint" >"$test_dir/client.log" 2>"$test_dir/client.err"
++rc=$?
++t1=$(date +%s.%N)
++elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
++
++echo "client exit=$rc elapsed=${elapsed}s"
++cat "$test_dir/client.log"
++cat "$test_dir/client.err"
++
++if [ "$rc" -eq 0 ]; then
++    echo "FAIL: client exited 0 -- it should have failed once the stub went silent" >&2
++    exit 1
++fi
++
++# Bounded: the fixed client must fail once its ~2s receive timeout fires,
++# not instantly (that would mean it failed for some unrelated reason before
++# ever reaching the stalled request) and not after a long wait (that would
++# mean the timeout never took effect and it's approaching an unbounded
++# hang -- this script's caller, ctest, has its own hard TIMEOUT as the
++# final backstop for that case).
++awk_cmp() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'; }
++if awk_cmp "$elapsed" "1.0"; then
++    echo "FAIL: client failed after only ${elapsed}s, before the ~2s timeout could have fired -- test setup is broken" >&2
++    exit 1
++fi
++if ! awk_cmp "$elapsed" "30.0"; then
++    echo "FAIL: client took ${elapsed}s -- the receive timeout does not appear to be bounding the wait" >&2
++    exit 1
++fi
++
++echo "OK: client failed cleanly after ${elapsed}s (bounded by GGML_RPC_CLIENT_TIMEOUT_SEC=2), not a hang"
++exit 0
+diff --git a/tools/rpc/CMakeLists.txt b/tools/rpc/CMakeLists.txt
+index 1ed0487c88..bab268e09e 100644
+--- a/tools/rpc/CMakeLists.txt
++++ b/tools/rpc/CMakeLists.txt
+@@ -23,6 +23,15 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
+             $<TARGET_FILE:test-rpc-server-multiclient>)
+     set_property(TEST test-rpc-server-multiclient PROPERTY LABELS main)
+     set_property(TEST test-rpc-server-multiclient PROPERTY TIMEOUT 120)
++
++    add_executable(test-rpc-client-timeout ${PROJECT_SOURCE_DIR}/tests/test-rpc-client-timeout.cpp)
++    target_link_libraries(test-rpc-client-timeout PRIVATE ggml ggml-rpc)
++    add_test(
++        NAME test-rpc-client-timeout
++        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-rpc-client-timeout.sh
++            $<TARGET_FILE:test-rpc-client-timeout>)
++    set_property(TEST test-rpc-client-timeout PROPERTY LABELS main)
++    set_property(TEST test-rpc-client-timeout PROPERTY TIMEOUT 60)
+ endif()
+ 
+ if(LLAMA_TOOLS_INSTALL)
+-- 
+2.43.0
+

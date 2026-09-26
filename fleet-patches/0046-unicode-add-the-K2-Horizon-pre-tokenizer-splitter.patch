@@ -30,7 +30,7 @@ tests/test-unicode.cpp gains a case for this: it fails before the change with
  2 files changed, 171 insertions(+), 7 deletions(-)
 
 diff --git a/src/unicode.cpp b/src/unicode.cpp
-index 93996f9dd..d2f166208 100644
+index 93996f9dd5..d2f166208f 100644
 --- a/src/unicode.cpp
 +++ b/src/unicode.cpp
 @@ -470,6 +470,150 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
@@ -196,7 +196,7 @@ index 93996f9dd..d2f166208 100644
          // K2's first pattern - handle all K2 patterns together
          bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
 diff --git a/tests/test-unicode.cpp b/tests/test-unicode.cpp
-index 2347d9000..52edf759b 100644
+index 2347d9000a..52edf759bb 100644
 --- a/tests/test-unicode.cpp
 +++ b/tests/test-unicode.cpp
 @@ -4,15 +4,13 @@

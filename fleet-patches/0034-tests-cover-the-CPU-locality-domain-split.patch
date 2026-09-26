@@ -41,7 +41,7 @@ Assisted-by: Claude Sonnet
  create mode 100644 tools/server/tests/unit/test_cpu_split.py
 
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 9b3a4fcc4..01fcf97cd 100644
+index 9b3a4fcc4b..01fcf97cd4 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -325,6 +325,7 @@ endif()
@@ -54,7 +54,7 @@ index 9b3a4fcc4..01fcf97cd 100644
      llama_build_and_test(test-rope.cpp)
 diff --git a/tests/test-cpu-device-split.cpp b/tests/test-cpu-device-split.cpp
 new file mode 100644
-index 000000000..5b374d4dd
+index 0000000000..5b374d4dd9
 --- /dev/null
 +++ b/tests/test-cpu-device-split.cpp
 @@ -0,0 +1,140 @@
@@ -200,7 +200,7 @@ index 000000000..5b374d4dd
 +}
 diff --git a/tools/server/tests/unit/test_cpu_split.py b/tools/server/tests/unit/test_cpu_split.py
 new file mode 100644
-index 000000000..e560a7076
+index 0000000000..e560a7076e
 --- /dev/null
 +++ b/tools/server/tests/unit/test_cpu_split.py
 @@ -0,0 +1,69 @@
@@ -274,7 +274,7 @@ index 000000000..e560a7076
 +    assert res.status_code == 200
 +    assert len(res.body["content"]) > 0
 diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
-index 5de966868..fa3d37412 100644
+index 5de9668689..fa3d374126 100644
 --- a/tools/server/tests/utils.py
 +++ b/tools/server/tests/utils.py
 @@ -124,6 +124,8 @@ class ServerProcess:

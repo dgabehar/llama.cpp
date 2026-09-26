@@ -1,0 +1,37 @@
+From 22a240a7a859a597513e6a02b33aebf5b3d59917 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 17:20:36 -0500
+Subject: [PATCH] fleet: fix the patch mirror table numbering
+
+Assisted-by: Claude Opus 5.5
+---
+ fleet-patches/README.md | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/fleet-patches/README.md b/fleet-patches/README.md
+index 1010373656..e7ce426d87 100644
+--- a/fleet-patches/README.md
++++ b/fleet-patches/README.md
+@@ -127,12 +127,13 @@ re-derive the equivalent change against the new upstream code, `git am
+ | 0110 | `24e4d819b` | fleet: regenerate patch mirror for the captured-checkpoint fix |
+ | 0111 | `0ab13d2bb` | server: don't update the prompt cache of a busy slot picked by id_slot |
+ | 0112 | `c4234d605` | FLEET.md: record the busy-slot prompt cache fix |
+-| 0113 | `1b177d4e5` | chat : K2-Horizon: don't leak tool-call markup into content with no tools |
+-| 0114 | `3a15bf975` | chat : K2-Horizon tests and comment: use a neutral example hostname |
+-| 0115 | `9ecf429da` | common : split-balance: scale prefill by byte_scale too, not just decode |
+-| 0116 | `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
+-| 0117 | `74405080c` | chat : drop whitespace between reasoning end tag and content |
+-| 0118 | (this commit) | fleet: regenerate patch mirror for the round-7 fixes |
++| 0113 | `181e60aad` | fleet: regenerate patch mirror for the busy-slot prompt cache fix |
++| 0114 || `1b177d4e5` | chat : K2-Horizon: don't leak tool-call markup into content with no tools |
++| 0115 || `3a15bf975` | chat : K2-Horizon tests and comment: use a neutral example hostname |
++| 0116 || `9ecf429da` | common : split-balance: scale prefill by byte_scale too, not just decode |
++| 0117 || `b4a0f6c85` | common : split-balance: fix calibration overrating a device under per-node Vulkan submits |
++| 0118 || `74405080c` | chat : drop whitespace between reasoning end tag and content |
++| 0119 || (this commit) | fleet: regenerate patch mirror for the round-7 fixes |
+ | 0110 | (this commit) | fleet: regenerate patch mirror |
+ 
+ 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
+-- 
+2.43.0
+

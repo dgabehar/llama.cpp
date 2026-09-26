@@ -30,7 +30,7 @@ Assisted-by: Claude Sonnet 5
 
 diff --git a/fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch b/fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
 new file mode 100644
-index 000000000..d77846c8b
+index 0000000000..d77846c8be
 --- /dev/null
 +++ b/fleet-patches/0015-fleet-regenerate-patch-mirror-for-occupancy-aware-ti.patch
 @@ -0,0 +1,7524 @@
@@ -7560,7 +7560,7 @@ index 000000000..d77846c8b
 +
 diff --git a/fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch b/fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch
 new file mode 100644
-index 000000000..d9b27a44b
+index 0000000000..d9b27a44b8
 --- /dev/null
 +++ b/fleet-patches/0016-model-K2-Horizon-gguf-conversion-code.patch
 @@ -0,0 +1,365 @@
@@ -7931,7 +7931,7 @@ index 000000000..d9b27a44b
 +
 diff --git a/fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch b/fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
 new file mode 100644
-index 000000000..7ac1fb934
+index 0000000000..7ac1fb9344
 --- /dev/null
 +++ b/fleet-patches/0017-model-loading-hparams-and-tensors-in-k2-horizon.cpp.patch
 @@ -0,0 +1,408 @@
@@ -8345,7 +8345,7 @@ index 000000000..7ac1fb934
 +
 diff --git a/fleet-patches/0018-model-K2-Horizon-compute-graph.patch b/fleet-patches/0018-model-K2-Horizon-compute-graph.patch
 new file mode 100644
-index 000000000..a4b934d8e
+index 0000000000..a4b934d8e7
 --- /dev/null
 +++ b/fleet-patches/0018-model-K2-Horizon-compute-graph.patch
 @@ -0,0 +1,458 @@
@@ -8809,7 +8809,7 @@ index 000000000..a4b934d8e
 +
 diff --git a/fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-regist.patch b/fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
 new file mode 100644
-index 000000000..5f9546b5d
+index 0000000000..5f9546b5d6
 --- /dev/null
 +++ b/fleet-patches/0019-model-K2-Horizon-compute-graph-adjustment-and-regist.patch
 @@ -0,0 +1,166 @@
@@ -8981,7 +8981,7 @@ index 000000000..5f9546b5d
 +
 diff --git a/fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-safete.patch b/fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-safete.patch
 new file mode 100644
-index 000000000..4aaf71f5d
+index 0000000000..4aaf71f5d5
 --- /dev/null
 +++ b/fleet-patches/0020-model-K2-Horizon-chat-template-and-accomodate-safete.patch
 @@ -0,0 +1,955 @@
@@ -9942,7 +9942,7 @@ index 000000000..4aaf71f5d
 +
 diff --git a/fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch b/fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
 new file mode 100644
-index 000000000..6d9e8668c
+index 0000000000..6d9e8668c2
 --- /dev/null
 +++ b/fleet-patches/0021-k2-horizon-adapt-to-hparams.n_ff_exp-API-drift-since.patch
 @@ -0,0 +1,75 @@
@@ -10022,7 +10022,7 @@ index 000000000..6d9e8668c
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 11637a915..2d5fab111 100644
+index 11637a9151..2d5fab1117 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,

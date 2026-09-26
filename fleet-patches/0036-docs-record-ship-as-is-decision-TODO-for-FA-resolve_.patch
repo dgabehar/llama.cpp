@@ -14,7 +14,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 17 insertions(+), 7 deletions(-)
 
 diff --git a/FLEET.md b/FLEET.md
-index f541fbb33..1b9201f92 100644
+index f541fbb33e..1b9201f925 100644
 --- a/FLEET.md
 +++ b/FLEET.md
 @@ -101,13 +101,23 @@ fixture: `resolve_fused_ops: layer 3 is assigned to device CPU1 but Flash

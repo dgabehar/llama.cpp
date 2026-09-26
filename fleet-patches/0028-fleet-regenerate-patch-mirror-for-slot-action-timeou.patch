@@ -17,7 +17,7 @@ Assisted-by: Claude Sonnet 5
 
 diff --git a/fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call-dif.patch b/fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
 new file mode 100644
-index 000000000..091d41620
+index 0000000000..091d416203
 --- /dev/null
 +++ b/fleet-patches/0026-fleet-regenerate-patch-mirror-document-tool-call-dif.patch
 @@ -0,0 +1,10508 @@
@@ -10531,7 +10531,7 @@ index 000000000..091d41620
 +
 diff --git a/fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch b/fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
 new file mode 100644
-index 000000000..68eed53f7
+index 0000000000..68eed53f73
 --- /dev/null
 +++ b/fleet-patches/0027-peg-parser-don-t-prematurely-close-an-until_one_of-s.patch
 @@ -0,0 +1,132 @@
@@ -10669,7 +10669,7 @@ index 000000000..68eed53f7
 +
 diff --git a/fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-empt.patch b/fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-empt.patch
 new file mode 100644
-index 000000000..b076d9316
+index 0000000000..b076d93162
 --- /dev/null
 +++ b/fleet-patches/0028-server-bound-slot-action-queue-wait-and-explain-empt.patch
 @@ -0,0 +1,495 @@
@@ -11169,7 +11169,7 @@ index 000000000..b076d9316
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 56742d951..8c397526c 100644
+index 56742d9512..8c397526cb 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -52,6 +52,8 @@ re-derive the equivalent change against the new upstream code, `git am

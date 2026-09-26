@@ -29,7 +29,7 @@ Assisted-by: Claude Sonnet
 
 diff --git a/fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch b/fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
 new file mode 100644
-index 000000000..d2102b9b6
+index 0000000000..d2102b9b60
 --- /dev/null
 +++ b/fleet-patches/0029-fleet-regenerate-patch-mirror-for-slot-action-timeou.patch
 @@ -0,0 +1,11186 @@
@@ -11221,7 +11221,7 @@ index 000000000..d2102b9b6
 +
 diff --git a/fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch b/fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
 new file mode 100644
-index 000000000..c6dc4f448
+index 0000000000..c6dc4f448c
 --- /dev/null
 +++ b/fleet-patches/0030-FLEET.md-require-Murat-Dawn-QA-loop-for-every-fork-e.patch
 @@ -0,0 +1,49 @@
@@ -11276,7 +11276,7 @@ index 000000000..c6dc4f448
 +
 diff --git a/fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch b/fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
 new file mode 100644
-index 000000000..dfcbef6ad
+index 0000000000..dfcbef6ad7
 --- /dev/null
 +++ b/fleet-patches/0031-ggml-cpu-extend-CPU-backend-device-registry-to-N-loc.patch
 @@ -0,0 +1,439 @@
@@ -11721,7 +11721,7 @@ index 000000000..dfcbef6ad
 +
 diff --git a/fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-thro.patch b/fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
 new file mode 100644
-index 000000000..bd708ea81
+index 0000000000..bd708ea812
 --- /dev/null
 +++ b/fleet-patches/0032-common-new-cpu-split-auto-off-flag-with-startup-thro.patch
 @@ -0,0 +1,329 @@
@@ -12056,7 +12056,7 @@ index 000000000..bd708ea81
 +
 diff --git a/fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-loca.patch b/fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-loca.patch
 new file mode 100644
-index 000000000..0fd12c98c
+index 0000000000..0fd12c98c9
 --- /dev/null
 +++ b/fleet-patches/0033-llama-model-weighted-per-layer-CPU-split-across-loca.patch
 @@ -0,0 +1,215 @@
@@ -12277,7 +12277,7 @@ index 000000000..0fd12c98c
 +
 diff --git a/fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-aware.patch b/fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-aware.patch
 new file mode 100644
-index 000000000..180b3dfad
+index 0000000000..180b3dfad3
 --- /dev/null
 +++ b/fleet-patches/0034-llama-context-make-backend_cpu-locality-domain-aware.patch
 @@ -0,0 +1,137 @@
@@ -12420,7 +12420,7 @@ index 000000000..180b3dfad
 +
 diff --git a/fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch b/fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch
 new file mode 100644
-index 000000000..697c53d7e
+index 0000000000..697c53d7e0
 --- /dev/null
 +++ b/fleet-patches/0035-tests-cover-the-CPU-locality-domain-split.patch
 @@ -0,0 +1,302 @@
@@ -12728,7 +12728,7 @@ index 000000000..697c53d7e
 +
 diff --git a/fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-domain-.patch b/fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
 new file mode 100644
-index 000000000..98a712676
+index 0000000000..98a7126769
 --- /dev/null
 +++ b/fleet-patches/0036-docs-document-cpu-split-and-the-CPU-locality-domain-.patch
 @@ -0,0 +1,96 @@
@@ -12830,7 +12830,7 @@ index 000000000..98a712676
 +
 diff --git a/fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch b/fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
 new file mode 100644
-index 000000000..c87b75dd0
+index 0000000000..c87b75dd0f
 --- /dev/null
 +++ b/fleet-patches/0037-docs-record-ship-as-is-decision-TODO-for-FA-resolve_.patch
 @@ -0,0 +1,53 @@
@@ -12888,7 +12888,7 @@ index 000000000..c87b75dd0
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index 8c397526c..bd9f34806 100644
+index 8c397526cb..bd9f34806d 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,

@@ -22,7 +22,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
 
 diff --git a/fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-log-un.patch b/fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
 new file mode 100644
-index 000000000..0a15d48af
+index 0000000000..0a15d48af1
 --- /dev/null
 +++ b/fleet-patches/0046-fleet-regenerate-patch-mirror-for-calibration-log-un.patch
 @@ -0,0 +1,13361 @@
@@ -13389,7 +13389,7 @@ index 000000000..0a15d48af
 +
 diff --git a/fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch b/fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
 new file mode 100644
-index 000000000..ce189fc3b
+index 0000000000..ce189fc3be
 --- /dev/null
 +++ b/fleet-patches/0047-unicode-add-the-K2-Horizon-pre-tokenizer-splitter.patch
 @@ -0,0 +1,247 @@
@@ -13642,7 +13642,7 @@ index 000000000..ce189fc3b
 +
 diff --git a/fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverage.patch b/fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
 new file mode 100644
-index 000000000..aab7d8a3d
+index 0000000000..aab7d8a3d5
 --- /dev/null
 +++ b/fleet-patches/0048-tests-expand-K2-Horizon-unicode-splitter-coverage.patch
 @@ -0,0 +1,249 @@
@@ -13897,7 +13897,7 @@ index 000000000..aab7d8a3d
 +
 diff --git a/fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch b/fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
 new file mode 100644
-index 000000000..557d9a826
+index 0000000000..557d9a8269
 --- /dev/null
 +++ b/fleet-patches/0049-unicode-handle-K2-Horizon-case-folding-and-empty-inp.patch
 @@ -0,0 +1,98 @@
@@ -14000,7 +14000,7 @@ index 000000000..557d9a826
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index d9e995dba..8501def9d 100644
+index d9e995dbad..8501def9df 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,

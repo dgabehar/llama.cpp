@@ -28,7 +28,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 24 insertions(+), 9 deletions(-)
 
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index 93866b61d..3f0e5ac0a 100644
+index 93866b61df..3f0e5ac0a5 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -456,6 +456,28 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne

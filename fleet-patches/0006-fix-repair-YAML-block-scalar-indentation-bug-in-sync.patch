@@ -11,7 +11,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 12 insertions(+), 7 deletions(-)
 
 diff --git a/.github/workflows/sync-fleet-patches.yml b/.github/workflows/sync-fleet-patches.yml
-index 258a40b59..35509aa10 100644
+index 258a40b59e..35509aa103 100644
 --- a/.github/workflows/sync-fleet-patches.yml
 +++ b/.github/workflows/sync-fleet-patches.yml
 @@ -88,15 +88,20 @@ jobs:

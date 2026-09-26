@@ -21,7 +21,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 8 insertions(+), 17 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index a1ad9aa0d..2e9f6f313 100644
+index a1ad9aa0d5..2e9f6f3137 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -14857,19 +14857,6 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total

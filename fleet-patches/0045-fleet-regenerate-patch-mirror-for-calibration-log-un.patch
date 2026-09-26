@@ -14,7 +14,7 @@ Assisted-by: Claude Sonnet
 
 diff --git a/fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup.patch b/fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup.patch
 new file mode 100644
-index 000000000..f201b4f52
+index 0000000000..f201b4f52e
 --- /dev/null
 +++ b/fleet-patches/0044-fleet-regenerate-patch-mirror-for-outage-writeup.patch
 @@ -0,0 +1,13272 @@
@@ -13292,7 +13292,7 @@ index 000000000..f201b4f52
 +
 diff --git a/fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-line-.patch b/fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-line-.patch
 new file mode 100644
-index 000000000..c5665525f
+index 0000000000..c5665525fc
 --- /dev/null
 +++ b/fleet-patches/0045-fix-correct-units-in-CPU-split-calibration-log-line-.patch
 @@ -0,0 +1,48 @@
@@ -13345,7 +13345,7 @@ index 000000000..c5665525f
 +2.43.0
 +
 diff --git a/fleet-patches/README.md b/fleet-patches/README.md
-index ac4223bac..d9e995dba 100644
+index ac4223bac7..d9e995dbad 100644
 --- a/fleet-patches/README.md
 +++ b/fleet-patches/README.md
 @@ -64,6 +64,7 @@ re-derive the equivalent change against the new upstream code, `git am

@@ -37,7 +37,7 @@ Assisted-by: Claude Sonnet 5
  1 file changed, 14 insertions(+), 1 deletion(-)
 
 diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
-index 208f551f1..2fdd261f9 100644
+index 208f551f1b..2fdd261f92 100644
 --- a/common/parsers/qwen3-coder.cpp
 +++ b/common/parsers/qwen3-coder.cpp
 @@ -89,8 +89,21 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat

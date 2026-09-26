@@ -20,7 +20,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
 
 diff --git a/.github/workflows/sync-fleet-patches.yml b/.github/workflows/sync-fleet-patches.yml
 new file mode 100644
-index 000000000..258a40b59
+index 0000000000..258a40b59e
 --- /dev/null
 +++ b/.github/workflows/sync-fleet-patches.yml
 @@ -0,0 +1,102 @@

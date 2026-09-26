@@ -10,7 +10,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index bd8b4dc6e..23c14eabf 100644
+index bd8b4dc6e1..23c14eabfb 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1318,9 +1318,13 @@ private:

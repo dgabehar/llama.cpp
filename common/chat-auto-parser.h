@@ -258,6 +258,7 @@ struct analyze_reasoning : analyze_base {
 
     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
+    std::vector<std::string> end_alts; // other tags that also close the reasoning (the model may emit any of them)
 
     analyze_reasoning() = default;
     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
@@ -287,6 +288,15 @@ struct analyze_content : analyze_base {
     std::string end;    // e.g., "</response>", ""
 
     bool requires_nonnull_content = false;
+
+    // tags the model may emit after its answer before derailing (e.g. a second reasoning close tag): content
+    // ends at the first of them and the rest of the output is dropped
+    std::vector<std::string> stray_ends;
+
+    // same idea as stray_ends, but only checked when the request has no tools (e.g. hallucinated
+    // tool-call markup the model emits despite none being offered). With tools offered, these tags
+    // are real tool-call syntax parsed by analyze_tools instead, so they must never end content here.
+    std::vector<std::string> stray_ends_no_tools;
 
     analyze_content() = default;
     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);

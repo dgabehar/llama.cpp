@@ -12,7 +12,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/tests/test-rpc-server-multiclient.cpp b/tests/test-rpc-server-multiclient.cpp
-index 83cf46aa2..78c3f3424 100644
+index 83cf46aa2c..78c3f34248 100644
 --- a/tests/test-rpc-server-multiclient.cpp
 +++ b/tests/test-rpc-server-multiclient.cpp
 @@ -349,11 +349,11 @@ static int mode_compute(const std::string & ep, int iters, int seed) {

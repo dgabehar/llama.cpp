@@ -16,7 +16,7 @@ Subject: [PATCH] model: K2 Horizon compute graph adjustment and registering
  8 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/conversion/__init__.py b/conversion/__init__.py
-index e43b9cec3..54edb3651 100644
+index e43b9cec3c..54edb36518 100644
 --- a/conversion/__init__.py
 +++ b/conversion/__init__.py
 @@ -137,6 +137,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
@@ -28,7 +28,7 @@ index e43b9cec3..54edb3651 100644
      "KimiK25ForConditionalGeneration": "deepseek",
      "KimiK3ForConditionalGeneration": "kimi_k3",
 diff --git a/conversion/base.py b/conversion/base.py
-index 6aca7f1d3..3df437929 100644
+index 6aca7f1d34..3df437929f 100644
 --- a/conversion/base.py
 +++ b/conversion/base.py
 @@ -1639,6 +1639,12 @@ class TextModel(ModelBase):
@@ -45,7 +45,7 @@ index 6aca7f1d3..3df437929 100644
              # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
              res = "llama-bpe"
 diff --git a/conversion/k2_horizon.py b/conversion/k2_horizon.py
-index d3f5af923..6ceb30b29 100644
+index d3f5af9236..6ceb30b29f 100644
 --- a/conversion/k2_horizon.py
 +++ b/conversion/k2_horizon.py
 @@ -8,7 +8,10 @@ from torch import Tensor
@@ -61,7 +61,7 @@ index d3f5af923..6ceb30b29 100644
      "IFM/K2-Horizon-0.9B",
      "IFM/K2-Horizon-36B",
 diff --git a/convert_hf_to_gguf_update.py b/convert_hf_to_gguf_update.py
-index 24b9bc075..4067239da 100755
+index 24b9bc0757..4067239da9 100755
 --- a/convert_hf_to_gguf_update.py
 +++ b/convert_hf_to_gguf_update.py
 @@ -197,6 +197,9 @@ pre_computed_hashes = [
@@ -75,7 +75,7 @@ index 24b9bc075..4067239da 100755
  
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50d0..03e4243be 100644
+index e195f50d0b..03e4243be1 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -344,6 +344,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
@@ -96,7 +96,7 @@ index e195f50d0..03e4243be 100644
          case LLM_ARCH_MAPLE:
          case LLM_ARCH_HRM_TEXT:
 diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
-index e038637ce..797969c3b 100644
+index e038637ce7..797969c3b2 100644
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -551,6 +551,11 @@ struct llm_tokenizer_bpe : llm_tokenizer {
@@ -123,7 +123,7 @@ index e038637ce..797969c3b 100644
                  throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
              }
 diff --git a/src/llama-vocab.h b/src/llama-vocab.h
-index 3fb061f0e..c132c8280 100644
+index 3fb061f0ec..c132c82807 100644
 --- a/src/llama-vocab.h
 +++ b/src/llama-vocab.h
 @@ -68,6 +68,7 @@ enum llama_vocab_pre_type {
@@ -135,7 +135,7 @@ index 3fb061f0e..c132c8280 100644
  
  struct LLM_KV;
 diff --git a/src/models/k2-horizon.cpp b/src/models/k2-horizon.cpp
-index 4ee66cade..ac901da50 100644
+index 4ee66cadee..ac901da50a 100644
 --- a/src/models/k2-horizon.cpp
 +++ b/src/models/k2-horizon.cpp
 @@ -277,13 +277,9 @@ static ggml_tensor * k2_horizon_group_rms_norm(
