@@ -394,14 +394,44 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     // what one node costs to submit and run: a chain of scales over one token's activations (dispatch bound)
     // and over a ubatch of them (memory bound). Long enough that a backend which submits one command buffer
     // per node (e.g. Vulkan with GGML_VK_MAX_NODES_PER_SUBMIT=1) pays its real per-submit cost here too, not
-    // just the cheap, unsaturated cost a short chain would see -- the same reason the weight/attention/GDN
-    // graphs above are too small to show it on their own (see t_op_tg/t_op_pp below).
+    // just the cheap, unsaturated cost a short chain would see. The decode graphs below repeat a layer's own
+    // ops to the same length, for the same reason (see n_rep below).
     constexpr int n_chain = 256;
 
     size_t n_tensors = 16;
     for (const auto & l : m.layers) {
         n_tensors += 6 * l.weights.size() + 32;
     }
+
+    // A layer's decode ops (its weight matmuls, attention and GDN) are timed together as one graph call.
+    // On their own they are far shorter than n_chain, so under per-node submits this graph never reaches
+    // the same submit-queue depth a real, many-layer decode graph reaches -- it pays the cheap, unsaturated
+    // per-submit cost instead of the real one, the same way the untimed ops would without n_chain above.
+    // Repeat the ops until the graph is long enough, and divide the measured time by the repeat count.
+    // Prefill is not repeated: its nodes are already much heavier (a whole ubatch each), so the same fixed
+    // per-submit cost is a far smaller share of it.
+    std::vector<int> n_rep(m.layers.size(), 1);
+    std::vector<int> n1_decode(m.layers.size(), 0);
+    std::vector<int> n1_prefill(m.layers.size(), 0);
+    std::vector<int> n1_prefill_exp(m.layers.size(), 0);
+    for (size_t li = 0; li < m.layers.size(); li++) {
+        const auto & l = m.layers[li];
+        int n_exp = 0, n_nonexp = 0;
+        for (const auto & w : l.weights) {
+            (w.ne[2] > 1 ? n_exp : n_nonexp)++;
+        }
+        const int n_gdn  = l.gdn_state > 0 ? 2 : 0;
+        const int n_attn = l.n_head > 0 ? 1 : 0;
+        n1_decode[li]      = n_exp + n_nonexp + n_gdn + n_attn;
+        n1_prefill[li]     = n_nonexp + n_gdn + n_attn;
+        n1_prefill_exp[li] = n_exp;
+        n_rep[li] = n1_decode[li] > 0 ? std::max(1, (n_chain + n1_decode[li] - 1) / n1_decode[li]) : 1;
+    }
+    size_t n_rep_tensors = 0;
+    for (size_t li = 0; li < m.layers.size(); li++) {
+        n_rep_tensors += (size_t) n_rep[li] * n1_decode[li] * 3; // the op itself plus add_timed_op's view and cont
+    }
+
     ggml_init_params wparams = {
         /* .mem_size   = */ ggml_tensor_overhead() * n_tensors,
         /* .mem_buffer = */ nullptr,
@@ -410,7 +440,7 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     ggml_context_ptr wctx { ggml_init(wparams) };          // weights and inputs, allocated once
     ggml_init_params gparams = {
         // 2 * n_chain: the untimed-op probe below builds two chains of n_chain scale nodes in this same context
-        /* .mem_size   = */ ggml_tensor_overhead() * (n_tensors * 4 + 2 * n_chain) + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
+        /* .mem_size   = */ ggml_tensor_overhead() * (n_tensors * 4 + 2 * n_chain + n_rep_tensors) + (3 * m.layers.size() + 4) * ggml_graph_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -499,37 +529,51 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
         if (has_exp) {
             g.prefill_exp = ggml_new_graph(gctx.get());
         }
-        for (size_t wi = 0; wi < l.weights.size(); wi++) {
-            ggml_tensor * w  = weights[li][wi];
-            const bool   exp = l.weights[wi].ne[2] > 1;
-            if (exp) {
-                add_timed_op(gctx.get(), g.decode,      ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], 1, true), ids_tg));
-                add_timed_op(gctx.get(), g.prefill_exp, ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], ub_exp, true), ids_pp));
-            } else {
-                add_timed_op(gctx.get(), g.decode,  ggml_mul_mat(gctx.get(), w, input(w->ne[0], 1, false)));
-                add_timed_op(gctx.get(), g.prefill, ggml_mul_mat(gctx.get(), w, input(w->ne[0], ub, false)));
+        // decode ops repeat n_rep[li] times (see n_rep's declaration above); prefill/prefill_exp ops are
+        // only built on the first pass
+        bool layer_attn_ok = true;
+        for (int rep = 0; rep < n_rep[li]; rep++) {
+            for (size_t wi = 0; wi < l.weights.size(); wi++) {
+                ggml_tensor * w  = weights[li][wi];
+                const bool   exp = l.weights[wi].ne[2] > 1;
+                if (exp) {
+                    add_timed_op(gctx.get(), g.decode, ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], 1, true), ids_tg));
+                    if (rep == 0) {
+                        add_timed_op(gctx.get(), g.prefill_exp, ggml_mul_mat_id(gctx.get(), w, input(w->ne[0], ub_exp, true), ids_pp));
+                    }
+                } else {
+                    add_timed_op(gctx.get(), g.decode, ggml_mul_mat(gctx.get(), w, input(w->ne[0], 1, false)));
+                    if (rep == 0) {
+                        add_timed_op(gctx.get(), g.prefill, ggml_mul_mat(gctx.get(), w, input(w->ne[0], ub, false)));
+                    }
+                }
+            }
+            if (l.gdn_state > 0) {
+                const auto & d = gdn[li];
+                add_timed_op(gctx.get(), g.decode, ggml_ssm_conv(gctx.get(), d.sx[0], d.c));
+                add_timed_op(gctx.get(), g.decode, ggml_gated_delta_net(gctx.get(), d.q[0], d.k[0], d.v[0], d.g[0], d.b[0], d.s, 1));
+                if (rep == 0) {
+                    add_timed_op(gctx.get(), g.prefill, ggml_ssm_conv(gctx.get(), d.sx[1], d.c));
+                    add_timed_op(gctx.get(), g.prefill, ggml_gated_delta_net(gctx.get(), d.q[1], d.k[1], d.v[1], d.g[1], d.b[1], d.s, 1));
+                }
+            }
+            if (l.n_head > 0 && layer_attn_ok) {
+                const auto & a = attn[li];
+                const float scale = 1.0f / std::sqrt((float) l.head_dim_k);
+                ggml_tensor * fa_tg = ggml_flash_attn_ext(gctx.get(), a.q_tg, a.k_tg, a.v_tg, nullptr, scale, 0.0f, 0.0f);
+                if (rep == 0) {
+                    ggml_tensor * fa_pp = ggml_flash_attn_ext(gctx.get(), a.q_pp, a.k_pp, a.v_pp, nullptr, scale, 0.0f, 0.0f);
+                    layer_attn_ok = ggml_backend_supports_op(backend.get(), fa_tg) && ggml_backend_supports_op(backend.get(), fa_pp);
+                    if (layer_attn_ok) {
+                        add_timed_op(gctx.get(), g.decode,  fa_tg);
+                        add_timed_op(gctx.get(), g.prefill, fa_pp);
+                    }
+                } else {
+                    add_timed_op(gctx.get(), g.decode, fa_tg);
+                }
             }
         }
-        if (l.gdn_state > 0) {
-            const auto & d = gdn[li];
-            ggml_cgraph * gfs[2] = { g.decode, g.prefill };
-            for (int j = 0; j < 2; j++) {
-                add_timed_op(gctx.get(), gfs[j], ggml_ssm_conv(gctx.get(), d.sx[j], d.c));
-                add_timed_op(gctx.get(), gfs[j], ggml_gated_delta_net(gctx.get(), d.q[j], d.k[j], d.v[j], d.g[j], d.b[j], d.s, 1));
-            }
-        }
-        if (l.n_head > 0) {
-            const auto & a = attn[li];
-            const float scale = 1.0f / std::sqrt((float) l.head_dim_k);
-            ggml_tensor * fa_tg = ggml_flash_attn_ext(gctx.get(), a.q_tg, a.k_tg, a.v_tg, nullptr, scale, 0.0f, 0.0f);
-            ggml_tensor * fa_pp = ggml_flash_attn_ext(gctx.get(), a.q_pp, a.k_pp, a.v_pp, nullptr, scale, 0.0f, 0.0f);
-            if (ggml_backend_supports_op(backend.get(), fa_tg) && ggml_backend_supports_op(backend.get(), fa_pp)) {
-                add_timed_op(gctx.get(), g.decode,  fa_tg);
-                add_timed_op(gctx.get(), g.prefill, fa_pp);
-            } else {
-                attn_ok = false;
-            }
-        }
+        attn_ok = attn_ok && layer_attn_ok;
         for (ggml_cgraph * gf : { g.decode, g.prefill, g.prefill_exp }) {
             if (gf == nullptr) {
                 continue;
@@ -618,13 +662,15 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
 
     // every graph gets its own allocation of the op outputs; they are timed one after another
     // kind: 0 decode, 1 prefill, 2 prefill of the experts
-    struct timed { ggml_cgraph * gf; ggml_gallocr_t alloc; double best; double share; int kind; double byte_scale = 1.0; };
+    struct timed { ggml_cgraph * gf; ggml_gallocr_t alloc; double best; double share; int kind; double byte_scale = 1.0; int n_rep = 1; };
     std::vector<timed> all;
-    for (auto & g : graphs) {
+    for (size_t li = 0; li < graphs.size(); li++) {
+        auto & g = graphs[li];
         int kind = 0;
         for (ggml_cgraph * gf : { g.decode, g.prefill, g.prefill_exp }) {
             if (gf != nullptr && ggml_graph_n_nodes(gf) > 0) {
-                all.push_back({ gf, nullptr, std::numeric_limits<double>::infinity(), g.share, kind, g.byte_scale });
+                const int rep = kind == 0 ? n_rep[li] : 1; // only decode graphs are repeated, see n_rep above
+                all.push_back({ gf, nullptr, std::numeric_limits<double>::infinity(), g.share, kind, g.byte_scale, rep });
             }
             kind++;
         }
@@ -723,7 +769,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
     double t_op_tg   = 0.0;
     double t_op_pp   = 0.0;
     for (auto & t : all) {
-        t.best = std::max(t.best - t_sync, 0.1 * t.best);
+        // decode graphs ran n_rep copies of the layer's ops back to back (see n_rep above); the fixed
+        // per-call sync cost is paid once for the whole call, so it comes off before dividing back down
+        t.best = std::max(t.best - t_sync, 0.1 * t.best) / t.n_rep;
         switch (t.kind) {
             case 3: out.s_output_byte = t.best / (double) ggml_nbytes(out_w); break;
             case 4: t_op_tg = t.best / n_chain; break;
@@ -733,19 +781,14 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
             case 2: t_prefill += t.share * t.best * t.byte_scale / exp_scale; break;
         }
     }
-    // the layer's other ops: its real node count minus the ops timed above (their helper copies excluded)
+    // the layer's other ops: its real node count minus the ops timed above. Computed from n1_decode/
+    // n1_prefill/n1_prefill_exp (the single-pass op counts) rather than by counting the (now repeated)
+    // decode graphs' nodes directly.
     double timed_tg = 0.0;
     double timed_pp = 0.0;
-    for (const auto & t : all) {
-        if (t.kind < 0 || t.kind > 2) {
-            continue;
-        }
-        int n = 0;
-        for (int i = 0; i < ggml_graph_n_nodes(t.gf); i++) {
-            const ggml_op op = ggml_graph_node(t.gf, i)->op;
-            n += op != GGML_OP_VIEW && op != GGML_OP_CONT;
-        }
-        (t.kind == 0 ? timed_tg : timed_pp) += t.share * n;
+    for (size_t li = 0; li < m.layers.size(); li++) {
+        timed_tg += m.layers[li].share * n1_decode[li];
+        timed_pp += m.layers[li].share * (n1_prefill[li] + n1_prefill_exp[li]);
     }
     if (m.nodes_tg_layer > 0.0) {
         t_decode  += std::max(0.0, m.nodes_tg_layer - timed_tg) * t_op_tg;
