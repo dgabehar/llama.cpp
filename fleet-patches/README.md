@@ -141,6 +141,9 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0124 | `3a61a3dfd` | fleet: regenerate patch mirror for the -fit abort and server test fixes |
 | 0125 | `ae3897657` | common: size -fit's auto-context probe from measured free memory, not just a caught exception |
 | 0126 | `ccc60e62a` | common: close the n_seq_max == 1 gap in --fit's auto-context probe, cap iGPU free memory consistently |
+| 0127 | `50ecce74e` | fleet: regenerate patch mirror for the -fit UMA free-memory clamp |
+| 0128 | `dd5756d58` | common : split-balance: calibrate a layer's decode ops long enough to pay the real per-submit cost |
+| 0129 | `d7e7f3668` | ggml-rpc: give the RPC client a bounded receive timeout and keepalive |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
