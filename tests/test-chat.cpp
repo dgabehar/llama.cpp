@@ -6660,6 +6660,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_thoughts)
             .run();
 
+        // gpt-oss-20b at long context writes the analysis header as "commentary (analysis)"
+        tst.test(
+               "<|channel|>commentary (analysis)<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, "
+               "world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
         // Analysis channel (reasoning) with final channel (content) with reasoning_format = none
         tst.test(
                "<|channel|>analysis<|message|>I'm\nthinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's "
