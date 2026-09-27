@@ -548,6 +548,16 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
+- **gpt-oss-20b writes `<|channel|>commentary (analysis)<|message|>`** (2026-09-26):
+  at long context (44K-token agent prompts) the model sometimes writes the
+  analysis header with a stray "commentary" and "(analysis)". The strict
+  gpt-oss PEG parser rejected the whole reply, so llama-server returned an
+  error ("unparsed peg-native output") and LiteLLM retried in a loop.
+  `common/parsers/gpt-oss.cpp` now accepts that exact header as reasoning.
+  Seen on gpt-oss-20b via `gpt-oss-20b-split`: 5 of 6 logged failures; the
+  sixth was `<|channel|>commentary**commentary**<|end|>`, not handled.
+  `test-chat` has the real output as a case.
+
 - **Views over transposed tensors** (2026-09-24, `41b2ad40d`): `ggml_view_*`
   always gives dim 0 the element stride, so slicing a transposed tensor
   along dim 0 with more than one element reads the wrong memory. The

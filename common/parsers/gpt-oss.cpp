@@ -77,7 +77,9 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
 
         // Occasionally, gpt-oss-20b will prefix channels with this commentary
         auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + p.optional(p.literal(" to=assistant")));
-        auto start_analysis = stray_commentary + p.literal("<|channel|>analysis<|message|>");
+        // gpt-oss-20b also writes the analysis header as "commentary (analysis)" at long context
+        auto start_analysis = (stray_commentary + p.literal("<|channel|>analysis<|message|>")) |
+                              p.literal("<|channel|>commentary (analysis)<|message|>");
 
         if (extract_reasoning) {
             p.rule("analysis", start_analysis + p.reasoning(content) + end);
