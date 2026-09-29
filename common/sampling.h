@@ -44,6 +44,9 @@ struct common_sampler * common_sampler_init(
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
+// the empty-reply guard sampler (see sampling.cpp); a common_sampler owns one when params.no_empty_reply is set
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert);
+
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);

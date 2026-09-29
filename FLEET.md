@@ -651,6 +651,35 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   500 "does not match the expected peg-native format" -- schema strictness, not
   a K2 issue.
 
+- **K2-Horizon-7B: Kimi-style tool-call opener, then EOG** (2026-09-28, branch
+  `k2-kimi-opener`). Live incident (opencode via LiteLLM, ctx ~28K, effort
+  low, 3 stalls in ~1 minute): a reasoning part that is exactly
+  `\n<|tool_calls_section_begin|><|tool_call_begin|>`, then EOG (output 0,
+  reasoning 15, finish=stop). Those markers are NOT vocab tokens of the GGUF
+  (they are plain pieces; `<ifm|tool_calls>` is the model's own format), so
+  they cannot be banned by id, and the empty-reply guard already treated them
+  as "real output" and let EOG through. Fix: the same guard
+  (`common_empty_reply_guard`) keeps a 27-char rolling tail of the generated
+  text and masks EOG while inside an unfinished Kimi opener
+  (`<|tool_calls_section_begin|>` until `<|tool_calls_section_end|>`, or a bare
+  `<|tool_call_begin|>` until `<|tool_call_end|>`); still never masks the last
+  candidate, still cloned with the sampler. Reproduction: NOT reproduced
+  naturally in ~220 opencode-shaped runs (session-replay of the stalled turns,
+  padded 0-50K ctx, stream + non-stream, effort low, temp 0.6-1.0: 0 Kimi
+  openers, so the trigger needs the real opencode system prompt/tool schemas we
+  do not have). Reproduced by forcing the opener into the prompt of the
+  stalled turn (`/completion`, 40 samples, temp 0.8): 23/40 EOG immediately
+  (the incident), 7/40 a native `<ifm|tool_calls>` call, 4/40 a Kimi call only,
+  6/40 other. With the guard state seeded as "inside the opener": 0/40 EOG,
+  25/40 native call, 14/40 a Kimi-form call as reasoning text (no parseable
+  tool call: still a stall), 1/40 other; with EOG banned outright 38/40 native
+  call. Residual: the guard releases at `<|tool_calls_section_end|>`, and the
+  model's Kimi calls vary (`functions.bash:3<|tool_call_argument_begin|>{json}`,
+  `<|sep|>`, missing `functions.` prefix), so parsing that form is not a single
+  grammar; recommendation is to keep EOG masked until the native
+  `</ifm|tool_calls>` (38/40 above) rather than to write a Kimi parser. Tests:
+  `tests/test-empty-reply-guard.cpp` (vocab-only, real incident text).
+
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
