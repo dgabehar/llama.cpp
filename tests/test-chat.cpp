@@ -7457,6 +7457,74 @@ static void test_developer_role_to_system_workaround() {
     }
 }
 
+// K2-Horizon history reasoning: rendered with the generation tag, foreign markup stripped, empty turns dropped.
+// The junk is real replayed reasoning (opencode session ses_f16214d2affecU4s4Zjhfkh9hS, 2026-09-29).
+static void test_k2_history_reasoning() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
+
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "check the version";
+    common_chat_msg junk_call;
+    junk_call.role = "assistant";
+    junk_call.reasoning_content = "\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n<|tool_calls_section_begin|><|tool_call_begin|>";
+    junk_call.tool_calls.push_back({ "bash", R"({"command":"ls"})", "call1" });
+    common_chat_msg result;
+    result.role = "tool";
+    result.content = "a.txt";
+    result.tool_call_id = "call1";
+    common_chat_msg empty_turn;                 // a stalled turn: nothing at all
+    empty_turn.role = "assistant";
+    empty_turn.reasoning_content = "\n<|close|>";
+    common_chat_msg partial;                    // a truncated marker
+    partial.role = "assistant";
+    partial.reasoning_content = "\n<|tool_call_begin\n";
+    partial.content = "Done.";
+    common_chat_msg real;
+    real.role = "assistant";
+    real.reasoning_content = "Check the file.";
+    real.content = "Looks fine.";
+
+    common_chat_tool bash{ "bash", "Executes a bash command",
+                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+    for (const char * effort : { "low", "medium" }) {
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user, junk_call, result, empty_turn, partial, real, user };
+        inputs.tools                 = { bash };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+        const std::string tag = std::string("ifm|think_") + (std::string(effort) == "low" ? "faster" : "fast");
+        const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        assert_contains(prompt, "<" + tag + ">\nCheck the file.\n</" + tag + ">\nLooks fine.");
+        if (prompt.find("<ifm|think>") != std::string::npos || prompt.find("</ifm|think>") != std::string::npos) {
+            throw std::runtime_error("K2 history still rendered with the high-effort tag at effort " + std::string(effort));
+        }
+        for (const char * bad : { "<|tool_call", "<|close" }) {
+            if (prompt.find(bad) != std::string::npos) {
+                throw std::runtime_error(std::string("K2 history kept foreign markup ") + bad);
+            }
+        }
+        // the emptied stalled turn is gone: 3 assistant turns from the history + the generation prompt
+        size_t n = 0;
+        for (size_t p = prompt.find("<|ifm|im_start|>assistant"); p != std::string::npos; p = prompt.find("<|ifm|im_start|>assistant", p + 1)) {
+            n++;
+        }
+        if (n != 4) {
+            throw std::runtime_error("K2 history: expected 4 assistant turns, got " + std::to_string(n));
+        }
+    }
+    // high effort: history tag and generation tag are both ifm|think, nothing is rewritten
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user, real, user };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
+        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file.\n</ifm|think>\nLooks fine.");
+    }
+    LOG_ERR("%s passed\n", __func__);
+}
+
 // Verify reasoning-trace retention rules in the DeepSeek-V4 template:
 // all traces are retained unless drop_thinking is true AND the conversation
 // has no tool calls, in which case only the last (after-final-user) trace is
@@ -7869,6 +7937,7 @@ int main(int argc, char ** argv) {
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
+        test_k2_history_reasoning();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
