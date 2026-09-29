@@ -689,6 +689,15 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   hold-until-native-close 34-35/40 complete native call, 5/40 (500-token
   window) Kimi loops; with the balanced-tags hold and 2600 tokens: 36/40
   complete native call, 4/40 Kimi loops/garbage that ran to the cap, 0/40 EOG.
+  Follow-up (2026-09-29, live): with the hold, the fleet turned the silent stall
+  into a ~1500-token loop of the opener (`ses_f16214d2...`), so the Kimi hold now
+  has its own cap `k_kimi_hold_cap` = 192 tokens (117 complete Kimi calls in the
+  harness: median 42, longest 115; native switch after the opener p90 118, max
+  255) and a REPEATED unfinished opener releases EOG at once (real loop text is
+  a test fixture). Release only permits EOG: forced Kimi-garbage samples that
+  never choose EOG still run to the client limit (5/40 ran to 2600 tokens in the
+  forced harness, same as before), so this is a safety net, not the fix; the
+  root-cause work is why the model leaves the native format at all.
   Residual: those ~10% never switch to the native format, run to the cap and
   then end the turn; parsing the Kimi form (which varies: `<|sep|>`, missing
   `functions.` prefix) would be the next step. Inner-tag balance in the

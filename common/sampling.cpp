@@ -127,6 +127,11 @@ struct ring_buffer {
 // (EOG allowed), it never truncates a call.
 static const int k_hold_cap = 2048;
 
+// A Kimi-form call is short (harness, 117 complete Kimi calls: median 42, longest 115 tokens; native switch after the opener: p90 118, max 255 tokens) and the model
+// either rewrites it natively soon or is looping (live 2026-09-29: ~1500 tokens of the opener repeated), so the
+// Kimi hold gets its own small cap, and a repeated unfinished opener releases it at once.
+static const int k_kimi_hold_cap = 192;
+
 struct common_empty_reply_guard {
     const llama_vocab *      vocab;
     std::vector<llama_token> eog;
@@ -139,7 +144,10 @@ struct common_empty_reply_guard {
     std::string              tail;
     bool                     in_section = false;
     bool                     in_call    = false;
-    bool                     held       = false;  // armed: an opener was seen, the call was not completed
+    bool                     held       = false;  // armed: a native opener was seen, the call was not completed
+    bool                     kimi_held  = false;  // a Kimi opener was seen (not looping): hold, capped by k_kimi_hold_cap
+    bool                     kimi_loop  = false;  // the Kimi opener repeated unfinished: no more Kimi hold
+    int                      n_kimi     = 0;      // generated tokens since the Kimi hold started
     int                      n_held     = 0;      // generated tokens since the hold started
     bool                     n_open     = false;  // the native section opener itself was seen during this hold
     bool                     n_closed   = false;  // ... and its close
@@ -151,8 +159,8 @@ static const char * const k_kimi_markers[] = {
 };
 
 static void common_empty_reply_guard_release(common_empty_reply_guard * ctx) {
-    ctx->held = ctx->n_open = ctx->n_closed = false;
-    ctx->n_held = 0;
+    ctx->held = ctx->n_open = ctx->n_closed = ctx->kimi_held = ctx->kimi_loop = false;
+    ctx->n_held = ctx->n_kimi = 0;
     ctx->depth.assign(ctx->depth.size(), 0);
 }
 
@@ -179,10 +187,23 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
             break;
         }
         switch (which) {
-            case 0: ctx->in_section = true;  if (armed) { ctx->held = true; } break;
-            case 1: ctx->in_section = false; ctx->in_call = false; break;
-            case 2: ctx->in_call    = true;  if (armed) { ctx->held = true; } break;
-            case 3: ctx->in_call    = false; break;
+            case 0:
+            case 2: {
+                // the opener again while the first is unfinished: the model is looping, let it end
+                const bool repeat = which == 0 ? ctx->in_section : ctx->in_call;
+                (which == 0 ? ctx->in_section : ctx->in_call) = true;
+                if (repeat) {
+                    ctx->kimi_held = false;
+                    ctx->kimi_loop = true;
+                    LOG_DBG("%s: empty-reply guard: Kimi opener repeated, releasing EOG\n", __func__);
+                } else if (!ctx->kimi_loop && !ctx->kimi_held && !ctx->n_open) {
+                    ctx->kimi_held = true;
+                    ctx->n_kimi    = 0;
+                }
+                break;
+            }
+            case 1: ctx->in_section = false; ctx->in_call = false; if (!armed) { ctx->kimi_held = false; } break;
+            case 3: ctx->in_call    = false; if (!armed && !ctx->in_section) { ctx->kimi_held = false; } break;
             default: {
                 const int  pair = (which - 4) / 2;
                 const bool open = (which - 4) % 2 == 0;
@@ -192,6 +213,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
                     }
                     ctx->held = ctx->n_open = true;
                     ctx->n_closed = false;
+                    ctx->kimi_held = ctx->kimi_loop = false; // the model switched to its own format
                 } else if (pair == 0) {
                     // a close without its opener (seen live after a Kimi opener) closes nothing
                     ctx->n_closed = ctx->n_open;
@@ -218,10 +240,7 @@ static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx)
     if (!ctx->seen_output) {
         return true;
     }
-    if (!ctx->hold.empty()) {
-        return ctx->held && ctx->n_held < k_hold_cap;
-    }
-    return ctx->in_section || ctx->in_call;
+    return (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
 }
 
 static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
@@ -239,6 +258,9 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
     // the native markers are special tokens, which only render with special=true
     ctx->tail += ctx->hold.empty() ? piece : common_token_to_piece(ctx->vocab, token, true);
+    if (ctx->kimi_held && ++ctx->n_kimi == k_kimi_hold_cap) {
+        LOG_DBG("%s: empty-reply guard: %d tokens after a Kimi opener, releasing EOG\n", __func__, k_kimi_hold_cap);
+    }
     if (ctx->held && ++ctx->n_held == k_hold_cap) {
         LOG_DBG("%s: empty-reply guard: %d tokens inside an open tool call, releasing EOG\n", __func__, k_hold_cap);
     }
