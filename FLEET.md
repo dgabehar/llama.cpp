@@ -658,26 +658,42 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   reasoning 15, finish=stop). Those markers are NOT vocab tokens of the GGUF
   (they are plain pieces; `<ifm|tool_calls>` is the model's own format), so
   they cannot be banned by id, and the empty-reply guard already treated them
-  as "real output" and let EOG through. Fix: the same guard
-  (`common_empty_reply_guard`) keeps a 27-char rolling tail of the generated
-  text and masks EOG while inside an unfinished Kimi opener
-  (`<|tool_calls_section_begin|>` until `<|tool_calls_section_end|>`, or a bare
-  `<|tool_call_begin|>` until `<|tool_call_end|>`); still never masks the last
-  candidate, still cloned with the sampler. Reproduction: NOT reproduced
-  naturally in ~220 opencode-shaped runs (session-replay of the stalled turns,
-  padded 0-50K ctx, stream + non-stream, effort low, temp 0.6-1.0: 0 Kimi
-  openers, so the trigger needs the real opencode system prompt/tool schemas we
-  do not have). Reproduced by forcing the opener into the prompt of the
-  stalled turn (`/completion`, 40 samples, temp 0.8): 23/40 EOG immediately
-  (the incident), 7/40 a native `<ifm|tool_calls>` call, 4/40 a Kimi call only,
-  6/40 other. With the guard state seeded as "inside the opener": 0/40 EOG,
-  25/40 native call, 14/40 a Kimi-form call as reasoning text (no parseable
-  tool call: still a stall), 1/40 other; with EOG banned outright 38/40 native
-  call. Residual: the guard releases at `<|tool_calls_section_end|>`, and the
-  model's Kimi calls vary (`functions.bash:3<|tool_call_argument_begin|>{json}`,
-  `<|sep|>`, missing `functions.` prefix), so parsing that form is not a single
-  grammar; recommendation is to keep EOG masked until the native
-  `</ifm|tool_calls>` (38/40 above) rather than to write a Kimi parser. Tests:
+  as "real output" and let EOG through. Fix, part 1: the same guard
+  (`common_empty_reply_guard`) keeps a rolling tail of the generated text and
+  masks EOG inside an unfinished Kimi opener (`<|tool_calls_section_begin|>`
+  until `<|tool_calls_section_end|>`, or a bare `<|tool_call_begin|>` until
+  `<|tool_call_end|>`). Part 2 (Doug, 2026-09-29; request field
+  `no_empty_reply_hold`, set by the chat handling only when the request offers
+  tools): from a native `<ifm|tool_calls>` or a Kimi opener, EOG stays masked
+  until the native section is closed AND every inner tag pair is balanced
+  (`tool_call`, `arg_key`, `arg_type`, `arg_value`; the json call format only
+  uses `tool_call`), because after a Kimi opener the model usually rewrites
+  the call in its own format, which the parser understands. A close without
+  its opener closes nothing. Hard cap `k_hold_cap` = 2048 generated tokens in
+  an open section (real opencode tool-call arguments: p50 157 / p95 1635 /
+  p99 3500 chars, ~1200 tokens at p99, x2), then EOG is released again and a
+  debug line is logged; the cap only restores the old behaviour, it never
+  truncates. Still out of the sampler chain, cloned/reset with the sampler,
+  never masks the last candidate. The tag list lives once, in the K2 block of
+  `common/chat-diff-analyzer.cpp` (this fork's parser is derived from the
+  template, so there is no separate constants file; the names match upstream
+  PR ggml-org/llama.cpp#29535's k2-horizon.cpp).
+  Reproduction: NOT reproduced naturally in ~220 opencode-shaped runs (replay
+  of the stalled turns, padded 0-50K ctx, stream + non-stream, effort low,
+  temp 0.6-1.0: 0 Kimi openers; the trigger probably needs opencode's real
+  system prompt/tool schemas). Reproduced by forcing the opener into the
+  stalled turn's prompt (`/completion`, 40 samples, temp 0.8): 23/40 EOG
+  immediately (the incident), 7/40 native call, 4/40 Kimi call only, 6/40
+  other. With the guard state seeded as "inside the opener": kimi-only guard
+  0/40 EOG but 14/40 Kimi-form call left as reasoning text (still a stall);
+  hold-until-native-close 34-35/40 complete native call, 5/40 (500-token
+  window) Kimi loops; with the balanced-tags hold and 2600 tokens: 36/40
+  complete native call, 4/40 Kimi loops/garbage that ran to the cap, 0/40 EOG.
+  Residual: those ~10% never switch to the native format, run to the cap and
+  then end the turn; parsing the Kimi form (which varies: `<|sep|>`, missing
+  `functions.` prefix) would be the next step. Inner-tag balance in the
+  harness: no unclosed inner tag in any complete native call; 2/40 native
+  calls emitted an EXTRA `</ifm|tool_calls>` (harmless). Tests:
   `tests/test-empty-reply-guard.cpp` (vocab-only, real incident text).
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on

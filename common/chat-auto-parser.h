@@ -406,6 +406,7 @@ struct autoparser {
     // Preserved tokens for tokenizer (union of all non-empty markers)
     std::vector<std::string> preserved_tokens;
     std::vector<std::string> no_empty_reply_inert; // see common_chat_params::no_empty_reply_inert
+    std::vector<std::string> no_empty_reply_hold;  // see common_chat_params::no_empty_reply_hold
     std::vector<std::string> additional_stops;  // literal stop strings (e.g. Laguna </assistant>) caught however tokenized
 
     autoparser() = default;

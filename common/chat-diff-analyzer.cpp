@@ -252,6 +252,15 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               // for a finished turn. The reply must hold something before an EOG token is allowed.
               analysis.no_empty_reply_inert = { "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|think>", "</ifm|think>",
                                                 "<ifm|think_fast>", "</ifm|think_fast>" };
+              // ... and it sometimes opens a Kimi-style call ("<|tool_calls_section_begin|>", not its own format)
+              // and ends the turn: with tools offered, hold EOG from an opener until the native close.
+              // Tag pairs: the section first, then the inner ones that must be balanced before the turn may
+              // end (xml, xml_typed and json call formats; the same tags the k2-horizon parser knows).
+              analysis.no_empty_reply_hold = { "<ifm|tool_calls>",  "</ifm|tool_calls>",
+                                               "<ifm|tool_call>",   "</ifm|tool_call>",
+                                               "<ifm|arg_key>",     "</ifm|arg_key>",
+                                               "<ifm|arg_type>",    "</ifm|arg_type>",
+                                               "<ifm|arg_value>",   "</ifm|arg_value>" };
               analysis.preserved_tokens.push_back("<ifm|think_faster>");
               analysis.preserved_tokens.push_back("</ifm|think_faster>");
               // Not the registered start/end pair (see comment above), but still real

@@ -103,6 +103,120 @@ int main(int argc, char ** argv) {
     CHECK(!std::isinf(d[0].logit));
     llama_sampler_free(g);
 
+    // ---- armed (tools offered): hold from a native or Kimi opener until the native close, capped
+    const std::vector<std::string> hold = { "<ifm|tool_calls>", "</ifm|tool_calls>" };
+    const int cap = 2048; // k_hold_cap in sampling.cpp
+
+    // no tools: the native markers mean nothing
+    g = common_sampler_init_empty_reply_guard(vocab, {}, {});
+    feed(g, vocab, "ok <ifm|tool_calls>\n<ifm|tool_call>bash");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+
+    // a native call: open holds, close releases; ordinary text never holds
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "Hello there.");
+    CHECK(eog_allowed(g));
+    feed(g, vocab, "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>");
+    CHECK(!eog_allowed(g));
+    llama_sampler * c2 = llama_sampler_clone(g);
+    feed(g, vocab, "\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n");
+    CHECK(!eog_allowed(g));                 // a call closed, the section is not
+    feed(g, vocab, "</ifm|tool_calls>");
+    CHECK(eog_allowed(g));
+    CHECK(!eog_allowed(c2));                // clone kept the hold, did not see the close
+    llama_sampler_reset(c2);
+    feed(c2, vocab, "x");
+    CHECK(eog_allowed(c2));                 // reset dropped it
+    llama_sampler_free(c2);
+    // re-arms on the next call
+    feed(g, vocab, "<ifm|tool_calls>");
+    CHECK(!eog_allowed(g));
+    llama_sampler_free(g);
+
+    // the incident: the Kimi opener (plus a whole Kimi call and its section end) holds until the NATIVE close
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "\n<|tool_calls_section_begin|><|tool_call_begin|>");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "functions.bash:0<|tool_call_argument_begin|>{\"command\":\"ls\"}<|tool_call_end|><|tool_calls_section_end|>");
+    CHECK(!eog_allowed(g));                 // the Kimi form is not a call the parser understands
+    feed(g, vocab, "</ifm|tool_calls>");    // a bare native close (seen live) closes nothing
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "<ifm|tool_calls>\n<ifm|tool_call>bash\n</ifm|tool_call>\n</ifm|tool_calls>");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+
+    // cap: a model that never closes is released after `cap` generated tokens
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "<ifm|tool_calls>");
+    for (int i = 0; i < cap - 1; ++i) {
+        llama_sampler_accept(g, g_other);
+    }
+    CHECK(!eog_allowed(g));
+    llama_sampler_accept(g, g_other);
+    CHECK(eog_allowed(g));
+    feed(g, vocab, "</ifm|tool_calls><ifm|tool_calls>"); // a later call holds again, with a fresh counter
+    CHECK(!eog_allowed(g));
+    llama_sampler_free(g);
+
+    // every tag that opens must close: the full native tag set (xml, xml_typed, json call formats)
+    const std::vector<std::string> full = {
+        "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>", "</ifm|tool_call>", "<ifm|arg_key>", "</ifm|arg_key>",
+        "<ifm|arg_type>", "</ifm|arg_type>", "<ifm|arg_value>", "</ifm|arg_value>" };
+    // section closed with an arg_value still open: keep holding, release when it balances
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "\n</ifm|tool_call>\n</ifm|tool_calls>");
+    CHECK(!eog_allowed(g));                 // section closed, arg_value still open
+    feed(g, vocab, "</ifm|arg_value>");
+    CHECK(eog_allowed(g));                  // balanced now
+    llama_sampler_free(g);
+    // a fully balanced xml_typed call releases at the section close, not before
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>a</ifm|arg_key>\n<ifm|arg_type>string</ifm|arg_type>\n"
+                   "<ifm|arg_value>x</ifm|arg_value>\n</ifm|tool_call>\n");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "</ifm|tool_calls>");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+    // an unclosed arg_type inside a closed section holds too
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "<ifm|tool_calls><ifm|tool_call>bash<ifm|arg_type>string</ifm|tool_call></ifm|tool_calls>");
+    CHECK(!eog_allowed(g));
+    llama_sampler_free(g);
+    // json format: <ifm|tool_call>{...}</ifm|tool_call>
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "<ifm|tool_calls>\n<ifm|tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "</ifm|tool_call>\n");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "</ifm|tool_calls>");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+    // a stray inner close never goes negative, inner tags outside a section are ignored
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "</ifm|arg_value><ifm|arg_value>x <ifm|tool_calls></ifm|tool_calls>");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+    // the cap releases an unbalanced call as well
+    g = common_sampler_init_empty_reply_guard(vocab, {}, full);
+    feed(g, vocab, "<ifm|tool_calls><ifm|tool_call>bash<ifm|arg_value>");
+    for (int i = 0; i < cap; ++i) {
+        llama_sampler_accept(g, g_other);
+    }
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+
+    // never mask the last candidate standing
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "<ifm|tool_calls>");
+    llama_token_data d2[1] = { { g_eog, 1.0f, 0.0f } };
+    llama_token_data_array p2 = { d2, 1, -1, false };
+    llama_sampler_apply(g, &p2);
+    CHECK(!std::isinf(d2[0].logit));
+    llama_sampler_free(g);
+
     llama_model_free(model);
     llama_backend_free();
     if (n_fail) {
