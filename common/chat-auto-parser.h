@@ -189,6 +189,18 @@ struct tool_format_analysis {
     std::string              id_field;
     std::string              gen_id_field;
     std::vector<std::string> parameter_order;
+
+    // K2-Horizon quirks (the official weights do not always emit the exact template shape):
+    // - the section opener/closer is optional: a bare per-call block is a tool call too
+    // - several calls in one turn are parsed whatever parallel_tool_calls says (throwing on them loses the turn)
+    // - a per-call block may be closed by the section end / the next call instead of its own end tag
+    bool section_optional = false;
+    bool always_parallel  = false;
+    // a complete call in the Kimi form (`<|tool_call_begin|>name<|sep|>{json}<|tool_call_end|>`, the section
+    // wrapper optional) is surfaced as a tool call too, also when the model emitted it inside its reasoning
+    bool kimi_fallback = false;
+    // whatever follows the last call (a stray close tag, EOG text) is dropped instead of failing the parse
+    bool drop_tail = false;
 };
 
 struct tool_function_analysis {
@@ -230,6 +242,10 @@ struct parser_build_context {
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
+    // Kimi-form call fallback (see tool_format_analysis::kimi_fallback); unset when not applicable to this request
+    std::optional<common_peg_parser>  kimi_calls;
+    std::optional<common_peg_parser>  kimi_first;  // just the first call, up to its end tag (what ends reasoning)
+    std::vector<std::string>          kimi_openers;
 
     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
 };
@@ -329,6 +345,9 @@ struct analyze_tools : analyze_base {
                   const analyze_reasoning &    reasoning);
 
     common_peg_parser build_parser(parser_build_context & ctx) const override;
+
+    // Kimi-form calls (see tool_format_analysis::kimi_fallback) for the tools of this request
+    common_peg_parser build_kimi_calls(parser_build_context & ctx) const;
 
   private:
     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format

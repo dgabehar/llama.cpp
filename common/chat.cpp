@@ -1543,6 +1543,19 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             return msg;
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+        if (src_parser.has_rule("lenient-fallback")) {
+            // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
+            common_chat_msg msg;
+            msg.role = "assistant";
+            common_peg_parse_context fctx(effective_input, flags);
+            auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
+            if (!fres.fail()) {
+                common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
+            } else {
+                msg.content = input;
+            }
+            return msg;
+        }
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
     }
