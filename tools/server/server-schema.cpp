@@ -522,6 +522,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("no_empty_reply_hold"))
+        ->set_desc("Tool-call tag pairs { section open, close, inner open, close, ... }: with tools offered, end-of-generation tokens are masked from an opener (or a Kimi-style opener) until the section is closed and the inner tags are balanced, capped at a few thousand tokens. Set by the chat template handling for models that open a tool call and then end the turn")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.no_empty_reply_hold.clear();
+            const auto & pair = data.at("no_empty_reply_hold");
+            if (pair.is_array() && pair.size() >= 2 && pair.size() % 2 == 0) {
+                std::vector<std::string> tags;
+                for (const auto & t : pair) {
+                    if (!t.is_string() || t.get<std::string>().empty()) {
+                        tags.clear();
+                        break;
+                    }
+                    tags.push_back(t.get<std::string>());
+                }
+                ctx.params.sampling.no_empty_reply_hold = tags;
+            }
+        }));
+
     add((new field_json("stop_after_reasoning"))
         ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

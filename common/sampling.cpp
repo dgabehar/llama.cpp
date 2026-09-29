@@ -111,34 +111,66 @@ struct ring_buffer {
 
 
 // Empty-reply guard: masks the EOG tokens until the reply holds something besides whitespace and the
-// `inert` tokens (reasoning tags), and again while the text is inside an unfinished Kimi-K2-style tool-call
-// opener (`<|tool_calls_section_begin|>` / `<|tool_call_begin|>` ... its end marker). K2-Horizon spells those
-// with ordinary pieces (they are not vocab tokens) and sometimes stops right after the opener, which the client
-// takes for a finished turn. It sits beside the grammar and the reasoning budget, not in the chain:
+// `inert` tokens (reasoning tags). K2-Horizon spells a Kimi-K2-style tool-call opener
+// (`<|tool_calls_section_begin|>` / `<|tool_call_begin|>`) with ordinary pieces (they are not vocab tokens)
+// and sometimes stops right after it, which the client takes for a finished turn, so EOG stays masked inside an
+// unfinished Kimi section/call too. When the request offers tools, `hold` (tag pairs: the native section
+// open/close, then the inner call/arg pairs) arms a stronger rule: from the moment either the native opener or a
+// Kimi opener is seen, EOG is masked until the native section closed and every inner tag is balanced (after a
+// Kimi opener the model then usually rewrites the call in its own format, which the parser understands), with
+// a hard cap of k_hold_cap generated tokens so a model that never closes cannot run
+// to max_tokens. It sits beside the grammar and the reasoning budget, not in the chain:
 // it must only see generated tokens (the chain also accepts the prompt), and it is cloned/copied with the
 // sampler, so speculative-decoding rollbacks restore its state too.
+//
+// k_hold_cap: real opencode tool-call arguments (9.6k calls, the k2-evidence session DB) have p50 157 / p95 1635 /
+// p99 3500 characters, about 1200 tokens at p99; twice that. Tripping the cap only restores the old behaviour
+// (EOG allowed), it never truncates a call.
+static const int k_hold_cap = 2048;
+
 struct common_empty_reply_guard {
     const llama_vocab *      vocab;
     std::vector<llama_token> eog;
     std::vector<llama_token> inert;
+    // tag pairs { section open, section close, then inner open/close pairs (call, arg key, arg value, ...) };
+    // empty = not armed
+    std::vector<std::string> hold;
     bool                     seen_output = false;
-    // unconsumed tail of the generated text (a marker may span pieces) and the Kimi opener state
+    // unconsumed tail of the generated text (a marker may span pieces) and the opener state
     std::string              tail;
     bool                     in_section = false;
     bool                     in_call    = false;
+    bool                     held       = false;  // armed: an opener was seen, the call was not completed
+    int                      n_held     = 0;      // generated tokens since the hold started
+    bool                     n_open     = false;  // the native section opener itself was seen during this hold
+    bool                     n_closed   = false;  // ... and its close
+    std::vector<int>         depth;               // open inner tags per inner pair (only counted inside a section)
 };
 
 static const char * const k_kimi_markers[] = {
     "<|tool_calls_section_begin|>", "<|tool_calls_section_end|>", "<|tool_call_begin|>", "<|tool_call_end|>",
 };
 
-// consume the Kimi tool-call markers found in `tail`, keeping only what may still be the start of one
+static void common_empty_reply_guard_release(common_empty_reply_guard * ctx) {
+    ctx->held = ctx->n_open = ctx->n_closed = false;
+    ctx->n_held = 0;
+    ctx->depth.assign(ctx->depth.size(), 0);
+}
+
+// consume the tool-call markers found in `tail`, keeping only what may still be the start of one
 static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
+    std::vector<std::string> markers(k_kimi_markers, k_kimi_markers + 4);
+    markers.insert(markers.end(), ctx->hold.begin(), ctx->hold.end()); // 4 + 2i: open, 5 + 2i: close of pair i
+    const bool armed = !ctx->hold.empty();
+    size_t keep = 0;
+    for (const auto & m : markers) {
+        keep = std::max(keep, m.size() - 1);
+    }
     for (;;) {
         size_t best  = std::string::npos;
         int    which = -1;
-        for (int i = 0; i < 4; ++i) {
-            const size_t pos = ctx->tail.find(k_kimi_markers[i]);
+        for (int i = 0; i < (int) markers.size(); ++i) {
+            const size_t pos = ctx->tail.find(markers[i]);
             if (pos != std::string::npos && pos < best) {
                 best  = pos;
                 which = i;
@@ -148,17 +180,49 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
             break;
         }
         switch (which) {
-            case 0: ctx->in_section = true;  break;
+            case 0: ctx->in_section = true;  if (armed) { ctx->held = true; } break;
             case 1: ctx->in_section = false; ctx->in_call = false; break;
-            case 2: ctx->in_call    = true;  break;
+            case 2: ctx->in_call    = true;  if (armed) { ctx->held = true; } break;
             case 3: ctx->in_call    = false; break;
+            default: {
+                const int  pair = (which - 4) / 2;
+                const bool open = (which - 4) % 2 == 0;
+                if (pair == 0 && open) {
+                    if (!ctx->n_open) {
+                        ctx->n_held = 0;
+                    }
+                    ctx->held = ctx->n_open = true;
+                    ctx->n_closed = false;
+                } else if (pair == 0) {
+                    // a close without its opener (seen live after a Kimi opener) closes nothing
+                    ctx->n_closed = ctx->n_open;
+                } else if (ctx->n_open) {
+                    int & d = ctx->depth[pair - 1];
+                    d = open ? d + 1 : std::max(0, d - 1);
+                }
+                // released once the section is closed and every inner tag is balanced
+                if (ctx->n_open && ctx->n_closed &&
+                    std::all_of(ctx->depth.begin(), ctx->depth.end(), [](int d) { return d == 0; })) {
+                    common_empty_reply_guard_release(ctx);
+                }
+            }
         }
-        ctx->tail.erase(0, best + strlen(k_kimi_markers[which]));
+        ctx->tail.erase(0, best + markers[which].size());
     }
-    const size_t keep = 27; // longest marker minus one
     if (ctx->tail.size() > keep) {
         ctx->tail.erase(0, ctx->tail.size() - keep);
     }
+}
+
+// true while EOG must stay masked (before the caller's "last candidate" check)
+static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx) {
+    if (!ctx->seen_output) {
+        return true;
+    }
+    if (!ctx->hold.empty()) {
+        return ctx->held && ctx->n_held < k_hold_cap;
+    }
+    return ctx->in_section || ctx->in_call;
 }
 
 static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
@@ -174,7 +238,11 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
         return;
     }
     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
-    ctx->tail += piece;
+    // the native markers are special tokens, which only render with special=true
+    ctx->tail += ctx->hold.empty() ? piece : common_token_to_piece(ctx->vocab, token, true);
+    if (ctx->held && ++ctx->n_held == k_hold_cap) {
+        LOG_DBG("%s: empty-reply guard: %d tokens inside an open tool call, releasing EOG\n", __func__, k_hold_cap);
+    }
     common_empty_reply_guard_scan(ctx);
     if (ctx->seen_output) {
         return;
@@ -189,7 +257,7 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
 
 static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
-    if (ctx->seen_output && !ctx->in_section && !ctx->in_call) {
+    if (!common_empty_reply_guard_holds(ctx)) {
         return;
     }
     // never mask the last candidate standing
@@ -215,6 +283,7 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
     ctx->seen_output = false;
     ctx->tail.clear();
     ctx->in_section = ctx->in_call = false;
+    common_empty_reply_guard_release(ctx);
 }
 
 static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl);
@@ -243,8 +312,9 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
 }
 
-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert) {
-    auto * ctx = new common_empty_reply_guard { vocab, {}, inert };
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
+    auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+    ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     for (llama_token id = 0; id < n_vocab; ++id) {
         if (llama_vocab_is_eog(vocab, id)) {
@@ -489,7 +559,7 @@ struct common_sampler * common_sampler_init(
     }
 
     if (params.no_empty_reply) {
-        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert);
+        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold);
     }
 
     if (params.mirostat == 0) {
