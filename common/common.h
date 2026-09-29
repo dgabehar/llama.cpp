@@ -299,6 +299,9 @@ struct common_params_sampling {
     // empty stop the client takes for a finished turn): `no_empty_reply_inert` are their reasoning tags.
     bool                      no_empty_reply = false;
     std::vector<llama_token>  no_empty_reply_inert;
+    // native tool-call tag pairs (tools offered), see common_chat_params::no_empty_reply_hold: EOG is also masked
+    // from an opener until the section is closed and its inner tags are balanced, capped
+    std::vector<std::string>  no_empty_reply_hold;
 
     bool backend_sampling = false;
 

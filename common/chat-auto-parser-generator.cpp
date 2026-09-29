@@ -54,6 +54,9 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
 
     if (inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && !autoparser.no_empty_reply_inert.empty()) {
         data.no_empty_reply_inert = autoparser.no_empty_reply_inert;
+        if (inputs.tools.is_array() && !inputs.tools.empty()) {
+            data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
+        }
     }
 
     std::string parser_generation_prompt = data.generation_prompt;
