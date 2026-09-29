@@ -152,6 +152,9 @@ struct common_empty_reply_guard {
     bool                     n_open     = false;  // the native section opener itself was seen during this hold
     bool                     n_closed   = false;  // ... and its close
     std::vector<int>         depth;               // open inner tags per inner pair (only counted inside a section)
+    // armed: token ids of every tag except the section opener; masked while no native section is open (a call
+    // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
+    std::vector<llama_token> tag_ids;
 };
 
 static const char * const k_kimi_markers[] = {
@@ -236,6 +239,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
 }
 
 // true while EOG must stay masked (before the caller's "last candidate" check)
+static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx);
 static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx) {
     if (!ctx->seen_output) {
         return true;
@@ -278,14 +282,19 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
 
 static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
-    if (!common_empty_reply_guard_holds(ctx)) {
+    const bool mask_eog  = common_empty_reply_guard_holds(ctx);
+    const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
+    if (!mask_eog && !mask_tags) {
         return;
     }
+    const auto masked = [&](llama_token id) {
+        return (mask_eog  && std::find(ctx->eog.begin(),     ctx->eog.end(),     id) != ctx->eog.end()) ||
+               (mask_tags && std::find(ctx->tag_ids.begin(), ctx->tag_ids.end(), id) != ctx->tag_ids.end());
+    };
     // never mask the last candidate standing
     size_t n_other = 0;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) == ctx->eog.end() &&
-            cur_p->data[i].logit != -INFINITY) {
+        if (!masked(cur_p->data[i].id) && cur_p->data[i].logit != -INFINITY) {
             n_other++;
         }
     }
@@ -293,7 +302,7 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
         return;
     }
     for (size_t i = 0; i < cur_p->size; ++i) {
-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) != ctx->eog.end()) {
+        if (masked(cur_p->data[i].id)) {
             cur_p->data[i].logit = -INFINITY;
         }
     }
@@ -336,6 +345,13 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
 struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
+    // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
+    for (size_t i = 1; i < ctx->hold.size(); ++i) {
+        const auto toks = common_tokenize(vocab, ctx->hold[i], false, true);
+        if (toks.size() == 1) {
+            ctx->tag_ids.push_back(toks[0]);
+        }
+    }
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     for (llama_token id = 0; id < n_vocab; ++id) {
         if (llama_vocab_is_eog(vocab, id)) {
