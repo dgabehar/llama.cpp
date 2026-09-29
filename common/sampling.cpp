@@ -155,6 +155,8 @@ struct common_empty_reply_guard {
     // armed: token ids of every tag except the section opener; masked while no native section is open (a call
     // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
     std::vector<llama_token> tag_ids;
+    // per token id: 1 = EOG, 2 = tag (built at init)
+    std::vector<uint8_t>     flags;
 };
 
 static const char * const k_kimi_markers[] = {
@@ -287,18 +289,28 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
     if (!mask_eog && !mask_tags) {
         return;
     }
+    // O(1) membership from a per-vocab flag table (built at init); was a std::find per candidate (~1.5 ms/token at 250k)
+    const uint8_t flag = (mask_eog ? 1 : 0) | (mask_tags ? 2 : 0);
     const auto masked = [&](llama_token id) {
-        return (mask_eog  && std::find(ctx->eog.begin(),     ctx->eog.end(),     id) != ctx->eog.end()) ||
-               (mask_tags && std::find(ctx->tag_ids.begin(), ctx->tag_ids.end(), id) != ctx->tag_ids.end());
+        return id >= 0 && (size_t) id < ctx->flags.size() && (ctx->flags[id] & flag);
     };
-    // never mask the last candidate standing
-    size_t n_other = 0;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        if (!masked(cur_p->data[i].id) && cur_p->data[i].logit != -INFINITY) {
-            n_other++;
-        }
+    // never mask the last candidate standing: stop at the first other finite candidate
+    bool has_other = false;
+    for (size_t i = 0; i < cur_p->size && !has_other; ++i) {
+        has_other = cur_p->data[i].logit != -INFINITY && !masked(cur_p->data[i].id);
     }
-    if (n_other == 0) {
+    if (!has_other) {
+        return;
+    }
+    // full-vocab candidates in id order (the usual case): jump straight to the few masked ids
+    const auto direct = [&](const std::vector<llama_token> & ids, bool on) {
+        return !on || std::all_of(ids.begin(), ids.end(), [&](llama_token id) {
+            return id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id;
+        });
+    };
+    if (direct(ctx->eog, mask_eog) && direct(ctx->tag_ids, mask_tags)) {
+        for (llama_token id : ctx->eog)     { if (mask_eog)  { cur_p->data[id].logit = -INFINITY; } }
+        for (llama_token id : ctx->tag_ids) { if (mask_tags) { cur_p->data[id].logit = -INFINITY; } }
         return;
     }
     for (size_t i = 0; i < cur_p->size; ++i) {
@@ -358,6 +370,9 @@ struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_
             ctx->eog.push_back(id);
         }
     }
+    ctx->flags.assign(n_vocab, 0);
+    for (llama_token id : ctx->eog)     { ctx->flags[id] |= 1; }
+    for (llama_token id : ctx->tag_ids) { if (id >= 0 && id < n_vocab) { ctx->flags[id] |= 2; } }
     return llama_sampler_init(&common_empty_reply_guard_i, ctx);
 }
 

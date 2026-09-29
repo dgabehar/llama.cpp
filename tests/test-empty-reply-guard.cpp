@@ -3,6 +3,9 @@
 // an opencode turn (2026-09-28): "\n<|tool_calls_section_begin|><|tool_call_begin|>" then EOG. Those markers
 // are not vocab tokens of that model, so a vocab that does not have them either (gpt-2) tokenizes them the same way.
 
+#include <algorithm>
+#include <chrono>
+#include <random>
 #include "llama.h"
 #include "common.h"
 #include "sampling.h"
@@ -305,6 +308,68 @@ int main(int argc, char ** argv) {
             llama_token_data_array p1 = { d1, 1, -1, false };
             llama_sampler_apply(g2, &p1);
             CHECK(!std::isinf(d1[0].logit));
+            // the masking must equal the reference std::find rule for any candidate layout (identity, shuffled, sparse,
+            // sorted, with -inf, ids past the vocab), and its per-token cost is timed against that old rule
+            {
+                const int n_v = llama_vocab_n_tokens(v2);
+                std::vector<llama_token> eogs;
+                for (llama_token t = 0; t < n_v; ++t) { if (llama_vocab_is_eog(v2, t)) { eogs.push_back(t); } }
+                const std::vector<llama_token> tag_v = { id[1], id[2], id[3] };
+                auto ref = [&](std::vector<llama_token_data> & c, bool m_eog, bool m_tag) {
+                    auto masked = [&](llama_token t) {
+                        return (m_eog && std::find(eogs.begin(), eogs.end(), t) != eogs.end()) ||
+                               (m_tag && std::find(tag_v.begin(), tag_v.end(), t) != tag_v.end());
+                    };
+                    size_t n_other = 0;
+                    for (auto & x : c) { if (!masked(x.id) && x.logit != -INFINITY) { n_other++; } }
+                    if (n_other == 0) { return; }
+                    for (auto & x : c) { if (masked(x.id)) { x.logit = -INFINITY; } }
+                };
+                std::mt19937 rng(42);
+                for (int iter = 0; iter < 200; ++iter) {
+                    const bool armed_open = iter % 2;            // tags masked only while no native section is open
+                    const bool seen       = iter % 4 < 2;        // EOG masked only before any output
+                    std::vector<llama_token_data> c;
+                    const int kind = iter % 5;
+                    for (llama_token t = 0; t < n_v; ++t) {
+                        if (kind == 3 && rng() % 3) { continue; } // sparse
+                        c.push_back({ t, (rng() % 7 == 0) ? -INFINITY : (float) (rng() % 100) / 10.f, 0.f });
+                    }
+                    if (kind == 1 || kind == 4) { std::shuffle(c.begin(), c.end(), rng); }
+                    if (kind == 2) { std::sort(c.begin(), c.end(), [](auto & a, auto & b) { return a.logit > b.logit; }); }
+                    if (kind == 4) { c.push_back({ n_v + 5, 1.f, 0.f }); c.push_back({ -1, 1.f, 0.f }); }
+                    if (iter % 11 == 0) { for (auto & x : c) { if (x.id != id[1] && x.id != eogs[0]) { x.logit = -INFINITY; } } } // last candidates
+                    llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
+                    if (!seen) { llama_sampler_accept(gg, ord); }
+                    if (armed_open) { llama_sampler_accept(gg, id[0]); }
+                    std::vector<llama_token_data> exp = c, got = c;
+                    ref(exp, seen || armed_open, !armed_open); // an open native section holds EOG too
+                    llama_token_data_array pp = { got.data(), got.size(), -1, false };
+                    llama_sampler_apply(gg, &pp);
+                    bool same = true;
+                    for (size_t i = 0; i < exp.size(); ++i) { same = same && exp[i].logit == got[i].logit; }
+                    CHECK(same);
+                    llama_sampler_free(gg);
+                }
+                // timing on a 250k candidate array (identity order, as the sampler sees it), no output yet, tags masked
+                const int N = 250000;
+                std::vector<llama_token_data> big(N);
+                for (int i = 0; i < N; ++i) { big[i] = { i, (float) (i % 97), 0.f }; }
+                llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
+                using clk = std::chrono::steady_clock;
+                const int reps = 200;
+                double t_new = 0, t_old = 0;
+                for (int r = 0; r < reps; ++r) {
+                    std::vector<llama_token_data> a = big, b = big;
+                    llama_token_data_array pa = { a.data(), a.size(), -1, false };
+                    auto t0 = clk::now(); llama_sampler_apply(gg, &pa); auto t1 = clk::now();
+                    ref(b, true, true);   auto t2 = clk::now();
+                    t_new += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    t_old += std::chrono::duration<double, std::milli>(t2 - t1).count();
+                }
+                printf("guard apply over %d candidates: new %.4f ms/token, old std::find rule %.4f ms/token\n", N, t_new / reps, t_old / reps);
+                llama_sampler_free(gg);
+            }
             llama_sampler_free(g2);
             llama_model_free(m2);
         }
