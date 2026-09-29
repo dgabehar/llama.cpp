@@ -705,6 +705,37 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   calls emitted an EXTRA `</ifm|tool_calls>` (harmless). Tests:
   `tests/test-empty-reply-guard.cpp` (vocab-only, real incident text).
 
+- **K2-Horizon-7B root cause of the Kimi-opener stalls: replayed history** (2026-09-29,
+  commits `5864976f9`, `282ab87a9`). The EOG holds (above) are safety nets; the
+  cause is in the prompt. (1) The template renders every past assistant turn's
+  reasoning with `<ifm|think>` whatever the effort, while the low-effort
+  generation prompt opens `<ifm|think_faster>`; (2) opencode replays a stalled
+  turn's junk reasoning (`<|tool_calls_section_begin|>...`, `<|close|>`) as
+  `reasoning_content`, which the model imitates: junk begets junk (live session
+  `ses_f16214d2...`: 25 of 26 replayed reasonings were junk). Evidence, raw
+  `/completion` sampling of that session's real history, 40 runs each, same
+  cuts/seed: as sent 10/40 Kimi openers; reasoning stripped 0/40; junk
+  reasoning stripped 0/40; history tag matched to the generation tag with the
+  junk kept 0/40. Fix 1 (`common/chat.cpp` `k2_history_reasoning`, K2 templates,
+  effort low/medium): history reasoning goes to the template's `think_faster` /
+  `think_fast` field, `<|...|>` / `<ifm|...>` markup is stripped from it, and
+  assistant turns left with nothing are dropped. Side effect measured with
+  first-token probes: with matching tags the model's first token after the open
+  tag skips ahead ("<ifm|tool_call>" 0.10-0.62, "</ifm|tool_calls>" 0.07-0.22,
+  vs "<ifm|think>" 0.45-0.78 repeat before), 11/40 empty turns on the garage
+  replay. Fix 2 (`common/sampling.cpp`): the tags are single vocab tokens, so
+  the armed guard masks every tool tag except the section opener while no
+  native section is open (a strict, token-level, non-lazy piece of the tool
+  grammar). Ablation on the garage replay (40 stream runs, empty turns): all off
+  0, tag match only 10, tag match + strip + drop 11, strip + drop only 0 but
+  live-session Kimi 5/60 (new spellings `<|open|>...`). A full non-lazy
+  grammar was not built: the trigger is lazy on `<ifm|tool_calls>` by design
+  (`chat-auto-parser-generator.cpp`), but with the token mask the failing
+  spellings are unreachable at the cheap layer. Result (chat endpoint, tools
+  offered, effort low, guard + normalisation): garage replay 0/40 stream, 0/40
+  non-stream; live-session replay 0/60 stream, 0/60 non-stream empty / stuck /
+  Kimi (before the fix: live stream 16/60 Kimi, 1 empty, 2 stuck).
+
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
