@@ -76,10 +76,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
             std::string gp = data.generation_prompt;
             gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
-            for (const auto & tag : autoparser.no_empty_reply_inert) {
-                if (tag.compare(0, 2, "</") != 0 && gp.size() >= tag.size() &&
-                    gp.compare(gp.size() - tag.size(), tag.size(), tag) == 0) {
-                    data.no_empty_reply_open = true;
+            const auto & inert = autoparser.no_empty_reply_inert; // (open, close) pairs
+            for (size_t i = 0; i + 1 < inert.size(); i += 2) {
+                if (gp.size() >= inert[i].size() && gp.compare(gp.size() - inert[i].size(), inert[i].size(), inert[i]) == 0) {
+                    data.no_empty_reply_open = inert[i + 1];
                 }
             }
         }
