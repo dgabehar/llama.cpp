@@ -173,6 +173,10 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0139 | `9a0ac0e5c` | chat: gpt-oss parser accepts the "commentary (analysis)" analysis header |
 | 0140 | `84d7611e9` | sampling: K2-Horizon: empty-reply guard also holds EOG inside an unfinished Kimi-style tool-call opener |
 | 0141 | `bf6ef50ff` | sampling, chat: K2-Horizon: hold EOG from a tool-call opener until the section is closed and its inner tags balance |
+| 0142 | `fb6b0159d` | sampling: K2-Horizon: Kimi hold gets its own small cap and releases on a repeated opener |
+| 0143 | `5864976f9` | chat: K2-Horizon: render history reasoning with the generation tag, strip foreign markup, drop emptied turns |
+| 0144 | `282ab87a9` | sampling: K2-Horizon: mask the structural tool-call tags while no native section is open |
+| 0145 | `3b7d51c4d` | FLEET.md: K2 history-replay root cause and the tag mask |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
