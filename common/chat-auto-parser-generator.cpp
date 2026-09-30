@@ -74,6 +74,14 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         data.no_empty_reply_inert = autoparser.no_empty_reply_inert;
         if (inputs.tools.is_array() && !inputs.tools.empty()) {
             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
+            std::string gp = data.generation_prompt;
+            gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
+            for (const auto & tag : autoparser.no_empty_reply_inert) {
+                if (tag.compare(0, 2, "</") != 0 && gp.size() >= tag.size() &&
+                    gp.compare(gp.size() - tag.size(), tag.size(), tag) == 0) {
+                    data.no_empty_reply_open = true;
+                }
+            }
         }
     }
 
