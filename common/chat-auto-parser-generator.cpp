@@ -530,11 +530,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
         // Build required arg sequence in definition order
         common_peg_parser args_seq = p.eps();
+        if (format.drop_tail) {
+            // K2-Horizon writes the arguments in whatever order it likes (`path` before the required `pattern`, seen
+            // live in Grafana F7): a strict required-first order made the whole call fail to parse and surface as `{`.
+            // Any order of any of the arguments; the client validates the required ones.
+            common_peg_parser any_arg = p.choice();
+            for (const auto & r : required_parsers) { any_arg |= r; }
+            for (const auto & o : optional_parsers) { any_arg |= o; }
+            args_seq = p.repeat(p.space() + any_arg, 0, -1);
+            optional_parsers.clear();
+        } else {
         for (size_t i = 0; i < required_parsers.size(); i++) {
             if (i > 0) {
                 args_seq = args_seq + p.space();
             }
             args_seq = args_seq + required_parsers[i];
+        }
         }
 
         // Build optional args with flexible ordering

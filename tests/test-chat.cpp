@@ -5346,6 +5346,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         common_chat_templates_ptr tmpls = read_templates("models/templates/k2-horizon.jinja");
         common_chat_tool bash{ "bash", "Executes a bash command",
                                R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+        common_chat_tool grep{ "grep", "Searches file contents",
+                               R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})" };
         auto make = [&](const char * effort, bool with_tools, common_chat_tool_choice choice = COMMON_CHAT_TOOL_CHOICE_AUTO,
                         bool parallel = false) {
             common_chat_templates_inputs in;
@@ -5356,7 +5358,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             in.parallel_tool_calls   = parallel;
             in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
             if (with_tools) {
-                in.tools = { bash };
+                in.tools = { bash, grep };
             }
             return make_peg_parser(tmpls.get(), in);
         };
@@ -5433,6 +5435,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             assert_equals((size_t) 0, m.tool_calls.size());
             assert_equals(std::string("Thinking."), trim_ws(m.reasoning_content));
             assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
+        }
+
+        // 6a''. arguments in a different order than the schema's (optional before the required one, seen live in Grafana
+        // F7, where the call surfaced as `{`) are still one whole call
+        {
+            const std::vector<std::pair<std::string, std::string>> variants = {
+                { "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n", R"({"pattern":"Info"})" },
+                { "<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n",
+                  R"({"path":"/x","pattern":"Info"})" },
+                { "<ifm|arg_key>include</ifm|arg_key>\n<ifm|arg_value>*.yaml</ifm|arg_value>\n<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n"
+                  "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info|Watchdog</ifm|arg_value>\n",
+                  R"({"include":"*.yaml","path":"/x","pattern":"Info|Watchdog"})" },
+            };
+            for (const auto & v : variants) {
+                auto m = stream_parse(make("low", true), "Ok.<ifm|tool_calls>\n<ifm|tool_call>grep\n" + v.first + "</ifm|tool_call>\n</ifm|tool_calls>");
+                assert_equals((size_t) 1, m.tool_calls.size());
+                assert_equals(v.second, m.tool_calls[0].arguments);
+            }
         }
 
         // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
