@@ -1018,15 +1018,15 @@ static void map_developer_role_to_system(json & messages) {
 // sees a tag it was not asked to open, and a junk reasoning (a Kimi tool-call opener, `<|close|>`, ...) replayed by
 // the client from a stalled turn primes the next turn to repeat it (opencode session ses_f16214d2: 25 of 26 replayed
 // reasonings junk, 10/40 replay samples opened a Kimi call; 0/40 with the tags matched). So render the history
-// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip foreign
-// `<|...|>` and `<ifm|...>` markup from it, and drop assistant turns that are left with nothing at all (an empty
+// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip the known K2/Kimi
+// markup tokens (`<|tool_call_begin|>`, `<|close|>`, ... never arbitrary `<|...`) and `<ifm|...>` tags from it, and drop assistant turns that are left with nothing at all (an empty
 // past turn teaches ending the turn right after the reasoning).
 static void k2_history_reasoning(json & messages, const std::string & effort) {
     const char * field = effort == "low" ? "think_faster" : effort == "medium" ? "think_fast" : nullptr;
     if (!field) {
         return; // high: history tag == generation tag already
     }
-    static const std::regex foreign(R"(<\|[A-Za-z_]*(?:\|>)?|</?ifm\|[a-z_]+>)");
+    static const std::regex foreign(R"(<\|(?:tool_calls_section_begin|tool_calls_section_end|tool_call_begin|tool_call_end|tool_call_argument_begin|close|sep|open)(?![A-Za-z_])(?:\|>)?|</?ifm\|[a-z_]+>)");
     json out = json::array();
     for (auto & m : messages) {
         if (!m.is_object() || m.value("role", "") != "assistant") {

@@ -7772,7 +7772,7 @@ static void test_k2_history_reasoning() {
     partial.content = "Done.";
     common_chat_msg real;
     real.role = "assistant";
-    real.reasoning_content = "Check the file.";
+    real.reasoning_content = "Check the file. p <|> q, <|x|> and <|cl|>.";
     real.content = "Looks fine.";
 
     common_chat_tool bash{ "bash", "Executes a bash command",
@@ -7785,7 +7785,7 @@ static void test_k2_history_reasoning() {
         inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
         const std::string tag = std::string("ifm|think_") + (std::string(effort) == "low" ? "faster" : "fast");
         const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
-        assert_contains(prompt, "<" + tag + ">\nCheck the file.\n</" + tag + ">\nLooks fine.");
+        assert_contains(prompt, "<" + tag + ">\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</" + tag + ">\nLooks fine.");
         if (prompt.find("<ifm|think>") != std::string::npos || prompt.find("</ifm|think>") != std::string::npos) {
             throw std::runtime_error("K2 history still rendered with the high-effort tag at effort " + std::string(effort));
         }
@@ -7809,7 +7809,7 @@ static void test_k2_history_reasoning() {
         inputs.messages              = { user, real, user };
         inputs.add_generation_prompt = true;
         inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
-        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file.\n</ifm|think>\nLooks fine.");
+        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</ifm|think>\nLooks fine.");
     }
     LOG_ERR("%s passed\n", __func__);
 }

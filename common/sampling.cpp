@@ -155,6 +155,11 @@ struct common_empty_reply_guard {
     // armed: token ids of every tag except the section opener; masked while no native section is open (a call
     // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
     std::vector<llama_token> tag_ids;
+    // the generation starts inside an open reasoning block (tools offered): EOG stays masked until an inert close
+    // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
+    bool                     open_initial = false;
+    bool                     r_open       = false;
+    int                      n_reason     = 0;
     // per token id: 1 = EOG, 2 = tag (built at init)
     std::vector<uint8_t>     flags;
 };
@@ -195,6 +200,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
             case 0:
             case 2: {
                 // the opener again while the first is unfinished: the model is looping, let it end
+                ctx->r_open = false; // a call was started: the call holds take over
                 const bool repeat = which == 0 ? ctx->in_section : ctx->in_call;
                 (which == 0 ? ctx->in_section : ctx->in_call) = true;
                 if (repeat) {
@@ -216,6 +222,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
                     if (!ctx->n_open) {
                         ctx->n_held = 0;
                     }
+                    ctx->r_open = false;
                     ctx->held = ctx->n_open = true;
                     ctx->n_closed = false;
                     ctx->kimi_held = ctx->kimi_loop = false; // the model switched to its own format
@@ -246,7 +253,7 @@ static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx)
     if (!ctx->seen_output) {
         return true;
     }
-    return (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
+    return (ctx->r_open && ctx->n_reason < k_hold_cap) || (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
 }
 
 static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
@@ -259,7 +266,15 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
         return;
     }
     if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
+        if (ctx->open_initial || ctx->r_open) {
+            const std::string tag = common_token_to_piece(ctx->vocab, token, true);
+            ctx->r_open = tag.compare(0, 2, "</") != 0; // a close tag ends the block, an open tag (re)opens one
+            ctx->n_reason = 0;
+        }
         return;
+    }
+    if (ctx->r_open && ++ctx->n_reason == k_hold_cap) {
+        LOG_DBG("%s: empty-reply guard: %d tokens inside an unclosed reasoning block, releasing EOG\n", __func__, k_hold_cap);
     }
     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
     // the native markers are special tokens, which only render with special=true
@@ -325,6 +340,8 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
     ctx->seen_output = false;
     ctx->tail.clear();
     ctx->in_section = ctx->in_call = false;
+    ctx->r_open = ctx->open_initial;
+    ctx->n_reason = 0;
     common_empty_reply_guard_release(ctx);
 }
 
@@ -354,8 +371,9 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
 }
 
-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, bool reasoning_open) {
     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+    ctx->open_initial = ctx->r_open = reasoning_open && !ctx->hold.empty();
     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
     // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
     for (size_t i = 1; i < ctx->hold.size(); ++i) {
@@ -608,7 +626,7 @@ struct common_sampler * common_sampler_init(
     }
 
     if (params.no_empty_reply) {
-        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold);
+        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold, params.no_empty_reply_open);
     }
 
     if (params.mirostat == 0) {
