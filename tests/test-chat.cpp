@@ -5409,6 +5409,28 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
         }
 
+        // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
+        // generation (it would run a tool with `{`); a complete one is
+        for (const char * effort : { "low", "high" }) {
+            const std::string close = std::string(effort) == "low" ? "</ifm|think_faster>" : "</ifm|think>";
+            const std::vector<std::string> cut = {
+                R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{)",
+                R"(<|tool_call_begin|>bash<|sep|>{"command":"l)",
+                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls",
+                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>",
+                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>",
+                "<ifm|tool_calls>\n<ifm|tool_call>bash\n{",
+                "<ifm|tool_calls>\n<ifm|tool_call>bash",
+            };
+            for (const auto & c : cut) {
+                for (const auto & pre : { std::string("Thinking."), "Thinking." + close + "Ok.\n" }) {
+                    auto m = stream_parse(make(effort, true), pre + c); // also: the streamed diffs stay valid
+                    assert_equals((size_t) 0, m.tool_calls.size());
+                    assert_equals(true, !trim_ws(m.reasoning_content + m.content).empty());
+                }
+            }
+        }
+
         // 6b. the parser never throws: whatever the model emits parses to something (fuzz, fixed seed)
         const std::vector<std::string> pieces = {
             "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>",
