@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <map>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -132,6 +133,9 @@ static const int k_hold_cap = 2048;
 // Kimi hold gets its own small cap, and a repeated unfinished opener releases it at once.
 static const int k_kimi_hold_cap = 192;
 
+// A reasoning line repeated this many times in an open block is a loop: force the close tag.
+static const int k_rep_lines = 3;
+
 struct common_empty_reply_guard {
     const llama_vocab *      vocab;
     std::vector<llama_token> eog;
@@ -161,6 +165,10 @@ struct common_empty_reply_guard {
     bool                     r_open       = false;
     llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
     int                      n_reason     = 0;
+    // repetition breaker for the open block: a line (16+ chars) written k_rep_lines times forces the close tag
+    std::string              line;
+    std::map<std::string, int> seen_lines;
+    bool                     force_close  = false;
     // per token id: 1 = EOG, 2 = tag (built at init)
     std::vector<uint8_t>     flags;
 };
@@ -271,8 +279,23 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
             const std::string tag = common_token_to_piece(ctx->vocab, token, true);
             ctx->r_open = tag.compare(0, 2, "</") != 0; // a close tag ends the block, an open tag (re)opens one
             ctx->n_reason = 0;
+            ctx->force_close = false;
+            ctx->line.clear();
+            ctx->seen_lines.clear();
         }
         return;
+    }
+    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL) {
+        // the model writes its next step in the reasoning, then repeats it to max_tokens ("Let me check ..." x 100)
+        ctx->line += common_token_to_piece(ctx->vocab, token, false);
+        for (size_t nl; (nl = ctx->line.find('\n')) != std::string::npos; ctx->line.erase(0, nl + 1)) {
+            std::string l = ctx->line.substr(0, nl);
+            l.erase(0, l.find_first_not_of(" \t\r"));
+            if (l.size() >= 16 && ++ctx->seen_lines[l] >= k_rep_lines) {
+                ctx->force_close = true;
+                LOG_DBG("%s: empty-reply guard: a reasoning line repeated %d times, forcing the close tag\n", __func__, k_rep_lines);
+            }
+        }
     }
     if (ctx->r_open && ++ctx->n_reason == k_hold_cap) {
         LOG_DBG("%s: empty-reply guard: %d tokens inside an unclosed reasoning block, releasing EOG\n", __func__, k_hold_cap);
@@ -302,9 +325,7 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
     const bool mask_eog  = common_empty_reply_guard_holds(ctx);
     const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
-    if (ctx->r_open && ctx->n_reason < k_hold_cap && ctx->close_id != LLAMA_TOKEN_NULL) {
-        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
-        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
+    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL && (ctx->force_close || ctx->n_reason < k_hold_cap)) {
         const auto find = [&](llama_token id) -> llama_token_data * {
             if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
                 return &cur_p->data[id];
@@ -314,6 +335,17 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
             }
             return nullptr;
         };
+        if (ctx->force_close) {
+            if (auto * c = find(ctx->close_id)) {
+                for (size_t i = 0; i < cur_p->size; ++i) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+                c->logit = 0.0f;
+                return;
+            }
+        }
+        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
+        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
         float best = -INFINITY;
         for (llama_token id : ctx->eog) {
             if (const auto * d = find(id)) { best = std::max(best, d->logit); }
@@ -363,6 +395,9 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
     ctx->in_section = ctx->in_call = false;
     ctx->r_open = ctx->open_initial;
     ctx->n_reason = 0;
+    ctx->force_close = false;
+    ctx->line.clear();
+    ctx->seen_lines.clear();
     common_empty_reply_guard_release(ctx);
 }
 
