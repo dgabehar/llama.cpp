@@ -736,6 +736,49 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   non-stream; live-session replay 0/60 stream, 0/60 non-stream empty / stuck /
   Kimi (before the fix: live stream 16/60 Kimi, 1 empty, 2 stuck).
 
+- **K2-Horizon-7B fix build F2: parser gaps, reasoning-block guard, repetition
+  breaker** (2026-09-30, patches 0146-0152, fork commits `11e9b4b63`,
+  `0088f823d`, `3449022c9`, `d5812222e`, `f893af144`, `59b910d75`, `ed3ab13ad`).
+  - 0146 (`11e9b4b63`): the armed empty-reply guard / tag mask did a
+    `std::find` over the EOG and tag id lists per candidate per token (about
+    +1.5 ms/token on a ~250k vocab); now a per-vocab flag table, same behavior.
+    Test: `test-empty-reply-guard` (200 randomized candidate layouts vs the old
+    rule, plus a 250k-candidate timing print).
+  - 0147 (`0088f823d`): K2 parser gaps. Reasoning open tag taken from the
+    generation prompt (low/medium/high all parse); bare `<ifm|tool_call>` block
+    (no section opener/end) is a call; a complete Kimi-form call is surfaced;
+    stray `</ifm|think*>`, `<|close|>`, `<|sep|>`, EOG text dropped; a parse
+    failure falls back to reasoning + content instead of throwing. Test:
+    `tests/test-chat.cpp` (efforts, bare/Kimi calls, stray tags, fallback, 18000-case
+    no-throw fuzz).
+  - 0148 (`3449022c9`): with tools offered, EOG inside an unclosed reasoning
+    block is held; only known K2/Kimi markup is stripped from replayed reasoning
+    (was: any `<|...|>`).
+  - 0149 (`d5812222e`): a call cut off by EOG/max_tokens (arguments healed to
+    `{`) is no longer surfaced as a call; falls back to reasoning/content at the
+    end of generation.
+  - 0150 (`f893af144`): tagged-args parser takes the arguments in any order
+    (was required-first in schema order; K2 writes e.g. `path` before the
+    required `pattern`, which surfaced a call with arguments `{`, Grafana F7 t3).
+  - 0151 (`59b910d75`): masking EOG alone in an open reasoning block pushed
+    replayed turns into 4096-token loops; the close tag now takes the best EOG
+    logit while the block is open (capped), so "stop" becomes "close reasoning".
+  - 0152 (`ed3ab13ad`): repetition breaker: a reasoning line of 16+ chars written
+    three times in the block the prompt opened forces the close tag (R17 live
+    seed 0 looped on "Let me check the GitHub releases..." from turn 31).
+    Known gap: only identical repeated lines are caught.
+  Tests for 0147-0152: `tests/test-chat.cpp`, `tests/test-empty-reply-guard.cpp`.
+  QA (Dawn, K2 results doc in home-infrastructure
+  `docs/architecture/model-test-plan-k2-horizon-7b-results.md`): GO for a canary.
+  R17 live 4 independent seeds 0 empty / 0 runaway / 0 badcall; F7 t3 19/20 OK;
+  R01 0/48, R01b 0/48 (baseline fleet build: 4/144 on junk-history replay, 20/20
+  leaks at medium/high effort). Pending: garage R17 and a decode-speed check.
+  **Upstream rebase point:** ggml-org/llama.cpp PR
+  [#29535](https://github.com/ggml-org/llama.cpp/pull/29535) (open, K2 Horizon
+  support). When it lands, rebase onto it; our patches still needed on top: the
+  EOG guard, bare `<ifm|tool_call>`, Kimi-form opener, `<|close|>` leak,
+  optional-before-required argument order, and the repetition breaker.
+
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
