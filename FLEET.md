@@ -689,12 +689,95 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   hold-until-native-close 34-35/40 complete native call, 5/40 (500-token
   window) Kimi loops; with the balanced-tags hold and 2600 tokens: 36/40
   complete native call, 4/40 Kimi loops/garbage that ran to the cap, 0/40 EOG.
+  Follow-up (2026-09-29, live): with the hold, the fleet turned the silent stall
+  into a ~1500-token loop of the opener (`ses_f16214d2...`), so the Kimi hold now
+  has its own cap `k_kimi_hold_cap` = 192 tokens (117 complete Kimi calls in the
+  harness: median 42, longest 115; native switch after the opener p90 118, max
+  255) and a REPEATED unfinished opener releases EOG at once (real loop text is
+  a test fixture). Release only permits EOG: forced Kimi-garbage samples that
+  never choose EOG still run to the client limit (5/40 ran to 2600 tokens in the
+  forced harness, same as before), so this is a safety net, not the fix; the
+  root-cause work is why the model leaves the native format at all.
   Residual: those ~10% never switch to the native format, run to the cap and
   then end the turn; parsing the Kimi form (which varies: `<|sep|>`, missing
   `functions.` prefix) would be the next step. Inner-tag balance in the
   harness: no unclosed inner tag in any complete native call; 2/40 native
   calls emitted an EXTRA `</ifm|tool_calls>` (harmless). Tests:
   `tests/test-empty-reply-guard.cpp` (vocab-only, real incident text).
+
+- **K2-Horizon-7B root cause of the Kimi-opener stalls: replayed history** (2026-09-29,
+  commits `5864976f9`, `282ab87a9`). The EOG holds (above) are safety nets; the
+  cause is in the prompt. (1) The template renders every past assistant turn's
+  reasoning with `<ifm|think>` whatever the effort, while the low-effort
+  generation prompt opens `<ifm|think_faster>`; (2) opencode replays a stalled
+  turn's junk reasoning (`<|tool_calls_section_begin|>...`, `<|close|>`) as
+  `reasoning_content`, which the model imitates: junk begets junk (live session
+  `ses_f16214d2...`: 25 of 26 replayed reasonings were junk). Evidence, raw
+  `/completion` sampling of that session's real history, 40 runs each, same
+  cuts/seed: as sent 10/40 Kimi openers; reasoning stripped 0/40; junk
+  reasoning stripped 0/40; history tag matched to the generation tag with the
+  junk kept 0/40. Fix 1 (`common/chat.cpp` `k2_history_reasoning`, K2 templates,
+  effort low/medium): history reasoning goes to the template's `think_faster` /
+  `think_fast` field, `<|...|>` / `<ifm|...>` markup is stripped from it, and
+  assistant turns left with nothing are dropped. Side effect measured with
+  first-token probes: with matching tags the model's first token after the open
+  tag skips ahead ("<ifm|tool_call>" 0.10-0.62, "</ifm|tool_calls>" 0.07-0.22,
+  vs "<ifm|think>" 0.45-0.78 repeat before), 11/40 empty turns on the garage
+  replay. Fix 2 (`common/sampling.cpp`): the tags are single vocab tokens, so
+  the armed guard masks every tool tag except the section opener while no
+  native section is open (a strict, token-level, non-lazy piece of the tool
+  grammar). Ablation on the garage replay (40 stream runs, empty turns): all off
+  0, tag match only 10, tag match + strip + drop 11, strip + drop only 0 but
+  live-session Kimi 5/60 (new spellings `<|open|>...`). A full non-lazy
+  grammar was not built: the trigger is lazy on `<ifm|tool_calls>` by design
+  (`chat-auto-parser-generator.cpp`), but with the token mask the failing
+  spellings are unreachable at the cheap layer. Result (chat endpoint, tools
+  offered, effort low, guard + normalisation): garage replay 0/40 stream, 0/40
+  non-stream; live-session replay 0/60 stream, 0/60 non-stream empty / stuck /
+  Kimi (before the fix: live stream 16/60 Kimi, 1 empty, 2 stuck).
+
+- **K2-Horizon-7B fix build F2: parser gaps, reasoning-block guard, repetition
+  breaker** (2026-09-30, patches 0146-0152, fork commits `11e9b4b63`,
+  `0088f823d`, `3449022c9`, `d5812222e`, `f893af144`, `59b910d75`, `ed3ab13ad`).
+  - 0146 (`11e9b4b63`): the armed empty-reply guard / tag mask did a
+    `std::find` over the EOG and tag id lists per candidate per token (about
+    +1.5 ms/token on a ~250k vocab); now a per-vocab flag table, same behavior.
+    Test: `test-empty-reply-guard` (200 randomized candidate layouts vs the old
+    rule, plus a 250k-candidate timing print).
+  - 0147 (`0088f823d`): K2 parser gaps. Reasoning open tag taken from the
+    generation prompt (low/medium/high all parse); bare `<ifm|tool_call>` block
+    (no section opener/end) is a call; a complete Kimi-form call is surfaced;
+    stray `</ifm|think*>`, `<|close|>`, `<|sep|>`, EOG text dropped; a parse
+    failure falls back to reasoning + content instead of throwing. Test:
+    `tests/test-chat.cpp` (efforts, bare/Kimi calls, stray tags, fallback, 18000-case
+    no-throw fuzz).
+  - 0148 (`3449022c9`): with tools offered, EOG inside an unclosed reasoning
+    block is held; only known K2/Kimi markup is stripped from replayed reasoning
+    (was: any `<|...|>`).
+  - 0149 (`d5812222e`): a call cut off by EOG/max_tokens (arguments healed to
+    `{`) is no longer surfaced as a call; falls back to reasoning/content at the
+    end of generation.
+  - 0150 (`f893af144`): tagged-args parser takes the arguments in any order
+    (was required-first in schema order; K2 writes e.g. `path` before the
+    required `pattern`, which surfaced a call with arguments `{`, Grafana F7 t3).
+  - 0151 (`59b910d75`): masking EOG alone in an open reasoning block pushed
+    replayed turns into 4096-token loops; the close tag now takes the best EOG
+    logit while the block is open (capped), so "stop" becomes "close reasoning".
+  - 0152 (`ed3ab13ad`): repetition breaker: a reasoning line of 16+ chars written
+    three times in the block the prompt opened forces the close tag (R17 live
+    seed 0 looped on "Let me check the GitHub releases..." from turn 31).
+    Known gap: only identical repeated lines are caught.
+  Tests for 0147-0152: `tests/test-chat.cpp`, `tests/test-empty-reply-guard.cpp`.
+  QA (Dawn, K2 results doc in home-infrastructure
+  `docs/architecture/model-test-plan-k2-horizon-7b-results.md`): GO for a canary.
+  R17 live 4 independent seeds 0 empty / 0 runaway / 0 badcall; F7 t3 19/20 OK;
+  R01 0/48, R01b 0/48 (baseline fleet build: 4/144 on junk-history replay, 20/20
+  leaks at medium/high effort). Pending: garage R17 and a decode-speed check.
+  **Upstream rebase point:** ggml-org/llama.cpp PR
+  [#29535](https://github.com/ggml-org/llama.cpp/pull/29535) (open, K2 Horizon
+  support). When it lands, rebase onto it; our patches still needed on top: the
+  EOG guard, bare `<ifm|tool_call>`, Kimi-form opener, `<|close|>` leak,
+  optional-before-required argument order, and the repetition breaker.
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's

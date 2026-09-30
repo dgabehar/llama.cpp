@@ -302,6 +302,8 @@ struct common_params_sampling {
     // native tool-call tag pairs (tools offered), see common_chat_params::no_empty_reply_hold: EOG is also masked
     // from an opener until the section is closed and its inner tags are balanced, capped
     std::vector<std::string>  no_empty_reply_hold;
+    // the prompt ends inside an open reasoning block (tools offered only): its close tag; EOG there becomes that tag, capped
+    std::string               no_empty_reply_open;
 
     bool backend_sampling = false;
 

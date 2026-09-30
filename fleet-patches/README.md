@@ -173,6 +173,17 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0139 | `9a0ac0e5c` | chat: gpt-oss parser accepts the "commentary (analysis)" analysis header |
 | 0140 | `84d7611e9` | sampling: K2-Horizon: empty-reply guard also holds EOG inside an unfinished Kimi-style tool-call opener |
 | 0141 | `bf6ef50ff` | sampling, chat: K2-Horizon: hold EOG from a tool-call opener until the section is closed and its inner tags balance |
+| 0142 | `fb6b0159d` | sampling: K2-Horizon: Kimi hold gets its own small cap and releases on a repeated opener |
+| 0143 | `5864976f9` | chat: K2-Horizon: render history reasoning with the generation tag, strip foreign markup, drop emptied turns |
+| 0144 | `282ab87a9` | sampling: K2-Horizon: mask the structural tool-call tags while no native section is open |
+| 0145 | `3b7d51c4d` | FLEET.md: K2 history-replay root cause and the tag mask |
+| 146 | `11e9b4b63` | sampling: empty-reply guard/tag mask: O(1) per-candidate masking |
+| 147 | `0088f823d` | chat: K2-Horizon parser gaps (all reasoning efforts, bare/Kimi calls, stray tags, never throw) |
+| 148 | `3449022c9` | K2: hold EOG inside an unclosed reasoning block (tools offered); strip only known K2/Kimi markup from replayed reasoning |
+| 149 | `d5812222e` | K2 parser: surface a tool call only once its arguments are complete JSON |
+| 150 | `f893af144` | K2 parser: accept the tool arguments in any order |
+| 151 | `59b910d75` | K2 guard: turn an end of turn inside an unclosed reasoning block into the block's close tag |
+| 152 | `ed3ab13ad` | K2 guard: repetition breaker for an open reasoning block |
 
 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead

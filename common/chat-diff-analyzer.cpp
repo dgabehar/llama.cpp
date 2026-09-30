@@ -244,9 +244,22 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               // the "high" tag, whatever the template opened) and sometimes start the tool call without
               // closing the reasoning at all (seen live 2026-09-26): both are consumed by the reasoning parser.
               analysis.reasoning.start_alts = { "<ifm|think>", "<ifm|think_fast>" };
-              analysis.reasoning.implicit_ends_with_tools = { "<ifm|tool_calls>" };
-              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
-              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>" };
+              analysis.reasoning.implicit_ends_with_tools = { "<ifm|tool_calls>", "<ifm|tool_call>" };
+              // The generation prompt opens the tag of the request's reasoning_effort ("<ifm|think>" high,
+              // "<ifm|think_fast>" medium, "<ifm|think_faster>" low): all of them are accepted as the open tag
+              // (start_alts) and as the close tag (end_alts), so no effort loses its reasoning. The stray ends
+              // also cover the Kimi/harmony delimiters the model sometimes derails into after its answer.
+              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>",
+                                              "<|close|>", "<|sep|>", "<|open|>", "<|ifm|im_end|>", "<|ifm|endoftext|>" };
+              // no call is possible (no tools, or tool_choice none): a call the model emits anyway is dropped from
+              // the content, from its first tag on
+              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>",
+                                                       "<ifm|tool_calls>", "<ifm|tool_call>", "<ifm|arg_key>", "<ifm|arg_value>",
+                                                       "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
+              analysis.tools.format.section_optional = true;
+              analysis.tools.format.always_parallel  = true;
+              analysis.tools.format.kimi_fallback    = true;
+              analysis.tools.format.drop_tail        = true;
               // With the reasoning open tag already in the prompt, the official weights sometimes end the
               // turn with their very first token (EOG): 1 output token, no content, and the client takes it
               // for a finished turn. The reply must hold something before an EOG token is allowed.

@@ -15,6 +15,25 @@ using json = common_json;
 
 namespace autoparser {
 
+// The reasoning open tag the generation prompt actually ended with: templates that pick the tag by request (K2-Horizon:
+// one tag per reasoning_effort) list the other spellings as start_alts. Falls back to the registered start tag.
+static std::string opened_reasoning_start(const analyze_reasoning & r, const std::string & generation_prompt) {
+    std::string best = r.start;
+    size_t      pos  = r.start.empty() ? std::string::npos : generation_prompt.find(r.start);
+    for (const auto & alt : r.start_alts) {
+        const size_t at = generation_prompt.find(alt);
+        if (at != std::string::npos && (pos == std::string::npos || at < pos)) {
+            best = alt;
+            pos  = at;
+        }
+    }
+    return best;
+}
+
+static bool request_uses_tools(const generation_params & inputs) {
+    return inputs.tools.is_array() && !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+}
+
 parser_build_context::parser_build_context(common_chat_peg_builder & p, const generation_params & inputs) :
     p(p),
     inputs(inputs),
@@ -45,8 +64,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         data.stops_after_reasoning = autoparser.content.stray_ends;
         // stray_ends_no_tools are real tool-call syntax once tools are offered, so they must never
         // stop generation in that case -- only fold them in when this request has none.
-        bool request_has_tools = inputs.tools.is_array() && !inputs.tools.empty();
-        if (!request_has_tools) {
+        if (!request_uses_tools(inputs)) {
             data.stops_after_reasoning.insert(data.stops_after_reasoning.end(),
                 autoparser.content.stray_ends_no_tools.begin(), autoparser.content.stray_ends_no_tools.end());
         }
@@ -56,6 +74,14 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         data.no_empty_reply_inert = autoparser.no_empty_reply_inert;
         if (inputs.tools.is_array() && !inputs.tools.empty()) {
             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
+            std::string gp = data.generation_prompt;
+            gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
+            const auto & inert = autoparser.no_empty_reply_inert; // (open, close) pairs
+            for (size_t i = 0; i + 1 < inert.size(); i += 2) {
+                if (gp.size() >= inert[i].size() && gp.compare(gp.size() - inert[i].size(), inert[i].size(), inert[i]) == 0) {
+                    data.no_empty_reply_open = inert[i + 1];
+                }
+            }
         }
     }
 
@@ -66,8 +92,9 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         const auto & msg = inputs.continue_msg;
 
         if (!autoparser.reasoning.start.empty()) {
-            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start));
-            data.generation_prompt += autoparser.reasoning.start + msg.reasoning_content;
+            const std::string opened = opened_reasoning_start(autoparser.reasoning, data.generation_prompt);
+            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(opened));
+            data.generation_prompt += opened + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += autoparser.reasoning.end;
             }
@@ -105,6 +132,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             data.grammar_triggers = {
                 { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, trigger_marker }
             };
+            if (autoparser.tools.format.section_optional && !autoparser.tools.format.per_call_start.empty()) {
+                // a bare per-call block (no section opener) is constrained the same way
+                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, autoparser.tools.format.per_call_start });
+            }
             if (autoparser.tools.format.openai_wrapper_trigger) {
                 // model emits the OpenAI function wrapper, trigger on it
                 data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "{\"type\": \"function\"," });
@@ -127,13 +158,21 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         ctx.content              = &content;
         ctx.reasoning            = &reasoning;
 
+        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+
+        // A grammar-less request may also get a complete Kimi-form call; the reasoning parser needs to know it
+        // (a call emitted while still "thinking" ends the reasoning). Not under a required-call grammar.
+        if (tools.format.kimi_fallback && tools.format.mode == tool_format::TAG_WITH_TAGGED && !has_response_format &&
+            has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && jinja_caps.supports_tool_calls) {
+            ctx.kimi_openers = { "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
+            ctx.kimi_calls   = tools.build_kimi_calls(ctx);
+        }
+
         // Build reasoning parser
         ctx.reasoning_parser = reasoning.build_parser(ctx);
 
         auto parser = p.eps();
-
-        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
-        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
 
         if (has_response_format) {
@@ -149,8 +188,15 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
         } else {
             parser = content.build_parser(ctx);
         }
-        const std::string reasoning_start = trim_whitespace(reasoning.start);
-        return pure_content ? p.prefix(generation_prompt, reasoning_start) + parser : p.prefix(generation_prompt, reasoning_start) << parser;
+        const std::string reasoning_start = trim_whitespace(opened_reasoning_start(reasoning, generation_prompt));
+        auto              prefix          = p.prefix(generation_prompt, reasoning_start);
+        auto              root            = pure_content ? prefix + parser : prefix << parser;
+        if (tools.format.drop_tail && ctx.extracting_reasoning) {
+            // K2-Horizon: output that fits no shape above must never fail the turn (common_chat_peg_parse falls back
+            // to this rule): keep the reasoning it can tell apart and hand back everything else as content.
+            p.rule("lenient-fallback", prefix << (ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end()));
+        }
+        return root;
     });
 }
 
@@ -179,17 +225,34 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
                 }
             }
             auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
+            auto opening = p.eps();
             if (start.empty()) {
-                return p.optional(body);
-            }
-            auto opening = p.optspace(start);
-            if (!start_alts.empty()) {
-                // the generation prompt's own newline after the open tag comes first, hence the space()
-                std::vector<common_peg_parser> repeats = { p.literal(trim_whitespace(start)) };
-                for (const auto & alt : start_alts) {
-                    repeats.push_back(p.literal(trim_whitespace(alt)));
+                if (!ctx.kimi_calls) {
+                    return p.optional(body);
                 }
-                opening = opening + p.zero_or_more(p.space() + p.choice(repeats));
+            } else {
+                opening = p.optspace(start);
+                if (!start_alts.empty()) {
+                    // the request picks the open tag (K2-Horizon: by reasoning_effort), so any spelling may be the one
+                    // the generation prompt opened; the generation prompt's own newline after it comes first
+                    std::vector<common_peg_parser> firsts = { opening };
+                    std::vector<common_peg_parser> repeats = { p.literal(trim_whitespace(start)) };
+                    for (const auto & alt : start_alts) {
+                        firsts.push_back(p.optspace(alt));
+                        repeats.push_back(p.literal(trim_whitespace(alt)));
+                    }
+                    opening = p.choice(firsts) + p.zero_or_more(p.space() + p.choice(repeats));
+                }
+            }
+            if (ctx.kimi_calls) {
+                // A complete Kimi-form call inside the reasoning ends it (the call is parsed after it); a Kimi opener
+                // that does not lead to a complete call is plain reasoning text, as before.
+                auto stops = ends;
+                stops.insert(stops.end(), ctx.kimi_openers.begin(), ctx.kimi_openers.end());
+                auto kimi_closers = closers;
+                kimi_closers.push_back(p.peek(*ctx.kimi_first));
+                auto kimi_body = p.reasoning(p.until_one_of(stops)) + p.choice(kimi_closers);
+                return p.optional(p.choice({ opening + kimi_body, opening + body }));
             }
             return p.optional(opening + body);
         }
@@ -222,7 +285,7 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
     // real tool-call syntax, parsed by analyze_tools instead, so this path never sees them (build_parser
     // only calls analyze_content::build_parser once tools are ruled out for this request).
     std::vector<std::string> ends = stray_ends;
-    if (!(ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty())) {
+    if (!request_uses_tools(ctx.inputs)) {
         ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
     }
 
@@ -344,6 +407,10 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
         auto close_peek = arguments.tolerate_intertag_whitespace
                               ? p.peek(p.space() + p.literal(format.per_call_end))
                               : p.peek(p.literal(format.per_call_end));
+        if (format.section_optional) {
+            close_peek = p.peek(p.space() + p.choice({ p.literal(format.per_call_end), p.literal(format.section_end),
+                                                        p.literal(format.per_call_start) }));
+        }
         func_parser = func_parser + p.tool_close(close_peek);
     } else {
         func_parser = func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
@@ -428,6 +495,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
+    const bool   parallel    = inputs.parallel_tool_calls || format.always_parallel;
 
     auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
 
@@ -462,11 +530,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
         // Build required arg sequence in definition order
         common_peg_parser args_seq = p.eps();
+        if (format.drop_tail) {
+            // K2-Horizon writes the arguments in whatever order it likes (`path` before the required `pattern`, seen
+            // live in Grafana F7): a strict required-first order made the whole call fail to parse and surface as `{`.
+            // Any order of any of the arguments; the client validates the required ones.
+            common_peg_parser any_arg = p.choice();
+            for (const auto & r : required_parsers) { any_arg |= r; }
+            for (const auto & o : optional_parsers) { any_arg |= o; }
+            args_seq = p.repeat(p.space() + any_arg, 0, -1);
+            optional_parsers.clear();
+        } else {
         for (size_t i = 0; i < required_parsers.size(); i++) {
             if (i > 0) {
                 args_seq = args_seq + p.space();
             }
             args_seq = args_seq + required_parsers[i];
+        }
         }
 
         // Build optional args with flexible ordering
@@ -511,16 +590,27 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     common_peg_parser tool_calls = p.eps();
 
     if (!format.per_call_start.empty()) {
-        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
-        if (inputs.parallel_tool_calls) {
+        // a block whose own end tag is missing still ends at the section end or at the next call
+        auto call_end = format.section_optional ?
+            p.choice({ p.literal(format.per_call_end), p.peek(p.literal(format.section_end)), p.peek(p.literal(format.per_call_start)) }) :
+            p.literal(format.per_call_end);
+        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + call_end;
+        if (parallel) {
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
         } else {
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
         }
         if (!format.section_start.empty()) {
-            tool_calls = p.trigger_rule("tool-calls",
-                                        p.literal(format.section_start) + p.space() + tool_calls + p.space() +
-                                            (format.section_end.empty() ? p.end() : p.literal(format.section_end) + p.space()));
+            if (format.section_optional) {
+                // a bare per-call block is a call too, and so is a section that is never closed
+                tool_calls = p.trigger_rule("tool-calls",
+                                            p.optional(p.literal(format.section_start) + p.space()) + tool_calls + p.space() +
+                                                p.optional(p.literal(format.section_end) + p.space()));
+            } else {
+                tool_calls = p.trigger_rule("tool-calls",
+                                            p.literal(format.section_start) + p.space() + tool_calls + p.space() +
+                                                (format.section_end.empty() ? p.end() : p.literal(format.section_end) + p.space()));
+            }
         }
     } else {
         std::string separator = ", ";  // Default
@@ -535,13 +625,92 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         }
     }
 
+    const auto tool_calls_native = tool_calls;
+    if (ctx.kimi_calls) {
+        // outside the trigger rule on purpose: the lazy grammar only ever constrains the native form
+        tool_calls = p.choice({ tool_calls, *ctx.kimi_calls });
+    }
+
+    const auto tool_calls_core = tool_calls;
     if (!require_tools) {
         tool_calls = p.optional(tool_calls);
     }
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+    if (format.drop_tail) {
+        // the content also ends at a bare call block, a Kimi-form call and the stray tags the model tacks on
+        // (a second reasoning close tag, ...)
+        std::vector<std::string> openers = { trigger_marker };
+        if (!format.per_call_start.empty()) {
+            openers.push_back(format.per_call_start);
+        }
+        openers.insert(openers.end(), ctx.kimi_openers.begin(), ctx.kimi_openers.end());
+        std::vector<std::string> stops = openers;
+        if (ctx.content) {
+            stops.insert(stops.end(), ctx.content->stray_ends.begin(), ctx.content->stray_ends.end());
+        }
+        // Whatever follows a call is dropped. Where no call is attempted, a stray tag and everything after it is
+        // dropped; a call that fails to parse is not dropped -- the parse fails and lenient-fallback keeps the text.
+        // stray tags before any content (a repeated close tag right after the reasoning) are skipped, not an end
+        std::vector<common_peg_parser> strays;
+        if (ctx.content) {
+            for (const auto & e : ctx.content->stray_ends) {
+                strays.push_back(p.literal(e));
+            }
+        }
+        auto lead = strays.empty() ? p.eps() : p.zero_or_more(p.space() + p.choice(strays));
+        std::vector<common_peg_parser> attempts;
+        for (const auto & o : openers) {
+            attempts.push_back(p.literal(o));
+        }
+        auto tail        = p.optional(p.rest());
+        auto tools_part  = tool_calls_core + tail;
+        if (!require_tools) {
+            tools_part = p.choice({ tools_part, p.negate(p.choice(attempts)) + tail });
+        }
+        if (!ctx.kimi_openers.empty()) {
+            // a Kimi opener that never became a call, followed by the native call
+            std::vector<std::string> native_openers = { trigger_marker };
+            if (!format.per_call_start.empty()) {
+                native_openers.push_back(format.per_call_start);
+            }
+            tools_part = p.choice({ tools_part, p.until_one_of(native_openers) + tool_calls_native + tail });
+        }
+        // a stray tag ends the content, but a call after it (a garbled restart that still calls) is a call
+        auto skip = p.optional(p.until_one_of(openers));
+        return ctx.reasoning_parser + lead + p.space() + p.optional(p.content(p.until_one_of(stops))) + skip + tools_part + p.end();
+    }
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+}
+
+common_peg_parser analyze_tools::build_kimi_calls(parser_build_context & ctx) const {
+    auto &       p      = ctx.p;
+    const auto & inputs = ctx.inputs;
+
+    // `<|tool_call_begin|>[functions.]name[:N][<|tool_call_argument_begin|>|<|sep|>]{json}<|tool_call_end|>`
+    common_peg_parser tool_choice = p.choice();
+    foreach_function(inputs.tools, [&](const json & tool) {
+        const auto & func   = tool.at("function");
+        std::string  name   = func.at("name");
+        const auto   schema = common_chat_tool_parameters(func);
+
+        auto open = p.tool_open(p.optional(p.literal("functions.")) + p.tool_name(p.literal(name)) +
+                                p.optional(p.literal(":") + p.chars("0-9", 1, -1)));
+        auto sep  = p.choice({ p.literal("<|tool_call_argument_begin|>"), p.literal("<|sep|>"), p.eps() });
+        auto args = p.tool_args(p.schema(p.json(), "kimi-tool-" + name + "-schema", schema));
+        tool_choice |= p.rule("kimi-tool-" + name,
+                              p.atomic(open + p.space() + sep + p.space() + args) + p.space() +
+                                  p.tool_close(p.literal("<|tool_call_end|>")));
+    });
+
+    auto call  = p.literal("<|tool_call_begin|>") + p.space() + tool_choice + p.space();
+    auto calls = p.one_or_more(call);
+    // only the first call is looked ahead at by the reasoning parser: waiting for the whole rest would stall it
+    ctx.kimi_first = p.choice({ p.literal("<|tool_calls_section_begin|>") + p.space() + call, call });
+    return p.choice({ p.literal("<|tool_calls_section_begin|>") + p.space() + calls +
+                          p.optional(p.literal("<|tool_calls_section_end|>") + p.space()),
+                      calls });
 }
 
 }  // namespace autoparser

@@ -25,6 +25,7 @@
 #include <map>
 
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1012,6 +1013,51 @@ static void map_developer_role_to_system(json & messages) {
 }
 
 
+// K2-Horizon: the template renders every past assistant turn's reasoning with the `ifm|think` tag family, whatever
+// the effort, while the generation prompt opens `ifm|think_fast` (medium) / `ifm|think_faster` (low). The model then
+// sees a tag it was not asked to open, and a junk reasoning (a Kimi tool-call opener, `<|close|>`, ...) replayed by
+// the client from a stalled turn primes the next turn to repeat it (opencode session ses_f16214d2: 25 of 26 replayed
+// reasonings junk, 10/40 replay samples opened a Kimi call; 0/40 with the tags matched). So render the history
+// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip the known K2/Kimi
+// markup tokens (`<|tool_call_begin|>`, `<|close|>`, ... never arbitrary `<|...`) and `<ifm|...>` tags from it, and drop assistant turns that are left with nothing at all (an empty
+// past turn teaches ending the turn right after the reasoning).
+static void k2_history_reasoning(json & messages, const std::string & effort) {
+    const char * field = effort == "low" ? "think_faster" : effort == "medium" ? "think_fast" : nullptr;
+    if (!field) {
+        return; // high: history tag == generation tag already
+    }
+    static const std::regex foreign(R"(<\|(?:tool_calls_section_begin|tool_calls_section_end|tool_call_begin|tool_call_end|tool_call_argument_begin|close|sep|open)(?![A-Za-z_])(?:\|>)?|</?ifm\|[a-z_]+>)");
+    json out = json::array();
+    for (auto & m : messages) {
+        if (!m.is_object() || m.value("role", "") != "assistant") {
+            out.push_back(std::move(m));
+            continue;
+        }
+        const bool has_content = m.contains("content") && m["content"].is_string() && !m["content"].get<std::string>().empty();
+        const bool has_calls   = m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty();
+        if (has_content && m["content"].get<std::string>().find("</ifm|think") != std::string::npos) {
+            out.push_back(std::move(m)); // reasoning is embedded in the content: the template splits it itself
+            continue;
+        }
+        std::string reasoning;
+        for (const char * key : { "reasoning_content", "reasoning" }) {
+            if (m.contains(key) && m[key].is_string()) {
+                reasoning = m[key].get<std::string>();
+                m.erase(key);
+            }
+        }
+        reasoning = std::regex_replace(reasoning, foreign, "");
+        const size_t b = reasoning.find_first_not_of(" \t\r\n");
+        reasoning = b == std::string::npos ? "" : reasoning.substr(b, reasoning.find_last_not_of(" \t\r\n") - b + 1);
+        if (reasoning.empty() && !has_content && !has_calls) {
+            continue;
+        }
+        m[field] = reasoning;
+        out.push_back(std::move(m));
+    }
+    messages = std::move(out);
+}
+
 // if first message is system and template does not support it, merge it with next message
 static void system_message_not_supported(json & messages) {
     if (!messages.empty() && messages.front().at("role") == "system") {
@@ -1293,6 +1339,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         params.extra_context[el.first] = json::parse(el.second);
     }
 
+    if (src.find("ifm|think_faster") != std::string::npos && src.find("ifm|think_fast") != std::string::npos) {
+        const auto e = params.extra_context.value("reasoning_effort", json("high"));
+        workaround::k2_history_reasoning(params.messages, e.is_string() ? e.get<std::string>() : "high");
+    }
+
     if (!inputs.json_schema.empty()) {
         params.json_schema = json::parse(inputs.json_schema);
     }
@@ -1468,6 +1519,20 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);
 
+    // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
+    auto lenient_fallback = [&]() {
+        common_chat_msg msg;
+        msg.role = "assistant";
+        common_peg_parse_context fctx(effective_input, flags);
+        auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
+        if (!fres.fail()) {
+            common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
+        } else {
+            msg.content = input;
+        }
+        return msg;
+    };
+
     if (result.fail()) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
@@ -1492,6 +1557,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             return msg;
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+        if (src_parser.has_rule("lenient-fallback")) {
+            return lenient_fallback();
+        }
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
     }
@@ -1508,6 +1576,20 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
     mapper->from_ast(ctx.ast, result);
+
+    if (src_parser.has_rule("lenient-fallback") && !msg.tool_calls.empty()) {
+        // K2-Horizon: a call is surfaced only once its arguments are complete JSON (the call block closed). A call cut
+        // off by EOG/max_tokens would otherwise run a tool with `{`; while streaming it also stays hidden until whole
+        // (the diffs only ever grow), at the end of generation the text falls back to reasoning/content.
+        const size_t n_calls = msg.tool_calls.size();
+        msg.tool_calls.erase(std::remove_if(msg.tool_calls.begin(), msg.tool_calls.end(),
+                                            [](const common_chat_tool_call & c) { return json::parse_no_throw(c.arguments).is_discarded(); }),
+                             msg.tool_calls.end());
+        if (!is_partial && msg.tool_calls.empty()) {
+            LOG_WRN("%s: dropped %zu tool call(s) with incomplete arguments\n", __func__, n_calls);
+            return lenient_fallback();
+        }
+    }
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());

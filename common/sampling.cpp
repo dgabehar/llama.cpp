@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <map>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -127,6 +128,14 @@ struct ring_buffer {
 // (EOG allowed), it never truncates a call.
 static const int k_hold_cap = 2048;
 
+// A Kimi-form call is short (harness, 117 complete Kimi calls: median 42, longest 115 tokens; native switch after the opener: p90 118, max 255 tokens) and the model
+// either rewrites it natively soon or is looping (live 2026-09-29: ~1500 tokens of the opener repeated), so the
+// Kimi hold gets its own small cap, and a repeated unfinished opener releases it at once.
+static const int k_kimi_hold_cap = 192;
+
+// A reasoning line repeated this many times in an open block is a loop: force the close tag.
+static const int k_rep_lines = 3;
+
 struct common_empty_reply_guard {
     const llama_vocab *      vocab;
     std::vector<llama_token> eog;
@@ -139,11 +148,29 @@ struct common_empty_reply_guard {
     std::string              tail;
     bool                     in_section = false;
     bool                     in_call    = false;
-    bool                     held       = false;  // armed: an opener was seen, the call was not completed
+    bool                     held       = false;  // armed: a native opener was seen, the call was not completed
+    bool                     kimi_held  = false;  // a Kimi opener was seen (not looping): hold, capped by k_kimi_hold_cap
+    bool                     kimi_loop  = false;  // the Kimi opener repeated unfinished: no more Kimi hold
+    int                      n_kimi     = 0;      // generated tokens since the Kimi hold started
     int                      n_held     = 0;      // generated tokens since the hold started
     bool                     n_open     = false;  // the native section opener itself was seen during this hold
     bool                     n_closed   = false;  // ... and its close
     std::vector<int>         depth;               // open inner tags per inner pair (only counted inside a section)
+    // armed: token ids of every tag except the section opener; masked while no native section is open (a call
+    // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
+    std::vector<llama_token> tag_ids;
+    // the generation starts inside an open reasoning block (tools offered): EOG stays masked until an inert close
+    // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
+    bool                     open_initial = false;
+    bool                     r_open       = false;
+    llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
+    int                      n_reason     = 0;
+    // repetition breaker for the open block: a line (16+ chars) written k_rep_lines times forces the close tag
+    std::string              line;
+    std::map<std::string, int> seen_lines;
+    bool                     force_close  = false;
+    // per token id: 1 = EOG, 2 = tag (built at init)
+    std::vector<uint8_t>     flags;
 };
 
 static const char * const k_kimi_markers[] = {
@@ -151,8 +178,8 @@ static const char * const k_kimi_markers[] = {
 };
 
 static void common_empty_reply_guard_release(common_empty_reply_guard * ctx) {
-    ctx->held = ctx->n_open = ctx->n_closed = false;
-    ctx->n_held = 0;
+    ctx->held = ctx->n_open = ctx->n_closed = ctx->kimi_held = ctx->kimi_loop = false;
+    ctx->n_held = ctx->n_kimi = 0;
     ctx->depth.assign(ctx->depth.size(), 0);
 }
 
@@ -179,10 +206,24 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
             break;
         }
         switch (which) {
-            case 0: ctx->in_section = true;  if (armed) { ctx->held = true; } break;
-            case 1: ctx->in_section = false; ctx->in_call = false; break;
-            case 2: ctx->in_call    = true;  if (armed) { ctx->held = true; } break;
-            case 3: ctx->in_call    = false; break;
+            case 0:
+            case 2: {
+                // the opener again while the first is unfinished: the model is looping, let it end
+                ctx->r_open = false; // a call was started: the call holds take over
+                const bool repeat = which == 0 ? ctx->in_section : ctx->in_call;
+                (which == 0 ? ctx->in_section : ctx->in_call) = true;
+                if (repeat) {
+                    ctx->kimi_held = false;
+                    ctx->kimi_loop = true;
+                    LOG_DBG("%s: empty-reply guard: Kimi opener repeated, releasing EOG\n", __func__);
+                } else if (!ctx->kimi_loop && !ctx->kimi_held && !ctx->n_open) {
+                    ctx->kimi_held = true;
+                    ctx->n_kimi    = 0;
+                }
+                break;
+            }
+            case 1: ctx->in_section = false; ctx->in_call = false; if (!armed) { ctx->kimi_held = false; } break;
+            case 3: ctx->in_call    = false; if (!armed && !ctx->in_section) { ctx->kimi_held = false; } break;
             default: {
                 const int  pair = (which - 4) / 2;
                 const bool open = (which - 4) % 2 == 0;
@@ -190,8 +231,10 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
                     if (!ctx->n_open) {
                         ctx->n_held = 0;
                     }
+                    ctx->r_open = false;
                     ctx->held = ctx->n_open = true;
                     ctx->n_closed = false;
+                    ctx->kimi_held = ctx->kimi_loop = false; // the model switched to its own format
                 } else if (pair == 0) {
                     // a close without its opener (seen live after a Kimi opener) closes nothing
                     ctx->n_closed = ctx->n_open;
@@ -214,14 +257,12 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
 }
 
 // true while EOG must stay masked (before the caller's "last candidate" check)
+static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx);
 static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx) {
     if (!ctx->seen_output) {
         return true;
     }
-    if (!ctx->hold.empty()) {
-        return ctx->held && ctx->n_held < k_hold_cap;
-    }
-    return ctx->in_section || ctx->in_call;
+    return (ctx->r_open && ctx->n_reason < k_hold_cap) || (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
 }
 
 static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
@@ -234,11 +275,37 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
         return;
     }
     if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
+        if (ctx->open_initial || ctx->r_open) {
+            const std::string tag = common_token_to_piece(ctx->vocab, token, true);
+            ctx->r_open = tag.compare(0, 2, "</") != 0; // a close tag ends the block, an open tag (re)opens one
+            ctx->n_reason = 0;
+            ctx->force_close = false;
+            ctx->line.clear();
+            ctx->seen_lines.clear();
+        }
         return;
+    }
+    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL) {
+        // the model writes its next step in the reasoning, then repeats it to max_tokens ("Let me check ..." x 100)
+        ctx->line += common_token_to_piece(ctx->vocab, token, false);
+        for (size_t nl; (nl = ctx->line.find('\n')) != std::string::npos; ctx->line.erase(0, nl + 1)) {
+            std::string l = ctx->line.substr(0, nl);
+            l.erase(0, l.find_first_not_of(" \t\r"));
+            if (l.size() >= 16 && ++ctx->seen_lines[l] >= k_rep_lines) {
+                ctx->force_close = true;
+                LOG_DBG("%s: empty-reply guard: a reasoning line repeated %d times, forcing the close tag\n", __func__, k_rep_lines);
+            }
+        }
+    }
+    if (ctx->r_open && ++ctx->n_reason == k_hold_cap) {
+        LOG_DBG("%s: empty-reply guard: %d tokens inside an unclosed reasoning block, releasing EOG\n", __func__, k_hold_cap);
     }
     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
     // the native markers are special tokens, which only render with special=true
     ctx->tail += ctx->hold.empty() ? piece : common_token_to_piece(ctx->vocab, token, true);
+    if (ctx->kimi_held && ++ctx->n_kimi == k_kimi_hold_cap) {
+        LOG_DBG("%s: empty-reply guard: %d tokens after a Kimi opener, releasing EOG\n", __func__, k_kimi_hold_cap);
+    }
     if (ctx->held && ++ctx->n_held == k_hold_cap) {
         LOG_DBG("%s: empty-reply guard: %d tokens inside an open tool call, releasing EOG\n", __func__, k_hold_cap);
     }
@@ -256,22 +323,66 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
 
 static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
-    if (!common_empty_reply_guard_holds(ctx)) {
-        return;
-    }
-    // never mask the last candidate standing
-    size_t n_other = 0;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) == ctx->eog.end() &&
-            cur_p->data[i].logit != -INFINITY) {
-            n_other++;
+    const bool mask_eog  = common_empty_reply_guard_holds(ctx);
+    const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
+    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL && (ctx->force_close || ctx->n_reason < k_hold_cap)) {
+        const auto find = [&](llama_token id) -> llama_token_data * {
+            if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
+                return &cur_p->data[id];
+            }
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == id) { return &cur_p->data[i]; }
+            }
+            return nullptr;
+        };
+        if (ctx->force_close) {
+            if (auto * c = find(ctx->close_id)) {
+                for (size_t i = 0; i < cur_p->size; ++i) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+                c->logit = 0.0f;
+                return;
+            }
+        }
+        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
+        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
+        float best = -INFINITY;
+        for (llama_token id : ctx->eog) {
+            if (const auto * d = find(id)) { best = std::max(best, d->logit); }
+        }
+        if (auto * c = find(ctx->close_id)) {
+            c->logit = std::max(c->logit, best);
         }
     }
-    if (n_other == 0) {
+    if (!mask_eog && !mask_tags) {
+        return;
+    }
+    // O(1) membership from a per-vocab flag table (built at init); was a std::find per candidate (~1.5 ms/token at 250k)
+    const uint8_t flag = (mask_eog ? 1 : 0) | (mask_tags ? 2 : 0);
+    const auto masked = [&](llama_token id) {
+        return id >= 0 && (size_t) id < ctx->flags.size() && (ctx->flags[id] & flag);
+    };
+    // never mask the last candidate standing: stop at the first other finite candidate
+    bool has_other = false;
+    for (size_t i = 0; i < cur_p->size && !has_other; ++i) {
+        has_other = cur_p->data[i].logit != -INFINITY && !masked(cur_p->data[i].id);
+    }
+    if (!has_other) {
+        return;
+    }
+    // full-vocab candidates in id order (the usual case): jump straight to the few masked ids
+    const auto direct = [&](const std::vector<llama_token> & ids, bool on) {
+        return !on || std::all_of(ids.begin(), ids.end(), [&](llama_token id) {
+            return id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id;
+        });
+    };
+    if (direct(ctx->eog, mask_eog) && direct(ctx->tag_ids, mask_tags)) {
+        for (llama_token id : ctx->eog)     { if (mask_eog)  { cur_p->data[id].logit = -INFINITY; } }
+        for (llama_token id : ctx->tag_ids) { if (mask_tags) { cur_p->data[id].logit = -INFINITY; } }
         return;
     }
     for (size_t i = 0; i < cur_p->size; ++i) {
-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) != ctx->eog.end()) {
+        if (masked(cur_p->data[i].id)) {
             cur_p->data[i].logit = -INFINITY;
         }
     }
@@ -282,6 +393,11 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
     ctx->seen_output = false;
     ctx->tail.clear();
     ctx->in_section = ctx->in_call = false;
+    ctx->r_open = ctx->open_initial;
+    ctx->n_reason = 0;
+    ctx->force_close = false;
+    ctx->line.clear();
+    ctx->seen_lines.clear();
     common_empty_reply_guard_release(ctx);
 }
 
@@ -311,15 +427,30 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
 }
 
-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, const std::string & reasoning_close) {
     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+    ctx->open_initial = ctx->r_open = !reasoning_close.empty() && !ctx->hold.empty();
+    if (ctx->open_initial) {
+        const auto toks = common_tokenize(vocab, reasoning_close, false, true);
+        ctx->close_id = toks.size() == 1 ? toks[0] : LLAMA_TOKEN_NULL;
+    }
     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
+    // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
+    for (size_t i = 1; i < ctx->hold.size(); ++i) {
+        const auto toks = common_tokenize(vocab, ctx->hold[i], false, true);
+        if (toks.size() == 1) {
+            ctx->tag_ids.push_back(toks[0]);
+        }
+    }
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     for (llama_token id = 0; id < n_vocab; ++id) {
         if (llama_vocab_is_eog(vocab, id)) {
             ctx->eog.push_back(id);
         }
     }
+    ctx->flags.assign(n_vocab, 0);
+    for (llama_token id : ctx->eog)     { ctx->flags[id] |= 1; }
+    for (llama_token id : ctx->tag_ids) { if (id >= 0 && id < n_vocab) { ctx->flags[id] |= 2; } }
     return llama_sampler_init(&common_empty_reply_guard_i, ctx);
 }
 
@@ -555,7 +686,7 @@ struct common_sampler * common_sampler_init(
     }
 
     if (params.no_empty_reply) {
-        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold);
+        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold, params.no_empty_reply_open);
     }
 
     if (params.mirostat == 0) {

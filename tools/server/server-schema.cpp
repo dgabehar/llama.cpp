@@ -540,6 +540,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("no_empty_reply_open"))
+        ->set_desc("Close tag of the reasoning block the prompt ends inside (tools offered): an end-of-generation token there is turned into this tag, capped. Set by the chat template handling")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & tag = data.at("no_empty_reply_open");
+            ctx.params.sampling.no_empty_reply_open = tag.is_string() ? tag.get<std::string>() : std::string();
+        }));
+
     add((new field_json("stop_after_reasoning"))
         ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
