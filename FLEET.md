@@ -638,6 +638,45 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
   report the RPC backend's intentionally never-freed registries as leaks.
   Run ctest under ASan with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`.
 
+## Truncated slot-save restore no longer aborts (D1, added 2026-10-06)
+
+Branch `upstream-sync-2026-10-d1` (one commit on `upstream-sync-2026-10`).
+Dawn QA defect D1: `/slots/<id>?action=restore` of a save file truncated by 1
+byte, 4096 bytes or half hit `GGML_ASSERT(nread <= state_size)` in
+`llama_context::state_seq_load_file` and killed llama-server (the file stays
+on disk, so a restart does not clear it; this fleet replicates saves between
+nodes, so a half-written copy is a real input). Reproduces on the old fleet
+build (state v3) and the 2026-10 sync (state v4); the fix is format-independent.
+
+Root cause: `llama_file::read_raw` deliberately tolerates reading past EOF
+(zero-fills, so model loading can read direct-I/O alignment padding).
+`llama_io_read_file` (the sequence-state file reader) inherited that, so a
+short file "read" fine, `nread` overran `state_size` and the assert fired. The
+in-memory reader (`llama_io_read_buffer`) already bounds-checks and throws.
+
+Fix (no on-disk format change, v3 and v4 files behave the same):
+- `src/llama-context.cpp`: `llama_io_read_file::read` / `read_tensor` throw
+  when the request exceeds the bytes left in the file (checked before the
+  `read_tensor` staging allocation, so a corrupt length cannot drive a huge
+  allocation). The existing catch in `llama_state_seq_load_file` turns it into
+  a return of 0, which the server reports as HTTP 400 "Unable to restore
+  slot: ...". `state_seq_read_data` now also `seq_rm`s the sequence when the
+  restore throws part-way, so a short read leaves no partial sequence (this
+  was visible on DeepSeek-V4, whose last-read component left cells behind).
+- `tools/server/server-context.cpp`: the SCKP checkpoint appendix reader
+  bounds a buffer length by the bytes left in the file instead of a fixed
+  16 GiB cap (a corrupt length of a few GiB could OOM a memory-limited pod).
+  A bad appendix is still just ignored (restore succeeds without
+  checkpoints, as before). The `.dft` companion is read whole by size and
+  already validated, so it needed no change.
+- Tests: `test-save-load-state` (case "file, truncated by 1 byte / 4096 bytes
+  / half" across all 129 arch models) and `test_slot_save.py::test_slot_restore_truncated_file`.
+  Both fail before the fix (abort) and pass after.
+
+Upstream check (b11445+11, `51ce9c11a`, 2026-10-06): no fix or open PR for the
+truncated-file assert (related but different: #27530 merged, #29723/#29700
+closed). Would be offered upstream as a PR; not opened.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **gpt-oss-20b writes `<|channel|>commentary (analysis)<|message|>`** (2026-09-26):

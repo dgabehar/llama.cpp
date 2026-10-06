@@ -2732,8 +2732,14 @@ private:
 
     static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t & n_read) {
         uint64_t n = 0;
-        // 16 GiB cap, in case the size field itself is corrupted
-        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > (1ull << 34)) {
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read)) {
+            return false;
+        }
+        // a corrupted size field must not drive a huge allocation: it can't exceed what is left in the file
+        const std::streamoff pos = ifs.tellg();
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff end = ifs.tellg();
+        if (pos < 0 || end < pos || !ifs.seekg(pos) || n > (uint64_t) (end - pos)) {
             return false;
         }
         buf.resize(n);

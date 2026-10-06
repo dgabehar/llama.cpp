@@ -661,6 +661,47 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
         return false;
     }
 
+    // save a state file, mutate its bytes, and try to restore it
+    const auto restore_file = [&](const std::function<bool(std::vector<uint8_t> &)> & mutate) {
+        GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
+        llama_memory_seq_rm(mem, 0, -1, -1);
+
+        std::vector<uint8_t> data;
+        {
+            std::ifstream f(path, std::ios::binary);
+            data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+
+        if (!mutate(data)) {
+            std::remove(path.c_str());
+            return false;
+        }
+
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write((const char *) data.data(), data.size());
+        }
+
+        llama_tokens tokens_out(tokens_save.size());
+        size_t n_token_count = 0;
+        const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
+        std::remove(path.c_str());
+
+        return nread == 0;
+    };
+
+    // a truncated (e.g. half-written) file must fail to restore, not abort
+    const auto truncate = [](size_t n_cut, bool half) {
+        return [n_cut, half](std::vector<uint8_t> & data) {
+            const size_t cut = half ? data.size()/2 : n_cut;
+            if (data.size() < 3*4096 || cut >= data.size()) {
+                return false;
+            }
+            data.resize(data.size() - cut);
+            return true;
+        };
+    };
+
     const std::vector<std::pair<const char *, std::function<bool()>>> cases = {
         { "buffer", [&]() {
             std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
@@ -673,33 +714,10 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
 
             return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
         }},
-        { "file", [&]() {
-            GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
-            llama_memory_seq_rm(mem, 0, -1, -1);
-
-            std::vector<uint8_t> data;
-            {
-                std::ifstream f(path, std::ios::binary);
-                data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-            }
-
-            if (!corrupt_state(data)) {
-                std::remove(path.c_str());
-                return false;
-            }
-
-            {
-                std::ofstream f(path, std::ios::binary);
-                f.write((const char *) data.data(), data.size());
-            }
-
-            llama_tokens tokens_out(tokens_save.size());
-            size_t n_token_count = 0;
-            const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
-            std::remove(path.c_str());
-
-            return nread == 0;
-        }},
+        { "file", [&]() { return restore_file(corrupt_state); }},
+        { "file, truncated by 1 byte",    [&]() { return restore_file(truncate(1,    false)); }},
+        { "file, truncated by 4096 bytes", [&]() { return restore_file(truncate(4096, false)); }},
+        { "file, truncated by half",      [&]() { return restore_file(truncate(0,    true));  }},
     };
 
     for (const auto & [name, restore_failed] : cases) {

@@ -132,6 +132,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0098 | `71e17322d` | K2 parser: accept the tool arguments in any order |
 | 0099 | `640423072` | K2 guard: turn an end of turn inside an unclosed reasoning block into the block's close tag |
 | 0100 | `5074d0df4` | K2 guard: repetition breaker for an open reasoning block |
+| 0101 | this commit | llama: truncated slot-save file fails the restore instead of aborting (bounded sequence-state file reader, SCKP buffer bound) |
 
 0030-0032 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
 (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there). They fix an MSVC `std::regex`
@@ -166,7 +167,7 @@ split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
 This mirror was rebuilt from scratch on 2026-10-06 for the upstream sync
-(100 patches; 3 earlier patches were dropped, see FLEET.md "Upstream sync
+(101 patches; 3 earlier patches were dropped, see FLEET.md "Upstream sync
 2026-10"). Patch numbers changed; refer to patches by subject.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
