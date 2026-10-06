@@ -131,6 +131,47 @@ def test_slot_restore_legacy_token_list():
 
 
 
+@pytest.mark.parametrize("n_cut", [1, 4096, None])  # None: cut the file in half
+def test_slot_restore_truncated_file(n_cut):
+    # a truncated (e.g. half-written) save file must be rejected with an error, never abort the server
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot_full.bin",
+    })
+    assert res.status_code == 200
+
+    path = os.path.join(server.slot_save_path, "slot_full.bin")
+    with open(path, "rb") as f:
+        data = f.read()
+    cut = len(data) // 2 if n_cut is None else n_cut
+    with open(os.path.join(server.slot_save_path, "slot_cut.bin"), "wb") as f:
+        f.write(data[:len(data) - cut])
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "slot_cut.bin",
+    })
+    assert res.status_code == 400
+    assert "Unable to restore slot" in res.body["error"]["message"]
+
+    # the server is still alive and the slot is usable
+    assert server.process.poll() is None
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+
 def test_slot_erase():
     global server
     server.start()

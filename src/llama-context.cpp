@@ -3027,11 +3027,14 @@ public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
     void read(void * dst, size_t size) override {
+        check_remaining(size);
         file->read_raw(dst, size);
         size_read += size;
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        // check before allocating: a corrupt size field must not trigger a huge allocation
+        check_remaining(size);
         temp_buffer.resize(size);
         read(temp_buffer.data(), size);
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
@@ -3042,6 +3045,14 @@ public:
     }
 
 private:
+    // llama_file::read_raw() tolerates reading past the end of the file (it zero-fills, to allow for
+    // direct I/O alignment padding), so a truncated state file would otherwise be read "successfully"
+    void check_remaining(size_t size) const {
+        if (size > file->size() - file->tell()) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+    }
+
     llama_file * file;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
@@ -4009,7 +4020,15 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        try {
+            memory->state_read(io, seq_id, flags);
+        } catch (...) {
+            // a short read (truncated state) throws in the middle of the restore: don't leave a partial sequence behind
+            if (seq_id >= 0) {
+                memory->seq_rm(seq_id, -1, -1);
+            }
+            throw;
+        }
     }
 
     return io.n_bytes();
