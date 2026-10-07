@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "log.h"
 
+#include <random>
 #include <algorithm>
 #include <exception>
 #include <fstream>
@@ -5184,6 +5185,535 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // The fork's K2-Horizon behaviours (FLEET.md), against the template the fleet GGUFs embed (k2-horizon.jinja, a
+    // fixture) and against IFM's newer upstream template: the parser must serve both.
+    for (const char * k2_template : { "models/templates/k2-horizon.jinja", "models/templates/IFM-K2-Horizon.jinja" }) {
+        // K2-Horizon: reasoning tags depend on reasoning_effort; at "low" the model may close
+        // its thinking with any of the three effort tags
+        {
+            auto tst = peg_tester(k2_template, detailed_debug);
+
+            for (const char * close : { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" }) {
+                tst.test(std::string("3:40 + 2:55 = 6:35.") + close + "6:35 PM.")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .expect_reasoning("3:40 + 2:55 = 6:35.")
+                    .expect_content("6:35 PM.")
+                    .run();
+            }
+
+            // a second close tag after the answer: the garbled restart after it is dropped
+            tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Repeat it.")
+                .expect_content("git.example.com")
+                .run();
+
+            // No tools offered, but the model hallucinates tool-call markup after its answer
+            // (seen live, Dawn QA round 7, 2026-09-25): the answer text before the markup is
+            // kept, and the markup itself is dropped like a stray reasoning close tag.
+            tst.test("Reasoning here.</ifm|think_faster>Sure, the address is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Reasoning here.")
+                .expect_content("Sure, the address is git.example.co")
+                .run();
+
+            // Same stray tool-call markup, but content starts after a real reasoning block.
+            tst.test("3:40 + 2:55 = 6:35.</ifm|think_faster>6:35 PM.</ifm|tool_call></ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("3:40 + 2:55 = 6:35.")
+                .expect_content("6:35 PM.")
+                .run();
+
+            // Same markup, but tools ARE offered this time: it's real tool-call syntax now, not a
+            // stray leak, and must still parse as a tool call rather than getting cut from content.
+            tst.test("Let me look that up.</ifm|think_faster>"
+                     "<ifm|tool_calls>\n<ifm|tool_call>special_function\n"
+                     "<ifm|arg_key>arg1</ifm|arg_key>\n<ifm|arg_value>1</ifm|arg_value>\n"
+                     "</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ special_function_tool })
+                .expect_reasoning("Let me look that up.")
+                .expect_tool_calls({
+                    { "special_function", R"({"arg1":1})", "" },
+                })
+                .run();
+
+            // Plain answer, no reasoning close-tag repeat, no tool markup, no tools offered:
+            // unaffected by either stray_ends list.
+            tst.test("Thinking.</ifm|think_faster>The sky is blue.")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Thinking.")
+                .expect_content("The sky is blue.")
+                .run();
+
+            // Empty reasoning block (low effort closes immediately), then a formatting newline
+            // before the real answer (seen live, 2026-09-25): the newline must not leak into
+            // content, and the whitespace-only reasoning block reports no reasoning_content.
+            tst.test("</ifm|think_faster>\nbuild-cache-07.example.net")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("")
+                .expect_content("build-cache-07.example.net")
+                .run();
+
+            // Empty reasoning block, then the model's own ": " prefix (real text, not
+            // formatting whitespace) -- must be preserved verbatim at the start of content.
+            tst.test("</ifm|think_faster>: build-cache-07.example.net")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("")
+                .expect_content(": build-cache-07.example.net")
+                .run();
+
+            // Non-empty reasoning followed by a double newline before the answer: same
+            // whitespace-drop applies regardless of whether the reasoning body was empty.
+            tst.test("Reasoning text.</ifm|think_faster>\n\nAnswer text.")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Reasoning text.")
+                .expect_content("Answer text.")
+                .run();
+
+            // ---- IFM's official K2-Horizon-7B Q4_K_M weights (fleet, 2026-09-26). The raw texts below are
+            // real model output (opencode session "Hello Horizon K2 Test" and a local llama-server run of the
+            // same weights with an opencode-shaped request), after the "<ifm|think_faster>\n" generation prompt.
+            static common_chat_tool bash_tool{
+                /* .name = */ "bash",
+                /* .description = */ "Executes a bash command",
+                /* .parameters = */ R"({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The command to run" }
+                    },
+                    "required": ["command"]
+                })",
+            };
+
+            // 1. The model starts the tool call while still "thinking", without any close tag
+            //    (msg_0df03c9b0001QF0KWHl3gi5liJ: finish=stop, 0 output tokens, the whole call sat in
+            //    reasoning_content and the client ended the turn). With tools offered the tool-call start
+            //    ends the reasoning.
+            {
+                const std::string cmd =
+                    "for d in /home/dgabehar/src/*/deploy /home/dgabehar/src/*/k8s /home/dgabehar/src/*/manifests; do\n"
+                    "  if [ -d \"$d\" ] && ls \"$d\" 2>/dev/null | grep -q deployment; then\n"
+                    "    echo \"=== $d\"; ls \"$d\"; echo;\n"
+                    "  fi\n"
+                    "done";
+                tst.test("\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>" + cmd +
+                         "</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ bash_tool })
+                    .expect_reasoning("")
+                    .expect_tool_calls({
+                        { "bash", json{{ "command", cmd }}.dump(), "" },
+                    })
+                    .run();
+            }
+            tst.test("<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                     "<ifm|arg_value>find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40</ifm|arg_value>\n"
+                     "</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ bash_tool })
+                .expect_reasoning("")
+                .expect_tool_calls({
+                    { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40"})", "" },
+                })
+                .run();
+
+            // ... but real thinking before the tool-call start stays reasoning
+            tst.test("The glob matched nothing, retry with find.<ifm|tool_calls>\n<ifm|tool_call>bash\n"
+                     "<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ bash_tool })
+                .expect_reasoning("The glob matched nothing, retry with find.")
+                .expect_tool_calls({
+                    { "bash", R"({"command":"ls"})", "" },
+                })
+                .run();
+
+            // 2. The model repeats the reasoning open tag as its first output, though the template already
+            //    opened it (msg_0df04eb43001Wt7NMifUGZD7Wf and 11 more turns: reasoning_content was the
+            //    literal "<ifm|think>"). The redundant open tag is consumed, whichever variant it is.
+            tst.test("<ifm|think>\n</ifm|think><ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                     "<ifm|arg_value>find /home/dgabehar/src -maxdepth 3 -name \"deployment*.yaml\" 2>/dev/null | head -30</ifm|arg_value>\n"
+                     "</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ bash_tool })
+                .expect_reasoning("")
+                .expect_tool_calls({
+                    { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 3 -name \"deployment*.yaml\" 2>/dev/null | head -30"})", "" },
+                })
+                .run();
+
+            // (msg_0df04a1c7001gmFPCxqyUtTVHs: the repeated open tag, then an answer)
+            tst.test("<ifm|think>\n</ifm|think>I ran a glob over `~/src/*/manifests` and the shell errored out.\n\nLet me redo it.")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("")
+                .expect_content("I ran a glob over `~/src/*/manifests` and the shell errored out.\n\nLet me redo it.")
+                .run();
+
+            for (const char * open : { "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>" }) {
+                tst.test(std::string(open) + "\nCount the files first.\n</ifm|think_faster>\nThere are 3.")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .expect_reasoning("Count the files first.")
+                    .expect_content("There are 3.")
+                    .run();
+            }
+
+            // 3. A short real reply (msg_0df014f90001frJ9TjWhIERdfc, 8 output tokens) is untouched.
+            tst.test("</ifm|think_faster>Hello!")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ bash_tool })
+                .expect_reasoning("")
+                .expect_content("Hello!")
+                .run();
+        }
+
+        // K2-Horizon parser gaps found by Dawn QA (2026-09-29): every reasoning_effort, a bare call block, a Kimi-form
+        // call, stray tags with tools offered, a call nobody asked for, and output that fits no shape.
+        {
+            auto tst = peg_tester(k2_template, detailed_debug);
+
+            static common_chat_tool k2_bash_tool{
+                /* .name = */ "bash",
+                /* .description = */ "Executes a bash command",
+                /* .parameters = */ R"({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                })",
+            };
+            const std::string call_ls =
+                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n"
+                "</ifm|tool_call>\n</ifm|tool_calls>";
+            const common_chat_tool_call ls_call{ "bash", R"({"command":"ls"})", "" };
+
+            // 1. medium/high open <ifm|think_fast> / <ifm|think>: the reasoning is parsed and either close tag ends it
+            for (const char * effort : { "\"medium\"", "\"high\"" }) {
+                for (const char * close : { "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>" }) {
+                    for (bool with_tools : { false, true }) {
+                        auto t = tst.test(std::string("Count the files first.") + close + "\nThere are 3.")
+                                     .chat_template_kwargs({ { "reasoning_effort", effort } })
+                                     .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                                     .expect_reasoning("Count the files first.")
+                                     .expect_content("There are 3.");
+                        if (with_tools) {
+                            t.tools({ k2_bash_tool });
+                        }
+                        t.run();
+                    }
+                }
+                tst.test(std::string("Need a listing.</ifm|think>\n") + call_ls)
+                    .chat_template_kwargs({ { "reasoning_effort", effort } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_reasoning("Need a listing.")
+                    .expect_tool_calls({ ls_call })
+                    .run();
+                // the model repeats the open tag as its first output, or never closes before the call
+                tst.test(std::string("<ifm|think>\nNeed a listing.\n") + call_ls)
+                    .chat_template_kwargs({ { "reasoning_effort", effort } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_reasoning("Need a listing.")
+                    .expect_tool_calls({ ls_call })
+                    .run();
+            }
+            // the default effort is high
+            tst.test("Reasoning.</ifm|think>\nAnswer.")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("Reasoning.")
+                .expect_content("Answer.")
+                .run();
+
+            // 2. a bare <ifm|tool_call> block (no <ifm|tool_calls> opener) is a tool call
+            const std::string bare =
+                "<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>";
+            for (const char * effort : { "\"low\"", "\"medium\"", "\"high\"" }) {
+                const char * close = std::string(effort) == "\"low\"" ? "</ifm|think_faster>" : "</ifm|think>";
+                tst.test(std::string("\n") + bare)
+                    .chat_template_kwargs({ { "reasoning_effort", effort } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_tool_calls({ ls_call })
+                    .run();
+                tst.test(std::string(close) + "\n" + bare)
+                    .chat_template_kwargs({ { "reasoning_effort", effort } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_tool_calls({ ls_call })
+                    .run();
+                tst.test(std::string("Let me check.\n") + bare)
+                    .chat_template_kwargs({ { "reasoning_effort", effort } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_reasoning("Let me check.")
+                    .expect_tool_calls({ ls_call })
+                    .run();
+            }
+            tst.test(std::string("Checking.</ifm|think_faster>I will list it.\n") + bare)
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("Checking.")
+                .expect_content("I will list it.")
+                .expect_tool_calls({ ls_call })
+                .run();
+            // the call block's own end tag missing: the section end (or the next call) ends it
+            tst.test("</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                     "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ k2_bash_tool })
+                .expect_tool_calls({ ls_call })
+                .run();
+
+            // several calls in one turn are all parsed, whatever parallel_tool_calls says
+            for (bool parallel : { false, true }) {
+                tst.test(std::string("</ifm|think_faster>\n<ifm|tool_calls>\n") + bare.substr(0) + "\n" + bare + "\n</ifm|tool_calls>")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .parallel_tool_calls(parallel)
+                    .tools({ k2_bash_tool })
+                    .expect_tool_calls({ ls_call, ls_call })
+                    .run();
+            }
+
+            // 4. a stray reasoning close tag / harmony delimiter after the answer is dropped with tools offered too
+            tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("Repeat it.")
+                .expect_content("git.example.com")
+                .run();
+            for (const char * junk : { "<|close|>", "<|close|>argument<|sep|>", "<|sep|>" }) {
+                tst.test(std::string("Reasoning.</ifm|think_faster>\nThe answer.") + junk)
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_reasoning("Reasoning.")
+                    .expect_content("The answer.")
+                    .run();
+            }
+            tst.test("</ifm|think_faster>\n<|close|>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("")
+                .expect_content("")
+                .run();
+
+            // 5. a full call nobody can take (no tools, or tool_choice none) is not content and not a call
+            tst.test(std::string("Reasoning.</ifm|think_faster>\n") + call_ls)
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_reasoning("Reasoning.")
+                .expect_content("")
+                .run();
+            tst.test(std::string("Reasoning.</ifm|think_faster>\nSure. ") + call_ls)
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("Reasoning.")
+                .expect_content("Sure.")
+                .run();
+            tst.test("Reasoning here.</ifm|think_faster>Sure, it is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ k2_bash_tool })
+                .expect_reasoning("Reasoning here.")
+                .expect_content("Sure, it is git.example.co")
+                .run();
+        }
+
+        // K2-Horizon: a call in the Kimi form (`<|tool_call_begin|>...`) and parse failures. The lazy grammar only
+        // ever triggers on the native form, so these cannot go through peg_tester (it insists on a trigger).
+        {
+            common_chat_templates_ptr tmpls = read_templates(k2_template);
+            common_chat_tool bash{ "bash", "Executes a bash command",
+                                   R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+            common_chat_tool grep{ "grep", "Searches file contents",
+                                   R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})" };
+            auto make = [&](const char * effort, bool with_tools, common_chat_tool_choice choice = COMMON_CHAT_TOOL_CHOICE_AUTO,
+                            bool parallel = false) {
+                common_chat_templates_inputs in;
+                in.messages              = { message_user };
+                in.add_generation_prompt = true;
+                in.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+                in.tool_choice           = choice;
+                in.parallel_tool_calls   = parallel;
+                in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+                if (with_tools) {
+                    in.tools = { bash, grep };
+                }
+                return make_peg_parser(tmpls.get(), in);
+            };
+            auto trim_ws = [](const std::string & v) {
+                const size_t b = v.find_first_not_of(" \n");
+                return b == std::string::npos ? std::string() : v.substr(b, v.find_last_not_of(" \n") + 1 - b);
+            };
+            // parse every prefix as a stream would (the diffs must stay valid), then the whole text
+            auto stream_parse = [](const make_peg_parser & parser, const std::string & text) {
+                common_chat_msg prev;
+                prev.role = "assistant";
+                for (size_t i = 1; i < text.size(); ++i) {
+                    common_chat_msg cur = parser.parse(text.substr(0, i), true);
+                    common_chat_msg_diff::compute_diffs(prev, cur);
+                    prev = cur;
+                }
+                common_chat_msg whole = parser.parse(text, false);
+                common_chat_msg_diff::compute_diffs(prev, whole);
+                return whole;
+            };
+
+            const std::vector<std::string> kimi = {
+                R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|><|tool_calls_section_end|>)",
+                R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0{"command":"ls"}<|tool_call_end|><|tool_calls_section_end|>)",
+                R"(<|tool_calls_section_begin|><|tool_call_begin|>bash<|sep|>{"command":"ls"}<|tool_call_end|>)",
+                R"(<|tool_call_begin|>functions.bash:1<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>)",
+            };
+            for (const char * effort : { "low", "high" }) {
+                auto parser = make(effort, true);
+                for (const auto & call : kimi) {
+                    // complete call while still "thinking": surfaced, never swallowed by the reasoning
+                    auto m = stream_parse(parser, "Let me look.\n" + call);
+                    assert_equals((size_t) 1, m.tool_calls.size());
+                    assert_equals(std::string("bash"), m.tool_calls[0].name);
+                    assert_equals(std::string(R"({"command":"ls"})"), m.tool_calls[0].arguments);
+                    assert_equals(std::string("Let me look."), trim_ws(m.reasoning_content));
+                    assert_equals(std::string(""), m.content);
+                    // ... and after the reasoning is closed
+                    const char * close = std::string(effort) == "low" ? "</ifm|think_faster>" : "</ifm|think>";
+                    m = stream_parse(parser, std::string("Let me look.") + close + "\n" + call);
+                    assert_equals((size_t) 1, m.tool_calls.size());
+                    assert_equals(std::string(R"({"command":"ls"})"), m.tool_calls[0].arguments);
+                    assert_equals(std::string("Let me look."), trim_ws(m.reasoning_content));
+                    assert_equals(std::string(""), m.content);
+                }
+                // an opener that never becomes a call, then the native rewrite (seen live)
+                auto m = stream_parse(parser, std::string("Checking.\n<|tool_calls_section_begin|><|tool_call_begin|>\n") +
+                                                  (std::string(effort) == "low" ? "</ifm|think_faster>\n" : "</ifm|think>\n") +
+                                                  "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                                                  "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>");
+                assert_equals((size_t) 1, m.tool_calls.size());
+                assert_equals(std::string(""), m.content);
+            }
+            // text after the last call (EOG text the model spells out) is dropped
+            {
+                auto m = make("low", true).parse(
+                    "</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                    "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>trailing", false);
+                assert_equals((size_t) 1, m.tool_calls.size());
+                assert_equals(std::string(""), m.content);
+            }
+            // no tools: the Kimi call is not a call and not content
+            {
+                auto m = stream_parse(make("low", false), "Thinking.</ifm|think_faster>\n" + kimi[0]);
+                assert_equals((size_t) 0, m.tool_calls.size());
+                assert_equals(std::string(""), m.content);
+            }
+
+            // 6a. a call that does not parse (here: the json call format, which the parser does not know) is neither
+            // thrown on nor dropped: the reasoning stays reasoning, the text of the call is handed back as content
+            {
+                auto m = make("low", true).parse(
+                    "Thinking.</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>{\"name\":\"bash\"}</ifm|tool_call>\n</ifm|tool_calls>", false);
+                assert_equals((size_t) 0, m.tool_calls.size());
+                assert_equals(std::string("Thinking."), trim_ws(m.reasoning_content));
+                assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
+            }
+
+            // 6a''. arguments in a different order than the schema's (optional before the required one, seen live in Grafana
+            // F7, where the call surfaced as `{`) are still one whole call
+            {
+                const std::vector<std::pair<std::string, std::string>> variants = {
+                    { "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n", R"({"pattern":"Info"})" },
+                    { "<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n",
+                      R"({"path":"/x","pattern":"Info"})" },
+                    { "<ifm|arg_key>include</ifm|arg_key>\n<ifm|arg_value>*.yaml</ifm|arg_value>\n<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n"
+                      "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info|Watchdog</ifm|arg_value>\n",
+                      R"({"include":"*.yaml","path":"/x","pattern":"Info|Watchdog"})" },
+                };
+                for (const auto & v : variants) {
+                    auto m = stream_parse(make("low", true), "Ok.<ifm|tool_calls>\n<ifm|tool_call>grep\n" + v.first + "</ifm|tool_call>\n</ifm|tool_calls>");
+                    assert_equals((size_t) 1, m.tool_calls.size());
+                    assert_equals(v.second, m.tool_calls[0].arguments);
+                }
+            }
+
+            // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
+            // generation (it would run a tool with `{`); a complete one is
+            for (const char * effort : { "low", "high" }) {
+                const std::string close = std::string(effort) == "low" ? "</ifm|think_faster>" : "</ifm|think>";
+                const std::vector<std::string> cut = {
+                    R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{)",
+                    R"(<|tool_call_begin|>bash<|sep|>{"command":"l)",
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls",
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>",
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>",
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n{",
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash",
+                };
+                for (const auto & c : cut) {
+                    for (const auto & pre : { std::string("Thinking."), "Thinking." + close + "Ok.\n" }) {
+                        auto m = stream_parse(make(effort, true), pre + c); // also: the streamed diffs stay valid
+                        assert_equals((size_t) 0, m.tool_calls.size());
+                        assert_equals(true, !trim_ws(m.reasoning_content + m.content).empty());
+                    }
+                }
+            }
+
+            // 6b. the parser never throws: whatever the model emits parses to something (fuzz, fixed seed)
+            const std::vector<std::string> pieces = {
+                "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>",
+                "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>", "</ifm|tool_call>", "<ifm|arg_key>", "</ifm|arg_key>",
+                "<ifm|arg_value>", "</ifm|arg_value>", "<|tool_calls_section_begin|>", "<|tool_call_begin|>", "<|tool_call_end|>",
+                "<|tool_calls_section_end|>", "<|tool_call_argument_begin|>", "<|close|>", "<|sep|>", "<|open|>", "<|ifm|im_end|>",
+                "bash", "command", "ls", "\n", " ", "{\"command\":\"ls\"}", "{", "}", "\"", "Answer.", "\xc3\xa9", "<", "|", "functions.bash:0",
+            };
+            std::mt19937 rng(20260929);
+            size_t       parsed = 0;
+            for (const char * effort : { "low", "medium", "high" }) {
+                for (int variant = 0; variant < 4; ++variant) {
+                    auto parser = make(effort, variant != 0, variant == 3 ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO,
+                                       variant == 2);
+                    for (int n = 0; n < 1500; ++n) {
+                        std::string text;
+                        for (size_t k = rng() % 12; k > 0; --k) {
+                            text += pieces[rng() % pieces.size()];
+                        }
+                        try {
+                            parser.parse(text, false);
+                            parser.parse(text, true);
+                            ++parsed;
+                        } catch (const std::exception & e) {
+                            throw std::runtime_error(std::string("K2 parser threw (") + e.what() + ") on: " + text);
+                        }
+                    }
+                }
+            }
+            assert_equals((size_t) 18000, parsed);
+        }
+    }
+
     // Kimi-K2-Thinking tests - custom parser
     // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
     {
@@ -7583,6 +8113,130 @@ static void test_developer_role_to_system_workaround() {
     }
 }
 
+// K2-Horizon history reasoning: rendered with the generation tag, foreign markup stripped, empty turns dropped.
+// The junk is real replayed reasoning (opencode session ses_f16214d2affecU4s4Zjhfkh9hS, 2026-09-29).
+static void test_k2_history_reasoning() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
+
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "check the version";
+    common_chat_msg junk_call;
+    junk_call.role = "assistant";
+    junk_call.reasoning_content = "\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n<|tool_calls_section_begin|><|tool_call_begin|>";
+    junk_call.tool_calls.push_back({ "bash", R"({"command":"ls"})", "call1" });
+    common_chat_msg result;
+    result.role = "tool";
+    result.content = "a.txt";
+    result.tool_call_id = "call1";
+    common_chat_msg empty_turn;                 // a stalled turn: nothing at all
+    empty_turn.role = "assistant";
+    empty_turn.reasoning_content = "\n<|close|>";
+    common_chat_msg partial;                    // a truncated marker
+    partial.role = "assistant";
+    partial.reasoning_content = "\n<|tool_call_begin\n";
+    partial.content = "Done.";
+    common_chat_msg real;
+    real.role = "assistant";
+    real.reasoning_content = "Check the file. p <|> q, <|x|> and <|cl|>.";
+    real.content = "Looks fine.";
+
+    common_chat_tool bash{ "bash", "Executes a bash command",
+                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+    for (const char * effort : { "low", "medium" }) {
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user, junk_call, result, empty_turn, partial, real, user };
+        inputs.tools                 = { bash };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+        const std::string tag = std::string("ifm|think_") + (std::string(effort) == "low" ? "faster" : "fast");
+        const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        assert_contains(prompt, "<" + tag + ">\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</" + tag + ">\nLooks fine.");
+        if (prompt.find("<ifm|think>") != std::string::npos || prompt.find("</ifm|think>") != std::string::npos) {
+            throw std::runtime_error("K2 history still rendered with the high-effort tag at effort " + std::string(effort));
+        }
+        for (const char * bad : { "<|tool_call", "<|close" }) {
+            if (prompt.find(bad) != std::string::npos) {
+                throw std::runtime_error(std::string("K2 history kept foreign markup ") + bad);
+            }
+        }
+        // the emptied stalled turn is gone: 3 assistant turns from the history + the generation prompt
+        size_t n = 0;
+        for (size_t p = prompt.find("<|ifm|im_start|>assistant"); p != std::string::npos; p = prompt.find("<|ifm|im_start|>assistant", p + 1)) {
+            n++;
+        }
+        if (n != 4) {
+            throw std::runtime_error("K2 history: expected 4 assistant turns, got " + std::to_string(n));
+        }
+    }
+    // high effort: history tag and generation tag are both ifm|think, nothing is rewritten
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user, real, user };
+        inputs.add_generation_prompt = true;
+        inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
+        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</ifm|think>\nLooks fine.");
+    }
+    LOG_ERR("%s passed\n", __func__);
+}
+
+// K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
+// compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
+// pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
+static void test_k2_guard_fields() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "hi";
+    common_chat_tool bash{ "bash", "Executes a bash command",
+                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+
+    for (const char * effort : { "low", "medium", "high" }) {
+        const std::string tag = std::string("ifm|think") + (std::string(effort) == "low" ? "_faster" : std::string(effort) == "medium" ? "_fast" : "");
+        for (bool with_tools : { false, true }) {
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { user };
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+            inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+            if (with_tools) {
+                inputs.tools = { bash };
+            }
+            const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            const std::string what = std::string("K2 guard fields, effort ") + effort + (with_tools ? " with tools" : " without tools");
+            if (params.no_empty_reply_inert.size() != 6) {
+                throw std::runtime_error(what + ": no_empty_reply_inert not filled (the guard is disarmed)");
+            }
+            if (params.stops_after_reasoning.empty()) {
+                throw std::runtime_error(what + ": stops_after_reasoning not filled");
+            }
+            if (with_tools) {
+                if (params.no_empty_reply_hold.size() != 10) {
+                    throw std::runtime_error(what + ": no_empty_reply_hold not filled");
+                }
+                assert_equals(std::string("</") + tag + ">", params.no_empty_reply_open);
+            } else if (!params.no_empty_reply_hold.empty() || !params.no_empty_reply_open.empty()) {
+                throw std::runtime_error(what + ": hold/open set without tools");
+            }
+        }
+    }
+    // reasoning_format none: raw text, nothing for the guard to track
+    {
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user };
+        inputs.add_generation_prompt = true;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_NONE;
+        const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        if (!params.no_empty_reply_inert.empty() || !params.stops_after_reasoning.empty()) {
+            throw std::runtime_error("K2 guard fields set with reasoning_format none");
+        }
+    }
+    LOG_ERR("%s passed\n", __func__);
+}
+
 // Verify reasoning-trace retention rules in the DeepSeek-V4 template:
 // all traces are retained unless drop_thinking is true AND the conversation
 // has no tool calls, in which case only the last (after-final-user) trace is
@@ -7995,6 +8649,8 @@ int main(int argc, char ** argv) {
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
+        test_k2_history_reasoning();
+        test_k2_guard_fields();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
