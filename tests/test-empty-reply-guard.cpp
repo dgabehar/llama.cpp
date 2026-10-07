@@ -263,6 +263,53 @@ int main(int argc, char ** argv) {
     CHECK(!std::isinf(d2[0].logit));
     llama_sampler_free(g);
 
+    // ---- structural tags are masked while no native section is open (needs a vocab where the tags are single
+    // tokens; K2's are, here llama-3 special tokens stand in): section = start_header/end_header, inner = begin_of_text/eot
+    if (argc > 2) {
+        llama_model * m2 = llama_model_load_from_file(argv[2], mparams);
+        CHECK(m2 != nullptr);
+        if (m2) {
+            const llama_vocab * v2 = llama_model_get_vocab(m2);
+            const std::vector<std::string> tags = { "<|start_header_id|>", "<|end_header_id|>", "<|begin_of_text|>", "<|reserved_special_token_5|>" };
+            std::vector<llama_token> id;
+            for (const auto & t : tags) {
+                auto tk = common_tokenize(v2, t, false, true);
+                CHECK(tk.size() == 1);
+                id.push_back(tk[0]);
+            }
+            const llama_token ord = common_tokenize(v2, "a", false, false)[0];
+            // which of { section open, section close, inner open, inner close, ordinary } survive
+            auto survivors = [&](llama_sampler * g2) {
+                llama_token_data d[5] = { { id[0], 1.f, 0.f }, { id[1], 1.f, 0.f }, { id[2], 1.f, 0.f }, { id[3], 1.f, 0.f }, { ord, 1.f, 0.f } };
+                llama_token_data_array p = { d, 5, -1, false };
+                llama_sampler_apply(g2, &p);
+                std::string r;
+                for (auto & x : d) { r += std::isinf(x.logit) ? '0' : '1'; }
+                return r;
+            };
+            llama_sampler * g2 = common_sampler_init_empty_reply_guard(v2, {}, tags);
+            llama_sampler_accept(g2, ord);                      // some output, no section yet
+            CHECK(survivors(g2) == "10001");                    // only the opener and ordinary text
+            llama_sampler_accept(g2, id[0]);
+            CHECK(survivors(g2) == "11111");                    // inside the section everything is allowed
+            llama_sampler_accept(g2, id[2]);
+            llama_sampler_accept(g2, id[3]);
+            llama_sampler_accept(g2, id[1]);                    // balanced and closed: outside again
+            CHECK(survivors(g2) == "10001");
+            llama_sampler * g3 = common_sampler_init_empty_reply_guard(v2, {}, {}); // not armed: nothing masked
+            llama_sampler_accept(g3, ord);
+            CHECK(survivors(g3) == "11111");
+            llama_sampler_free(g3);
+            // never mask the last candidate standing
+            llama_token_data d1[1] = { { id[1], 1.f, 0.f } };
+            llama_token_data_array p1 = { d1, 1, -1, false };
+            llama_sampler_apply(g2, &p1);
+            CHECK(!std::isinf(d1[0].logit));
+            llama_sampler_free(g2);
+            llama_model_free(m2);
+        }
+    }
+
     llama_model_free(model);
     llama_backend_free();
     if (n_fail) {
