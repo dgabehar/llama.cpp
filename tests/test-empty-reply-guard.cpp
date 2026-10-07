@@ -162,6 +162,54 @@ int main(int argc, char ** argv) {
     CHECK(!eog_allowed(g));
     llama_sampler_free(g);
 
+    // open reasoning block (prompt ends inside it, tools offered): EOG masked until the block closes or a call opens.
+    // Stand-ins for the reasoning tags: "<" opens, "</" closes (the guard tells them apart by the "</" prefix).
+    {
+        const auto t_open  = common_tokenize(vocab, "<", false, false);
+        const auto t_close = common_tokenize(vocab, "</", false, false);
+        if (t_open.size() == 1 && t_close.size() == 1) {
+            const std::vector<llama_token> inert = { t_open[0], t_close[0] };
+            // the incident: reasoning text, no close, then EOG
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+            CHECK(!eog_allowed(g));
+            feed(g, vocab, "Next I will run the tests");
+            CHECK(!eog_allowed(g));                 // unclosed reasoning: text does not release
+            llama_sampler * c3 = llama_sampler_clone(g);
+            llama_sampler_accept(g, t_close[0]);
+            CHECK(eog_allowed(g));                  // closed
+            CHECK(!eog_allowed(c3));                // the clone kept the open block
+            llama_sampler_reset(c3);
+            CHECK(!eog_allowed(c3));
+            llama_sampler_free(c3);
+            llama_sampler_free(g);
+            // cap: released after k_hold_cap tokens
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+            for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
+            CHECK(!eog_allowed(g));
+            llama_sampler_accept(g, g_other);
+            CHECK(eog_allowed(g));
+            llama_sampler_free(g);
+            // a native call opener inside the block hands over to the call hold
+            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, true); // (the stand-in tags would eat parts of the markers)
+            feed(g, vocab, "x<ifm|tool_calls>");
+            CHECK(!eog_allowed(g));
+            feed(g, vocab, "</ifm|tool_calls>");
+            CHECK(eog_allowed(g));
+            llama_sampler_free(g);
+            // no tools (no hold) or prompt not in reasoning: never held
+            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, true);
+            feed(g, vocab, "text");
+            CHECK(eog_allowed(g));
+            llama_sampler_free(g);
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, false);
+            feed(g, vocab, "text");
+            CHECK(eog_allowed(g));
+            llama_sampler_free(g);
+        } else {
+            fprintf(stderr, "skip open-reasoning tests: stand-in tags are not single tokens\n");
+        }
+    }
+
     // every tag that opens must close: the full native tag set (xml, xml_typed, json call formats)
     const std::vector<std::string> full = {
         "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>", "</ifm|tool_call>", "<ifm|arg_key>", "</ifm|arg_key>",

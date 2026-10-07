@@ -295,6 +295,9 @@ struct common_chat_params {
     // tool-call tag pairs { section open, close, inner open, close, ... } when tools are offered: EOG is masked from
     // an opener until the section is closed and the inner tags are balanced (capped)
     std::vector<std::string>            no_empty_reply_hold;
+    // the generation prompt ends inside an open reasoning block (tools offered): the reply starts in reasoning, and
+    // EOG stays masked until that block is closed (or a call opens), capped
+    bool                                no_empty_reply_open = false;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
 };
