@@ -194,6 +194,28 @@ int main(int argc, char ** argv) {
             CHECK(!eog_allowed(c3));
             llama_sampler_free(c3);
             llama_sampler_free(g);
+            // repetition breaker: the same 16+ char line three times in the open block forces the close tag
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
+            {
+                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+                llama_token_data_array p = { d, 3, -1, false };
+                feed(g, vocab, "Let me check the index again.\nLet me check the index again.\nsomething else entirely\n");
+                llama_sampler_apply(g, &p);
+                CHECK(d[1].logit == 0.5f && d[2].logit == 2.0f);                          // two repeats: only the EOG redirect
+            }
+            {
+                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+                llama_token_data_array p = { d, 3, -1, false };
+                feed(g, vocab, "Let me check the index again.\n");
+                llama_sampler_apply(g, &p);
+                CHECK(std::isinf(d[0].logit) && std::isinf(d[1].logit) && !std::isinf(d[2].logit)); // forced
+                llama_sampler_accept(g, t_close[0]);
+                llama_token_data e[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+                llama_token_data_array q = { e, 3, -1, false };
+                llama_sampler_apply(g, &q);
+                CHECK(e[0].logit == 2.0f && e[1].logit == 0.5f); // released once closed
+            }
+            llama_sampler_free(g);
             // cap: released after k_hold_cap tokens
             g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
             for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
