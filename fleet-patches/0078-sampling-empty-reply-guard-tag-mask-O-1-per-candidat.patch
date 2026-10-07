@@ -1,0 +1,170 @@
+From 1a9f36e792b47a4a2c5a064cc81349e4bd8a4d83 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 29 Sep 2026 17:12:10 -0500
+Subject: [PATCH] sampling: empty-reply guard/tag mask: O(1) per-candidate
+ masking
+
+apply() ran std::find over the EOG and tag id lists for every candidate (twice) on each token while armed,
+about +1.5 ms/token over a ~250k vocab. Membership is now a per-vocab flag table built at init, the
+"last candidate standing" check stops at the first other finite candidate, and when the candidates are the
+full vocab in id order only the few masked ids are touched. Behavior unchanged.
+
+test-empty-reply-guard: 200 randomized candidate layouts (identity, shuffled, sparse, sorted, -inf, out-of-range
+ids, last-candidate) compared against the old std::find rule, plus a 250k-candidate timing print
+(new 0.0003 ms/token vs old rule ~0.66-0.79 ms/token on this CPU).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+(cherry picked from commit 876e04668c5836ccb12697bcff1cbd3437e1932f)
+---
+ common/sampling.cpp              | 33 +++++++++++-----
+ tests/test-empty-reply-guard.cpp | 65 ++++++++++++++++++++++++++++++++
+ 2 files changed, 89 insertions(+), 9 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index db2d3ecf6..2a604f041 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -156,6 +156,8 @@ struct common_empty_reply_guard {
+     // armed: token ids of every tag except the section opener; masked while no native section is open (a call
+     // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
+     std::vector<llama_token> tag_ids;
++    // per token id: 1 = EOG, 2 = tag (built at init)
++    std::vector<uint8_t>     flags;
+ };
+ 
+ static const char * const k_kimi_markers[] = {
+@@ -288,18 +290,28 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
+     if (!mask_eog && !mask_tags) {
+         return;
+     }
++    // O(1) membership from a per-vocab flag table (built at init); was a std::find per candidate (~1.5 ms/token at 250k)
++    const uint8_t flag = (mask_eog ? 1 : 0) | (mask_tags ? 2 : 0);
+     const auto masked = [&](llama_token id) {
+-        return (mask_eog  && std::find(ctx->eog.begin(),     ctx->eog.end(),     id) != ctx->eog.end()) ||
+-               (mask_tags && std::find(ctx->tag_ids.begin(), ctx->tag_ids.end(), id) != ctx->tag_ids.end());
++        return id >= 0 && (size_t) id < ctx->flags.size() && (ctx->flags[id] & flag);
+     };
+-    // never mask the last candidate standing
+-    size_t n_other = 0;
+-    for (size_t i = 0; i < cur_p->size; ++i) {
+-        if (!masked(cur_p->data[i].id) && cur_p->data[i].logit != -INFINITY) {
+-            n_other++;
+-        }
++    // never mask the last candidate standing: stop at the first other finite candidate
++    bool has_other = false;
++    for (size_t i = 0; i < cur_p->size && !has_other; ++i) {
++        has_other = cur_p->data[i].logit != -INFINITY && !masked(cur_p->data[i].id);
++    }
++    if (!has_other) {
++        return;
+     }
+-    if (n_other == 0) {
++    // full-vocab candidates in id order (the usual case): jump straight to the few masked ids
++    const auto direct = [&](const std::vector<llama_token> & ids, bool on) {
++        return !on || std::all_of(ids.begin(), ids.end(), [&](llama_token id) {
++            return id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id;
++        });
++    };
++    if (direct(ctx->eog, mask_eog) && direct(ctx->tag_ids, mask_tags)) {
++        for (llama_token id : ctx->eog)     { if (mask_eog)  { cur_p->data[id].logit = -INFINITY; } }
++        for (llama_token id : ctx->tag_ids) { if (mask_tags) { cur_p->data[id].logit = -INFINITY; } }
+         return;
+     }
+     for (size_t i = 0; i < cur_p->size; ++i) {
+@@ -359,6 +371,9 @@ struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_
+             ctx->eog.push_back(id);
+         }
+     }
++    ctx->flags.assign(n_vocab, 0);
++    for (llama_token id : ctx->eog)     { ctx->flags[id] |= 1; }
++    for (llama_token id : ctx->tag_ids) { if (id >= 0 && id < n_vocab) { ctx->flags[id] |= 2; } }
+     return llama_sampler_init(&common_empty_reply_guard_i, ctx);
+ }
+ 
+diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
+index 62fa0a24c..cd96b2674 100644
+--- a/tests/test-empty-reply-guard.cpp
++++ b/tests/test-empty-reply-guard.cpp
+@@ -3,6 +3,9 @@
+ // an opencode turn (2026-09-28): "\n<|tool_calls_section_begin|><|tool_call_begin|>" then EOG. Those markers
+ // are not vocab tokens of that model, so a vocab that does not have them either (gpt-2) tokenizes them the same way.
+ 
++#include <algorithm>
++#include <chrono>
++#include <random>
+ #include "llama.h"
+ #include "common.h"
+ #include "sampling.h"
+@@ -305,6 +308,68 @@ int main(int argc, char ** argv) {
+             llama_token_data_array p1 = { d1, 1, -1, false };
+             llama_sampler_apply(g2, &p1);
+             CHECK(!std::isinf(d1[0].logit));
++            // the masking must equal the reference std::find rule for any candidate layout (identity, shuffled, sparse,
++            // sorted, with -inf, ids past the vocab), and its per-token cost is timed against that old rule
++            {
++                const int n_v = llama_vocab_n_tokens(v2);
++                std::vector<llama_token> eogs;
++                for (llama_token t = 0; t < n_v; ++t) { if (llama_vocab_is_eog(v2, t)) { eogs.push_back(t); } }
++                const std::vector<llama_token> tag_v = { id[1], id[2], id[3] };
++                auto ref = [&](std::vector<llama_token_data> & c, bool m_eog, bool m_tag) {
++                    auto masked = [&](llama_token t) {
++                        return (m_eog && std::find(eogs.begin(), eogs.end(), t) != eogs.end()) ||
++                               (m_tag && std::find(tag_v.begin(), tag_v.end(), t) != tag_v.end());
++                    };
++                    size_t n_other = 0;
++                    for (auto & x : c) { if (!masked(x.id) && x.logit != -INFINITY) { n_other++; } }
++                    if (n_other == 0) { return; }
++                    for (auto & x : c) { if (masked(x.id)) { x.logit = -INFINITY; } }
++                };
++                std::mt19937 rng(42);
++                for (int iter = 0; iter < 200; ++iter) {
++                    const bool armed_open = iter % 2;            // tags masked only while no native section is open
++                    const bool seen       = iter % 4 < 2;        // EOG masked only before any output
++                    std::vector<llama_token_data> c;
++                    const int kind = iter % 5;
++                    for (llama_token t = 0; t < n_v; ++t) {
++                        if (kind == 3 && rng() % 3) { continue; } // sparse
++                        c.push_back({ t, (rng() % 7 == 0) ? -INFINITY : (float) (rng() % 100) / 10.f, 0.f });
++                    }
++                    if (kind == 1 || kind == 4) { std::shuffle(c.begin(), c.end(), rng); }
++                    if (kind == 2) { std::sort(c.begin(), c.end(), [](auto & a, auto & b) { return a.logit > b.logit; }); }
++                    if (kind == 4) { c.push_back({ n_v + 5, 1.f, 0.f }); c.push_back({ -1, 1.f, 0.f }); }
++                    if (iter % 11 == 0) { for (auto & x : c) { if (x.id != id[1] && x.id != eogs[0]) { x.logit = -INFINITY; } } } // last candidates
++                    llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
++                    if (!seen) { llama_sampler_accept(gg, ord); }
++                    if (armed_open) { llama_sampler_accept(gg, id[0]); }
++                    std::vector<llama_token_data> exp = c, got = c;
++                    ref(exp, seen || armed_open, !armed_open); // an open native section holds EOG too
++                    llama_token_data_array pp = { got.data(), got.size(), -1, false };
++                    llama_sampler_apply(gg, &pp);
++                    bool same = true;
++                    for (size_t i = 0; i < exp.size(); ++i) { same = same && exp[i].logit == got[i].logit; }
++                    CHECK(same);
++                    llama_sampler_free(gg);
++                }
++                // timing on a 250k candidate array (identity order, as the sampler sees it), no output yet, tags masked
++                const int N = 250000;
++                std::vector<llama_token_data> big(N);
++                for (int i = 0; i < N; ++i) { big[i] = { i, (float) (i % 97), 0.f }; }
++                llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
++                using clk = std::chrono::steady_clock;
++                const int reps = 200;
++                double t_new = 0, t_old = 0;
++                for (int r = 0; r < reps; ++r) {
++                    std::vector<llama_token_data> a = big, b = big;
++                    llama_token_data_array pa = { a.data(), a.size(), -1, false };
++                    auto t0 = clk::now(); llama_sampler_apply(gg, &pa); auto t1 = clk::now();
++                    ref(b, true, true);   auto t2 = clk::now();
++                    t_new += std::chrono::duration<double, std::milli>(t1 - t0).count();
++                    t_old += std::chrono::duration<double, std::milli>(t2 - t1).count();
++                }
++                printf("guard apply over %d candidates: new %.4f ms/token, old std::find rule %.4f ms/token\n", N, t_new / reps, t_old / reps);
++                llama_sampler_free(gg);
++            }
+             llama_sampler_free(g2);
+             llama_model_free(m2);
+         }
+-- 
+2.43.0
+

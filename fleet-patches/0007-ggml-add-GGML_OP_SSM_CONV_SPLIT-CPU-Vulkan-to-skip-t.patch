@@ -1,4 +1,4 @@
-From b91aa1bae4b06b524b2ef6999f69f79b55052064 Mon Sep 17 00:00:00 2001
+From 7f64d19468785559902add2e90ab61bb98aaaa0a Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Mon, 14 Sep 2026 13:10:48 -0500
 Subject: [PATCH] ggml: add GGML_OP_SSM_CONV_SPLIT (CPU+Vulkan) to skip the
@@ -33,6 +33,7 @@ GGML_VK_PERF_LOGGER confirms the per-layer CONCAT (214.6ms/pass baseline) is
 gone entirely in the modified build.
 
 Assisted-by: Claude Sonnet 5
+(cherry picked from commit b91aa1bae4b06b524b2ef6999f69f79b55052064)
 ---
  ggml/include/ggml-rpc.h                       |  4 +-
  ggml/include/ggml.h                           | 20 ++++
@@ -58,12 +59,12 @@ Assisted-by: Claude Sonnet 5
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 1f8cb7906c..05267f1aff 100644
+index 482bd3666d..ecf0a3a6dc 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
  
- #define RPC_PROTO_MAJOR_VERSION    7
+ #define RPC_PROTO_MAJOR_VERSION    8
  #define RPC_PROTO_MINOR_VERSION    0
 -#define RPC_PROTO_PATCH_VERSION    0
 +#define RPC_PROTO_PATCH_VERSION    1
@@ -113,7 +114,7 @@ index 224bdef927..94a5377eed 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * s,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 0394433c08..370a3db7b0 100644
+index 8ed5f4ebbc..79764ad013 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -814,6 +814,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -147,7 +148,7 @@ index 0394433c08..370a3db7b0 100644
      auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                  src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-@@ -1062,6 +1086,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1067,6 +1091,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_GLU: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
@@ -181,7 +182,7 @@ index 7c274c03b7..4c89b5339e 100644
          case GGML_OP_LIGHTNING_INDEXER:
              {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 16a916d20a..c50e7b7a36 100644
+index c7e7c47a79..b4bb2bd988 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -9996,6 +9996,98 @@ void ggml_compute_forward_ssm_conv(
@@ -352,7 +353,7 @@ index 4158ff7793..41ece9a2b0 100644
      vk_pipeline pipeline_opt_step_sgd_f32;
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 5587dfc284..805f7f7a54 100644
+index 740de5b5aa..3feaa772cc 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3747,6 +3747,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -366,7 +367,7 @@ index 5587dfc284..805f7f7a54 100644
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
-@@ -9170,6 +9174,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -9176,6 +9180,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              }
          }
          return nullptr;
@@ -378,7 +379,7 @@ index 5587dfc284..805f7f7a54 100644
      case GGML_OP_OPT_STEP_ADAMW:
          if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              return ctx->device->pipeline_opt_step_adamw_f32;
-@@ -9689,8 +9698,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -9695,8 +9704,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          }
          break;
      case GGML_OP_SSM_CONV:
@@ -389,7 +390,7 @@ index 5587dfc284..805f7f7a54 100644
              const uint32_t n_t = dst->ne[1];
              const uint32_t n_s = dst->ne[2];
              elements = { nr, n_t, n_s };
-@@ -10351,6 +10361,28 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
+@@ -10357,6 +10367,28 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
      });
  }
  
@@ -418,7 +419,7 @@ index 5587dfc284..805f7f7a54 100644
  static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
      const ggml_tensor * x = dst->src[0];
      const ggml_tensor * g = dst->src[1];
-@@ -12714,6 +12746,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12720,6 +12752,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
      case GGML_OP_SSM_CONV:
          ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
  
@@ -429,7 +430,7 @@ index 5587dfc284..805f7f7a54 100644
          break;
  
      case GGML_OP_OPT_STEP_ADAMW:
-@@ -15942,6 +15978,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15948,6 +15984,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
              }
          case GGML_OP_SSM_CONV:
              return op->src[0]->type == GGML_TYPE_F32;
@@ -726,7 +727,7 @@ index ad66126477..93866b61df 100644
  
  ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 diff --git a/src/models/models.h b/src/models/models.h
-index 387a4adcb2..2900473cc7 100644
+index 023ed3021e..5c35adfa30 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -76,9 +76,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
@@ -807,7 +808,7 @@ index 2d56c38ca1..a19228a885 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d8893025e7..06fbfde94f 100644
+index cbe59178d3..fd30806ff5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4434,6 +4434,49 @@ struct test_ssm_conv : public test_case {
@@ -860,7 +861,7 @@ index d8893025e7..06fbfde94f 100644
  // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
  struct test_ssm_conv_bias_silu : public test_case {
      const ggml_type type;
-@@ -10205,6 +10248,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10220,6 +10263,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              // long token (n_t > 32, exercises the long_token kernel path)
              test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
              test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
@@ -880,7 +881,7 @@ index d8893025e7..06fbfde94f 100644
          }
      }
  
-@@ -12019,6 +12075,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12037,6 +12093,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
      test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
      test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate

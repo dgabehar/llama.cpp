@@ -1,0 +1,55 @@
+From 2f1949ec8dba9c295ffc1a8b4adfecf29f5c6cab Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 10:11:00 -0500
+Subject: [PATCH] chat: K2-Horizon: startup self-check that the sampler guard
+ is fed
+
+common_chat_templates_init renders a K2-Horizon template once with a tool.
+The parser logs "K2-Horizon parser: guard inert=6 hold=10" (INFO, once) and
+the self-check logs an error if the chat params carry no empty-reply guard
+inputs. The deploy workflow greps the pod log for the INFO line, so a future
+upstream parser change that pre-empts the fork's K2 handling fails the deploy
+leg instead of shipping a disarmed guard.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 0339cc77c..df2c6d93b 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -852,6 +852,28 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model *
+             LOG_ERR("%s: failed to parse tool use chat template (ignoring it): %s\n", __func__, e.what());
+         }
+     }
++
++    // K2-Horizon: render once with a tool at startup. The parser logs "K2-Horizon parser: guard inert=.. hold=.." (the
++    // deploy workflow greps for it) and this fails loudly if it ever stops feeding the sampler's empty-reply guard
++    // (upstream's specialized parser once pre-empted the fork's workaround and silently disarmed it).
++    if (default_template_src.find("<|ifm|im_start|>") != std::string::npos && default_template_src.find("<ifm|tool_calls>") != std::string::npos) {
++        try {
++            common_chat_msg user;
++            user.role    = "user";
++            user.content = "hi";
++            common_chat_templates_inputs probe;
++            probe.messages              = { user };
++            probe.tools                 = { common_chat_tool{ "probe", "probe", R"({"type":"object","properties":{}})" } };
++            probe.add_generation_prompt = true;
++            probe.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
++            const auto params = common_chat_templates_apply(tmpls.get(), probe);
++            if (params.no_empty_reply_inert.empty() || params.no_empty_reply_hold.empty()) {
++                LOG_ERR("%s: K2-Horizon sampler guard NOT armed: the chat parser fed no empty-reply guard inputs\n", __func__);
++            }
++        } catch (const std::exception & e) {
++            LOG_WRN("%s: K2-Horizon startup self-check failed: %s\n", __func__, e.what());
++        }
++    }
+     return tmpls;
+ }
+ 
+-- 
+2.43.0
+

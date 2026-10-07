@@ -1,4 +1,4 @@
-From 7bc133cd9c678d68ba6c3b0d65ea9fe8ab456de0 Mon Sep 17 00:00:00 2001
+From 2d13e476c51dabc661d04636400f3eb62b95a207 Mon Sep 17 00:00:00 2001
 From: dgabehar <dgabehar@gmail.com>
 Date: Tue, 15 Sep 2026 11:59:57 -0500
 Subject: [PATCH] qwen3-coder: bound xml-arg-string with until_one_of, not a
@@ -32,6 +32,7 @@ here since this fleet doesn't run those models and the bug is unconfirmed
 there; worth a follow-up sweep or an upstream report.
 
 Assisted-by: Claude Sonnet 5
+(cherry picked from commit 7bc133cd9c678d68ba6c3b0d65ea9fe8ab456de0)
 ---
  common/parsers/qwen3-coder.cpp | 15 ++++++++++++++-
  1 file changed, 14 insertions(+), 1 deletion(-)

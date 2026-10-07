@@ -1,4 +1,4 @@
-From 54b9a9e2dd6ec8f80be9beb9d179dacfb16fafea Mon Sep 17 00:00:00 2001
+From 9a97b6f0f96663e14738eadfafea8ae403369e97 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:28 -0500
 Subject: [PATCH] server: fix slot save/restore losing checkpoint-based cache
@@ -88,12 +88,13 @@ full restored prefix reused, only 17 new tokens processed), 3.0s versus
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+(cherry picked from commit 54b9a9e2dd6ec8f80be9beb9d179dacfb16fafea)
 ---
  tools/server/server-context.cpp | 181 +++++++++++++++++++++++++++++++-
  1 file changed, 179 insertions(+), 2 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d1af984e67..71a090f2fc 100644
+index d1af984e6..71a090f2f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -2575,6 +2575,128 @@ private:

@@ -561,6 +561,7 @@ class MODEL_ARCH(IntEnum):
     GEMMA4           = auto()
     GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
+    GEMMA_EMBEDDING2 = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
     RWKV6QWEN2       = auto()
@@ -942,9 +943,8 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_COMPRESSOR_NORM = auto()
     INDEXER_KPOOL_GATE   = auto()
     INDEXER_KPOOL_APE    = auto()
-    ATTN_V_GATE          = auto() # K2Horizon
-    ATTN_V_EXP           = auto() # K2Horizon
-
+    ATTN_V_GATE          = auto() # k2-horizon MoVA router
+    ATTN_V_EXP           = auto() # k2-horizon MoVA value experts
     # vision
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
@@ -1344,6 +1344,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA4:           "gemma4",
     MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4-assistant",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
+    MODEL_ARCH.GEMMA_EMBEDDING2: "gemma-embedding2",
     MODEL_ARCH.STARCODER2:       "starcoder2",
     MODEL_ARCH.RWKV6:            "rwkv6",
     MODEL_ARCH.RWKV6QWEN2:       "rwkv6qwen2",
@@ -2059,10 +2060,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
     MODEL_TENSOR.D2T:                       "d2t",
-    # K2 Horizon
     MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
     MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
-
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -3481,6 +3480,30 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_PRE_NORM,
         MODEL_TENSOR.FFN_POST_NORM,
+    ],
+    MODEL_ARCH.GEMMA_EMBEDDING2: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
+        MODEL_TENSOR.PER_LAYER_MODEL_PROJ,
+        MODEL_TENSOR.PER_LAYER_INP_GATE,
+        MODEL_TENSOR.PER_LAYER_PROJ,
+        MODEL_TENSOR.PER_LAYER_PROJ_NORM,
+        MODEL_TENSOR.PER_LAYER_POST_NORM,
     ],
     MODEL_ARCH.STARCODER2: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5784,29 +5807,23 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_K_NORM,
         MODEL_TENSOR.ATTN_V,
-        MODEL_TENSOR.ATTN_V_GATE, # MoVA
-        MODEL_TENSOR.ATTN_V_EXP,  # MoVA
+        MODEL_TENSOR.ATTN_V_GATE,
+        MODEL_TENSOR.ATTN_V_EXP,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_GATE,
         MODEL_TENSOR.FFN_NORM,
-
-        # Dense MLP
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_DOWN,
-
-        # MoE
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
-
-        # Shared Expert
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
-    ]
+    ],
 }
 
 # tensors that will not be serialized
@@ -6052,6 +6069,7 @@ class DecisionType:
     KEV     = "kev"      # dot product of the hidden states of the last token and of one end token per option
     NIMBLE  = "nimble"   # same as openjev, the prompt lists all the questions of the request
     CLEF    = "clef"     # joint head over all questions, one score per option
+    PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
 
 
 class VisionProjectorType:

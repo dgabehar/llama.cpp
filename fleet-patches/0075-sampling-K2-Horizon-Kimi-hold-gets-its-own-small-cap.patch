@@ -1,0 +1,184 @@
+From d1ed6605df0fb7c7bef2109bd794c247a65053b8 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 09:41:52 -0500
+Subject: [PATCH] sampling: K2-Horizon: Kimi hold gets its own small cap and
+ releases on a repeated opener
+
+Live 2026-09-29: with the EOG hold a K2 session looped ~1500 tokens of
+"<|tool_calls_section_begin|><|tool_call_begin|>" (blank lines between repeats) before
+ending. The Kimi hold now has k_kimi_hold_cap = 192 tokens (117 complete Kimi calls in
+the harness: median 42, longest 115) while the native hold keeps 2048, and an opener
+repeated while the first is unfinished releases EOG immediately. Switching to the native
+opener hands over to the native hold. The real loop text is a test fixture (8 checks fail
+against the previous guard). Release only permits EOG; it does not force the model to end.
+Forced-opener harness (40 samples): before 36 native / 4 loops to 2600 tokens, after 34
+native / 6 non-native, 5 still run to 2600 tokens because the model never picks EOG.
+ctest -L main 59/59, -R split-balance pass.
+
+Assisted-by: Claude Sonnet 5
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+
+(cherry picked from commit 1fd293626; re-derived for upstream b11454: the autoparser/test-chat hunks of this patch are carried by the k2-horizon.cpp port commits)
+---
+ common/sampling.cpp              | 44 ++++++++++++++++++++++--------
+ tests/test-empty-reply-guard.cpp | 46 ++++++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 11 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index e9ee3e972..53c79049a 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -128,6 +128,11 @@ struct ring_buffer {
+ // (EOG allowed), it never truncates a call.
+ static const int k_hold_cap = 2048;
+ 
++// A Kimi-form call is short (harness, 117 complete Kimi calls: median 42, longest 115 tokens; native switch after the opener: p90 118, max 255 tokens) and the model
++// either rewrites it natively soon or is looping (live 2026-09-29: ~1500 tokens of the opener repeated), so the
++// Kimi hold gets its own small cap, and a repeated unfinished opener releases it at once.
++static const int k_kimi_hold_cap = 192;
++
+ struct common_empty_reply_guard {
+     const llama_vocab *      vocab;
+     std::vector<llama_token> eog;
+@@ -140,7 +145,10 @@ struct common_empty_reply_guard {
+     std::string              tail;
+     bool                     in_section = false;
+     bool                     in_call    = false;
+-    bool                     held       = false;  // armed: an opener was seen, the call was not completed
++    bool                     held       = false;  // armed: a native opener was seen, the call was not completed
++    bool                     kimi_held  = false;  // a Kimi opener was seen (not looping): hold, capped by k_kimi_hold_cap
++    bool                     kimi_loop  = false;  // the Kimi opener repeated unfinished: no more Kimi hold
++    int                      n_kimi     = 0;      // generated tokens since the Kimi hold started
+     int                      n_held     = 0;      // generated tokens since the hold started
+     bool                     n_open     = false;  // the native section opener itself was seen during this hold
+     bool                     n_closed   = false;  // ... and its close
+@@ -152,8 +160,8 @@ static const char * const k_kimi_markers[] = {
+ };
+ 
+ static void common_empty_reply_guard_release(common_empty_reply_guard * ctx) {
+-    ctx->held = ctx->n_open = ctx->n_closed = false;
+-    ctx->n_held = 0;
++    ctx->held = ctx->n_open = ctx->n_closed = ctx->kimi_held = ctx->kimi_loop = false;
++    ctx->n_held = ctx->n_kimi = 0;
+     ctx->depth.assign(ctx->depth.size(), 0);
+ }
+ 
+@@ -180,10 +188,23 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
+             break;
+         }
+         switch (which) {
+-            case 0: ctx->in_section = true;  if (armed) { ctx->held = true; } break;
+-            case 1: ctx->in_section = false; ctx->in_call = false; break;
+-            case 2: ctx->in_call    = true;  if (armed) { ctx->held = true; } break;
+-            case 3: ctx->in_call    = false; break;
++            case 0:
++            case 2: {
++                // the opener again while the first is unfinished: the model is looping, let it end
++                const bool repeat = which == 0 ? ctx->in_section : ctx->in_call;
++                (which == 0 ? ctx->in_section : ctx->in_call) = true;
++                if (repeat) {
++                    ctx->kimi_held = false;
++                    ctx->kimi_loop = true;
++                    LOG_DBG("%s: empty-reply guard: Kimi opener repeated, releasing EOG\n", __func__);
++                } else if (!ctx->kimi_loop && !ctx->kimi_held && !ctx->n_open) {
++                    ctx->kimi_held = true;
++                    ctx->n_kimi    = 0;
++                }
++                break;
++            }
++            case 1: ctx->in_section = false; ctx->in_call = false; if (!armed) { ctx->kimi_held = false; } break;
++            case 3: ctx->in_call    = false; if (!armed && !ctx->in_section) { ctx->kimi_held = false; } break;
+             default: {
+                 const int  pair = (which - 4) / 2;
+                 const bool open = (which - 4) % 2 == 0;
+@@ -193,6 +214,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
+                     }
+                     ctx->held = ctx->n_open = true;
+                     ctx->n_closed = false;
++                    ctx->kimi_held = ctx->kimi_loop = false; // the model switched to its own format
+                 } else if (pair == 0) {
+                     // a close without its opener (seen live after a Kimi opener) closes nothing
+                     ctx->n_closed = ctx->n_open;
+@@ -219,10 +241,7 @@ static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx)
+     if (!ctx->seen_output) {
+         return true;
+     }
+-    if (!ctx->hold.empty()) {
+-        return ctx->held && ctx->n_held < k_hold_cap;
+-    }
+-    return ctx->in_section || ctx->in_call;
++    return (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
+ }
+ 
+ static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
+@@ -240,6 +259,9 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
+     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
+     // the native markers are special tokens, which only render with special=true
+     ctx->tail += ctx->hold.empty() ? piece : common_token_to_piece(ctx->vocab, token, true);
++    if (ctx->kimi_held && ++ctx->n_kimi == k_kimi_hold_cap) {
++        LOG_DBG("%s: empty-reply guard: %d tokens after a Kimi opener, releasing EOG\n", __func__, k_kimi_hold_cap);
++    }
+     if (ctx->held && ++ctx->n_held == k_hold_cap) {
+         LOG_DBG("%s: empty-reply guard: %d tokens inside an open tool call, releasing EOG\n", __func__, k_hold_cap);
+     }
+diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
+index f90033bce..6623089e6 100644
+--- a/tests/test-empty-reply-guard.cpp
++++ b/tests/test-empty-reply-guard.cpp
+@@ -208,6 +208,52 @@ int main(int argc, char ** argv) {
+     CHECK(eog_allowed(g));
+     llama_sampler_free(g);
+ 
++    // ---- live loop 2026-09-29 (opencode session ses_f16214d2..., ~1500 tokens): the opener repeated with blank
++    // lines between the repeats, no call ever started. Real text, trimmed. The repeat releases EOG at once.
++    const std::string loop1 = "\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n\n\n\n\n\n";
++    const std::string loop2 = "<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n\n\n\n\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n";
++    for (const std::vector<std::string> & h : { hold, full, std::vector<std::string>() }) {
++        g = common_sampler_init_empty_reply_guard(vocab, {}, h);
++        feed(g, vocab, loop1);
++        CHECK(!eog_allowed(g));             // the first opener still holds
++        feed(g, vocab, loop2);
++        CHECK(eog_allowed(g));              // repeated with no end marker: looping, release
++        feed(g, vocab, "<|tool_calls_section_begin|><|tool_call_begin|>");
++        CHECK(eog_allowed(g));              // and it stays released
++        llama_sampler_free(g);
++    }
++    // a repeated bare call opener is a loop too; a call after a finished one is not
++    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
++    feed(g, vocab, "<|tool_call_begin|>x<|tool_call_end|><|tool_call_begin|>y");
++    CHECK(!eog_allowed(g));
++    feed(g, vocab, "<|tool_call_begin|>");
++    CHECK(eog_allowed(g));
++    llama_sampler_free(g);
++
++    // the Kimi hold has its own small cap (k_kimi_hold_cap), the native hold keeps 2048
++    const int kcap = 192;
++    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
++    feed(g, vocab, "<|tool_calls_section_begin|>"); // the cap counts the tokens after the opener marker
++    for (int i = 0; i < kcap - 1; ++i) {
++        llama_sampler_accept(g, g_other);
++    }
++    CHECK(!eog_allowed(g));
++    llama_sampler_accept(g, g_other);
++    CHECK(eog_allowed(g));
++    llama_sampler_free(g);
++    // ... and switching to the native format after the Kimi opener gives the native cap
++    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
++    feed(g, vocab, "<|tool_calls_section_begin|><|tool_call_begin|>");
++    for (int i = 0; i < 100; ++i) {
++        llama_sampler_accept(g, g_other);
++    }
++    feed(g, vocab, "<ifm|tool_calls>");
++    for (int i = 0; i < cap - 2; ++i) {     // far past the Kimi cap
++        llama_sampler_accept(g, g_other);
++    }
++    CHECK(!eog_allowed(g));
++    llama_sampler_free(g);
++
+     // never mask the last candidate standing
+     g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+     feed(g, vocab, "<ifm|tool_calls>");
+-- 
+2.43.0
+

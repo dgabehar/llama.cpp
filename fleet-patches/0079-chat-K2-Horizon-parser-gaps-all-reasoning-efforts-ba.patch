@@ -1,0 +1,51 @@
+From 3aaaa53af8a9452c1f1d7b4f3f7a128c0b657ed9 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 09:41:52 -0500
+Subject: [PATCH] chat: K2-Horizon parser gaps (all reasoning efforts,
+ bare/Kimi calls, stray tags, never throw)
+
+- reasoning: the open tag is picked from the generation prompt (start_alts), so
+  medium/high (<ifm|think_fast>/<ifm|think>) parse like low; any close tag ends it
+- a bare <ifm|tool_call> block (no <ifm|tool_calls> opener, or a missing per-call/
+  section end) is a tool call; several calls parse whatever parallel_tool_calls says
+- a complete Kimi-form call (in reasoning or content) is surfaced as a tool call
+- stray </ifm|think*>, <|close|>, <|sep|>, EOG text and trailing junk are dropped with
+  tools offered too; tool markup is dropped from content without tools / tool_choice none
+- a parse failure falls back to reasoning + content (lenient-fallback rule) instead of throwing
+- tests: efforts, bare/Kimi calls, stray tags, no-tools calls, fallback, 18000-case no-throw fuzz
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+
+(cherry picked from commit 5bfb85f86; re-derived for upstream b11454: the autoparser/test-chat hunks of this patch are carried by the k2-horizon.cpp port commits)
+---
+ common/chat.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 4bad0357b..16424c6cd 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1559,6 +1559,19 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+             return msg;
+         }
+         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
++        if (src_parser.has_rule("lenient-fallback")) {
++            // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
++            common_chat_msg msg;
++            msg.role = "assistant";
++            common_peg_parse_context fctx(effective_input, flags);
++            auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
++            if (!fres.fail()) {
++                common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
++            } else {
++                msg.content = input;
++            }
++            return msg;
++        }
+         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
+         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+     }
+-- 
+2.43.0
+

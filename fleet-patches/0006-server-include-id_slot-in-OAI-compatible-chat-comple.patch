@@ -1,4 +1,4 @@
-From 9849c0935bd90e2687f699c32b4e91a389b95b9b Mon Sep 17 00:00:00 2001
+From 8b9d76cba35ba83d36069f1c8d0377da2091f658 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Thu, 10 Sep 2026 16:57:55 -0500
 Subject: [PATCH] server: include id_slot in OAI-compatible chat completion
@@ -16,12 +16,14 @@ lets it pass through when present -- it just was never present).
 Adds id_slot as a plain top-level field to both response shapes,
 mirroring the field already emitted by to_json_non_oaicompat(). No
 existing field removed or renamed.
+
+(cherry picked from commit 9849c0935bd90e2687f699c32b4e91a389b95b9b)
 ---
  tools/server/server-task.cpp | 4 +++-
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index a5c33c056b..25eb4a24fa 100644
+index a5c33c056..25eb4a24f 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -445,7 +445,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {

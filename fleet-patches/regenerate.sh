@@ -20,7 +20,16 @@ if [ -z "${TIP:-}" ]; then
 fi
 
 rm -f fleet-patches/*.patch
-git format-patch --no-numbered -o fleet-patches "$BASE..$TIP"
+# Mirror/landing bookkeeping commits ("fleet: rebuild/regenerate patch mirror ...", "Land ...") are not fork
+# patches: they only carry this directory and FLEET.md, so they are left out of the mirror.
+n=0
+for sha in $(git rev-list --reverse "$BASE..$TIP"); do
+    case "$(git log -1 --format=%s "$sha")" in
+        "fleet: rebuild patch mirror"*|"fleet: regenerate patch mirror"*|"Land "*) continue ;;
+    esac
+    n=$((n + 1))
+    git format-patch --no-numbered --start-number "$n" -1 -o fleet-patches "$sha" >/dev/null
+done
 
 echo "Regenerated $(ls fleet-patches/*.patch | wc -l) patch files."
 echo "Update the table in fleet-patches/README.md if the patch set changed, then commit."

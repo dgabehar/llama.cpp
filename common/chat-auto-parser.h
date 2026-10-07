@@ -189,18 +189,6 @@ struct tool_format_analysis {
     std::string              id_field;
     std::string              gen_id_field;
     std::vector<std::string> parameter_order;
-
-    // K2-Horizon quirks (the official weights do not always emit the exact template shape):
-    // - the section opener/closer is optional: a bare per-call block is a tool call too
-    // - several calls in one turn are parsed whatever parallel_tool_calls says (throwing on them loses the turn)
-    // - a per-call block may be closed by the section end / the next call instead of its own end tag
-    bool section_optional = false;
-    bool always_parallel  = false;
-    // a complete call in the Kimi form (`<|tool_call_begin|>name<|sep|>{json}<|tool_call_end|>`, the section
-    // wrapper optional) is surfaced as a tool call too, also when the model emitted it inside its reasoning
-    bool kimi_fallback = false;
-    // whatever follows the last call (a stray close tag, EOG text) is dropped instead of failing the parse
-    bool drop_tail = false;
 };
 
 struct tool_function_analysis {
@@ -242,10 +230,6 @@ struct parser_build_context {
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
-    // Kimi-form call fallback (see tool_format_analysis::kimi_fallback); unset when not applicable to this request
-    std::optional<common_peg_parser>  kimi_calls;
-    std::optional<common_peg_parser>  kimi_first;  // just the first call, up to its end tag (what ends reasoning)
-    std::vector<std::string>          kimi_openers;
 
     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
 };
@@ -274,13 +258,6 @@ struct analyze_reasoning : analyze_base {
 
     std::string start;  // e.g., "<think>", "[THINK]", "<|START_THINKING|>", ""
     std::string end;    // e.g., "</think>", "[BEGIN FINAL RESPONSE]", "<|END_THINKING|>"
-    std::vector<std::string> end_alts; // other tags that also close the reasoning (the model may emit any of them)
-    // other open tags the model may emit again right after the (already opened) reasoning start; consumed
-    // and dropped, so a redundant repeat of the open tag never ends up as reasoning text
-    std::vector<std::string> start_alts;
-    // when the request offers tools: a tag that ends the reasoning without a close tag before it (the model
-    // starts its tool call while still "thinking"); it is left in the input for the tool-call parser
-    std::vector<std::string> implicit_ends_with_tools;
 
     analyze_reasoning() = default;
     analyze_reasoning(const common_chat_template & tmpl, bool supports_tools);
@@ -311,15 +288,6 @@ struct analyze_content : analyze_base {
 
     bool requires_nonnull_content = false;
 
-    // tags the model may emit after its answer before derailing (e.g. a second reasoning close tag): content
-    // ends at the first of them and the rest of the output is dropped
-    std::vector<std::string> stray_ends;
-
-    // same idea as stray_ends, but only checked when the request has no tools (e.g. hallucinated
-    // tool-call markup the model emits despite none being offered). With tools offered, these tags
-    // are real tool-call syntax parsed by analyze_tools instead, so they must never end content here.
-    std::vector<std::string> stray_ends_no_tools;
-
     analyze_content() = default;
     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);
 
@@ -345,9 +313,6 @@ struct analyze_tools : analyze_base {
                   const analyze_reasoning &    reasoning);
 
     common_peg_parser build_parser(parser_build_context & ctx) const override;
-
-    // Kimi-form calls (see tool_format_analysis::kimi_fallback) for the tools of this request
-    common_peg_parser build_kimi_calls(parser_build_context & ctx) const;
 
   private:
     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format
@@ -424,8 +389,6 @@ struct autoparser {
 
     // Preserved tokens for tokenizer (union of all non-empty markers)
     std::vector<std::string> preserved_tokens;
-    std::vector<std::string> no_empty_reply_inert; // see common_chat_params::no_empty_reply_inert
-    std::vector<std::string> no_empty_reply_hold;  // see common_chat_params::no_empty_reply_hold
     std::vector<std::string> additional_stops;  // literal stop strings (e.g. Laguna </assistant>) caught however tokenized
 
     autoparser() = default;

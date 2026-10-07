@@ -1,4 +1,4 @@
-From 9f9044d3899f5e33f5cc807b0f226df0b64e6fff Mon Sep 17 00:00:00 2001
+From 805a228964449be21baa874d59a630a3564b83d4 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:59:11 -0500
 Subject: [PATCH] ci: add sync-with-upstream workflow (mirror of the master
@@ -13,6 +13,7 @@ purposes.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+(cherry picked from commit 9f9044d3899f5e33f5cc807b0f226df0b64e6fff)
 ---
  .github/workflows/sync-fleet-patches.yml | 102 +++++++++++++++++++++++
  1 file changed, 102 insertions(+)
@@ -20,7 +21,7 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
 
 diff --git a/.github/workflows/sync-fleet-patches.yml b/.github/workflows/sync-fleet-patches.yml
 new file mode 100644
-index 0000000000..258a40b59e
+index 000000000..258a40b59
 --- /dev/null
 +++ b/.github/workflows/sync-fleet-patches.yml
 @@ -0,0 +1,102 @@

@@ -1,0 +1,48 @@
+From c75c3cd6c717836cc05cb0776828bc6ab69cbe28 Mon Sep 17 00:00:00 2001
+From: Shikanime Deva <william.phetsinorath@shikanime.studio>
+Date: Fri, 18 Sep 2026 13:42:52 +0200
+Subject: [PATCH] rpc : serialize backend compute across connection threads
+
+Concurrent connections can now drive the same backend handle. Restores
+the pre-fix serialization semantics around ggml_backend_graph_compute
+with a single file-scope mutex shared by graph_compute and
+graph_recompute.
+
+Signed-off-by: Shikanime Deva <william.phetsinorath@shikanime.studio>
+(cherry picked from commit 5bacb855d2e3e07acc6910d149af76f9765f0d84)
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index f331c8822..e828bbf6f 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2006,6 +2006,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+     return result;
+ }
+ 
++static std::mutex compute_mutex; // serializes backend compute across connection threads
++
+ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     // serialization format:
+     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+@@ -2083,6 +2085,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+         }
+     }
++    std::lock_guard<std::mutex> lock(compute_mutex);
+     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     sg.graph = graph;
+@@ -2101,6 +2104,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     ggml_cgraph * graph = it->second.graph;
+     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
++    std::lock_guard<std::mutex> lock(compute_mutex);
+     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     return true;
+-- 
+2.43.0
+

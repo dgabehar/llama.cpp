@@ -1,4 +1,4 @@
-From be29ab3c5d9d35f129bd9b157e3a87f57ef75671 Mon Sep 17 00:00:00 2001
+From 9a214a0916e57494e7a65984b0fe2c30de8cf3b1 Mon Sep 17 00:00:00 2001
 From: dgabehar <dgabehar@gmail.com>
 Date: Tue, 15 Sep 2026 16:36:23 -0500
 Subject: [PATCH] vulkan: occupancy-aware S/M/L tile selector for non-coopmat2
@@ -26,13 +26,14 @@ tile for nearly every real shape there. Canarying on gabesrv06 (Radeon
 actually diverges.
 
 Assisted-by: Claude Sonnet
+(cherry picked from commit be29ab3c5d9d35f129bd9b157e3a87f57ef75671)
 ---
  ggml/src/ggml-vulkan/ggml-vulkan.cpp | 69 ++++++++++++++++++++--------
  tests/test-backend-ops.cpp           | 13 ++++++
  2 files changed, 63 insertions(+), 19 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 805f7f7a54..023e05b5d2 100644
+index 3feaa772c..3d3b08842 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -2824,26 +2824,44 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -123,10 +124,10 @@ index 805f7f7a54..023e05b5d2 100644
              if (configs.size() == 2) return 1;
              if (m <= 64 || n <= 64) return 1;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 06fbfde94f..656dc43eb6 100644
+index fd30806ff..b5d90899b 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10641,6 +10641,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10656,6 +10656,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32, 588, {1, 1}, {1, 1})); // 14*14*3, e.g. conv_2d im2col
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {4, 1}, {1, 1}));
  

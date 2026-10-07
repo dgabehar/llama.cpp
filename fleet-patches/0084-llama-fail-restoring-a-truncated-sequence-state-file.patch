@@ -1,0 +1,246 @@
+From cec58d8b29d07568d2a8fb0683ead8bc961e310f Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 6 Oct 2026 15:06:00 -0500
+Subject: [PATCH] llama : fail restoring a truncated sequence state file
+ instead of aborting
+
+llama_io_read_file inherited llama_file::read_raw()'s tolerance for reads
+past the end of the file (it zero-fills, to allow for direct I/O alignment
+padding). A truncated state file was therefore "read" successfully, nread
+overran the file size and GGML_ASSERT(nread <= state_size) aborted the
+process, e.g. when llama-server restored a half-written slot save.
+
+Check the remaining file size in read() and read_tensor() and throw, which
+llama_state_seq_load_file already turns into a failed restore. Also remove
+the partially restored sequence if a restore throws part-way, and bound the
+length fields of the server's checkpoint appendix by the remaining file size.
+
+No change to the on-disk format.
+
+Assisted-by: Claude Sonnet
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+(cherry picked from commit 38e46b01592b634ee4f8409d92286a111afc7ff7)
+---
+ src/llama-context.cpp                     | 21 ++++++-
+ tests/test-save-load-state.cpp            | 72 ++++++++++++++---------
+ tools/server/server-context.cpp           | 10 +++-
+ tools/server/tests/unit/test_slot_save.py | 41 +++++++++++++
+ 4 files changed, 114 insertions(+), 30 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f7401c520..3df918170 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3027,11 +3027,14 @@ public:
+     llama_io_read_file(llama_file * f) : file(f) {}
+ 
+     void read(void * dst, size_t size) override {
++        check_remaining(size);
+         file->read_raw(dst, size);
+         size_read += size;
+     }
+ 
+     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        // check before allocating: a corrupt size field must not trigger a huge allocation
++        check_remaining(size);
+         temp_buffer.resize(size);
+         read(temp_buffer.data(), size);
+         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+@@ -3042,6 +3045,14 @@ public:
+     }
+ 
+ private:
++    // llama_file::read_raw() tolerates reading past the end of the file (it zero-fills, to allow for
++    // direct I/O alignment padding), so a truncated state file would otherwise be read "successfully"
++    void check_remaining(size_t size) const {
++        if (size > file->size() - file->tell()) {
++            throw std::runtime_error("unexpectedly reached end of file");
++        }
++    }
++
+     llama_file * file;
+     size_t size_read = 0;
+     std::vector<uint8_t> temp_buffer;
+@@ -4009,7 +4020,15 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
+ 
+ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+     if (memory) {
+-        memory->state_read(io, seq_id, flags);
++        try {
++            memory->state_read(io, seq_id, flags);
++        } catch (...) {
++            // a short read (truncated state) throws in the middle of the restore: don't leave a partial sequence behind
++            if (seq_id >= 0) {
++                memory->seq_rm(seq_id, -1, -1);
++            }
++            throw;
++        }
+     }
+ 
+     return io.n_bytes();
+diff --git a/tests/test-save-load-state.cpp b/tests/test-save-load-state.cpp
+index 43a513ae5..64985af25 100644
+--- a/tests/test-save-load-state.cpp
++++ b/tests/test-save-load-state.cpp
+@@ -661,6 +661,47 @@ static bool test_state_restore_failure(struct llama_model * model, const struct
+         return false;
+     }
+ 
++    // save a state file, mutate its bytes, and try to restore it
++    const auto restore_file = [&](const std::function<bool(std::vector<uint8_t> &)> & mutate) {
++        GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
++        llama_memory_seq_rm(mem, 0, -1, -1);
++
++        std::vector<uint8_t> data;
++        {
++            std::ifstream f(path, std::ios::binary);
++            data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
++        }
++
++        if (!mutate(data)) {
++            std::remove(path.c_str());
++            return false;
++        }
++
++        {
++            std::ofstream f(path, std::ios::binary);
++            f.write((const char *) data.data(), data.size());
++        }
++
++        llama_tokens tokens_out(tokens_save.size());
++        size_t n_token_count = 0;
++        const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
++        std::remove(path.c_str());
++
++        return nread == 0;
++    };
++
++    // a truncated (e.g. half-written) file must fail to restore, not abort
++    const auto truncate = [](size_t n_cut, bool half) {
++        return [n_cut, half](std::vector<uint8_t> & data) {
++            const size_t cut = half ? data.size()/2 : n_cut;
++            if (data.size() < 3*4096 || cut >= data.size()) {
++                return false;
++            }
++            data.resize(data.size() - cut);
++            return true;
++        };
++    };
++
+     const std::vector<std::pair<const char *, std::function<bool()>>> cases = {
+         { "buffer", [&]() {
+             std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
+@@ -673,33 +714,10 @@ static bool test_state_restore_failure(struct llama_model * model, const struct
+ 
+             return llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == 0;
+         }},
+-        { "file", [&]() {
+-            GGML_ASSERT(llama_state_seq_save_file(ctx.get(), path.c_str(), 0, tokens_save.data(), tokens_save.size()) > 0);
+-            llama_memory_seq_rm(mem, 0, -1, -1);
+-
+-            std::vector<uint8_t> data;
+-            {
+-                std::ifstream f(path, std::ios::binary);
+-                data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+-            }
+-
+-            if (!corrupt_state(data)) {
+-                std::remove(path.c_str());
+-                return false;
+-            }
+-
+-            {
+-                std::ofstream f(path, std::ios::binary);
+-                f.write((const char *) data.data(), data.size());
+-            }
+-
+-            llama_tokens tokens_out(tokens_save.size());
+-            size_t n_token_count = 0;
+-            const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
+-            std::remove(path.c_str());
+-
+-            return nread == 0;
+-        }},
++        { "file", [&]() { return restore_file(corrupt_state); }},
++        { "file, truncated by 1 byte",    [&]() { return restore_file(truncate(1,    false)); }},
++        { "file, truncated by 4096 bytes", [&]() { return restore_file(truncate(4096, false)); }},
++        { "file, truncated by half",      [&]() { return restore_file(truncate(0,    true));  }},
+     };
+ 
+     for (const auto & [name, restore_failed] : cases) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b02092173..a5a4d9319 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2732,8 +2732,14 @@ private:
+ 
+     static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t & n_read) {
+         uint64_t n = 0;
+-        // 16 GiB cap, in case the size field itself is corrupted
+-        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > (1ull << 34)) {
++        if (!ckpt_read(ifs, &n, sizeof(n), n_read)) {
++            return false;
++        }
++        // a corrupted size field must not drive a huge allocation: it can't exceed what is left in the file
++        const std::streamoff pos = ifs.tellg();
++        ifs.seekg(0, std::ios::end);
++        const std::streamoff end = ifs.tellg();
++        if (pos < 0 || end < pos || !ifs.seekg(pos) || n > (uint64_t) (end - pos)) {
+             return false;
+         }
+         buf.resize(n);
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index ba64808af..cbd8f4a1d 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -131,6 +131,47 @@ def test_slot_restore_legacy_token_list():
+ 
+ 
+ 
++@pytest.mark.parametrize("n_cut", [1, 4096, None])  # None: cut the file in half
++def test_slot_restore_truncated_file(n_cut):
++    # a truncated (e.g. half-written) save file must be rejected with an error, never abort the server
++    global server
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of France?",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=save", data={
++        "filename": "slot_full.bin",
++    })
++    assert res.status_code == 200
++
++    path = os.path.join(server.slot_save_path, "slot_full.bin")
++    with open(path, "rb") as f:
++        data = f.read()
++    cut = len(data) // 2 if n_cut is None else n_cut
++    with open(os.path.join(server.slot_save_path, "slot_cut.bin"), "wb") as f:
++        f.write(data[:len(data) - cut])
++
++    res = server.make_request("POST", "/slots/0?action=restore", data={
++        "filename": "slot_cut.bin",
++    })
++    assert res.status_code == 400
++    assert "Unable to restore slot" in res.body["error"]["message"]
++
++    # the server is still alive and the slot is usable
++    assert server.process.poll() is None
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of France?",
++        "id_slot": 0,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++
+ def test_slot_erase():
+     global server
+     server.start()
+-- 
+2.43.0
+

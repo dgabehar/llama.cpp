@@ -1,0 +1,337 @@
+From 532a6fc250e0b134444d068dff5f9f326d7d05ce Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 09:41:52 -0500
+Subject: [PATCH] chat, sampling: K2-Horizon official weights: tool call in
+ reasoning, repeated open tag, empty first-token stop
+
+Root causes (official IFM K2-Horizon-7B Q4_K_M, fleet 2026-09-26, opencode via
+LiteLLM), after the template's "<ifm|think_faster>\n" generation prompt:
+- the model sometimes emits "<ifm|tool_calls>..." without closing the reasoning
+  (8/42 opencode-shaped runs); the parser stayed in reasoning, the whole call
+  became reasoning_content, finish=stop, and the client ended the turn.
+- it sometimes repeats the open tag ("<ifm|think>\n</ifm|think>...", 4/42);
+  the parser only knew the effort's own start tag, so "<ifm|think>" leaked
+  into reasoning_content.
+- it can emit an EOG token (id 1 / 250019) as its very first token (4-12% at
+  temp 1 after an empty assistant turn in the history): a 1-token empty stop.
+
+Fix: analyze_reasoning::start_alts (redundant open tags consumed) and
+implicit_ends_with_tools (<ifm|tool_calls> ends the reasoning when tools are
+offered); an empty-reply guard sampler (common_sampler::eguard, request field
+no_empty_reply_inert) masks EOG until something besides whitespace/reasoning
+tags was generated. Streaming and non-streaming share the one PEG parser.
+
+Verification (42 runs per row, stream + non-stream, low effort, 3080 Ti):
+official file before 13 leaks / 9 tool calls stuck in reasoning / 9 empty
+stops; after 0 / 0 / 0. Community quant before: 15 / 4 / 4 (same quirks, so
+model behaviour, not a weights regression). Guard at /completion level: 6-12
+EOG-first of 100 before, 0 of 100 after. test-chat gets real-output cases that
+fail before and pass after; ctest -L main (58) and -R split-balance pass.
+FLEET.md documents the mechanism and the (identical) GGUF metadata/template.
+
+Assisted-by: Claude Sonnet 5
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+
+(cherry picked from commit 3c994840e; re-derived for upstream b11454: the autoparser/test-chat hunks of this patch are carried by the k2-horizon.cpp port commits)
+---
+ common/chat.h                  |   2 +
+ common/common.h                |   7 ++
+ common/sampling.cpp            | 121 +++++++++++++++++++++++++++++++++
+ tools/server/server-common.cpp |   3 +
+ tools/server/server-schema.cpp |  20 ++++++
+ 5 files changed, 153 insertions(+)
+
+diff --git a/common/chat.h b/common/chat.h
+index c48e286fa..fb2562086 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -290,6 +290,8 @@ struct common_chat_params {
+     std::vector<std::string>            preserved_tokens;
+     std::vector<std::string>            additional_stops;
+     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
++    // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
++    std::vector<std::string>            no_empty_reply_inert;
+     std::string                         parser;
+     common_chat_msg_delimiters          message_delimiters;
+ };
+diff --git a/common/common.h b/common/common.h
+index c04a4ee62..7f44003d5 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -296,6 +296,13 @@ struct common_params_sampling {
+     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+ 
++    // Never let the reply end (EOG tokens masked) before a token other than `no_empty_reply_inert` and
++    // whitespace has been generated. The chat template handling turns this on for models that, after a
++    // reasoning open tag already in the prompt, sometimes emit an end-of-turn token straight away (an
++    // empty stop the client takes for a finished turn): `no_empty_reply_inert` are their reasoning tags.
++    bool                      no_empty_reply = false;
++    std::vector<llama_token>  no_empty_reply_inert;
++
+     bool backend_sampling = false;
+ 
+     // print the parameters into a string
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index d9c508049..d59cfaa92 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -109,11 +109,109 @@ struct ring_buffer {
+     std::vector<T> data;
+ };
+ 
++
++// Empty-reply guard: masks the EOG tokens until the reply holds something besides whitespace and the
++// `inert` tokens (reasoning tags). It sits beside the grammar and the reasoning budget, not in the chain:
++// it must only see generated tokens (the chain also accepts the prompt), and it is cloned/copied with the
++// sampler, so speculative-decoding rollbacks restore its state too.
++struct common_empty_reply_guard {
++    const llama_vocab *      vocab;
++    std::vector<llama_token> eog;
++    std::vector<llama_token> inert;
++    bool                     seen_output = false;
++};
++
++static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
++    return "empty-reply-guard";
++}
++
++static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_token token) {
++    auto * ctx = (common_empty_reply_guard *) smpl->ctx;
++    if (ctx->seen_output || llama_vocab_is_eog(ctx->vocab, token)) {
++        return;
++    }
++    if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
++        return;
++    }
++    const std::string piece = common_token_to_piece(ctx->vocab, token, false);
++    // a control token that renders as nothing is not an answer either, but is not a whitespace token
++    // the model can legitimately chain, so treat anything else than plain whitespace as output
++    const bool blank = piece.find_first_not_of(" \t\r\n") == std::string::npos && !piece.empty();
++    if (!blank) {
++        ctx->seen_output = true;
++    }
++}
++
++static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
++    if (ctx->seen_output) {
++        return;
++    }
++    // never mask the last candidate standing
++    size_t n_other = 0;
++    for (size_t i = 0; i < cur_p->size; ++i) {
++        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) == ctx->eog.end() &&
++            cur_p->data[i].logit != -INFINITY) {
++            n_other++;
++        }
++    }
++    if (n_other == 0) {
++        return;
++    }
++    for (size_t i = 0; i < cur_p->size; ++i) {
++        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) != ctx->eog.end()) {
++            cur_p->data[i].logit = -INFINITY;
++        }
++    }
++}
++
++static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
++    ((common_empty_reply_guard *) smpl->ctx)->seen_output = false;
++}
++
++static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl);
++
++static void common_empty_reply_guard_free(struct llama_sampler * smpl) {
++    delete (common_empty_reply_guard *) smpl->ctx;
++}
++
++static struct llama_sampler_i common_empty_reply_guard_i = {
++    /* .name              = */ common_empty_reply_guard_name,
++    /* .accept            = */ common_empty_reply_guard_accept,
++    /* .apply             = */ common_empty_reply_guard_apply,
++    /* .reset             = */ common_empty_reply_guard_reset,
++    /* .clone             = */ common_empty_reply_guard_clone,
++    /* .free              = */ common_empty_reply_guard_free,
++    /* .backend_init      = */ nullptr,
++    /* .backend_accept    = */ nullptr,
++    /* .backend_apply     = */ nullptr,
++    /* .backend_set_input = */ nullptr,
++    /* .backend_reset     = */ nullptr,
++    /* .copy_state        = */ nullptr,
++};
++
++static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl) {
++    return llama_sampler_init(&common_empty_reply_guard_i,
++            new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
++}
++
++static struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert) {
++    auto * ctx = new common_empty_reply_guard { vocab, {}, inert, false };
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    for (llama_token id = 0; id < n_vocab; ++id) {
++        if (llama_vocab_is_eog(vocab, id)) {
++            ctx->eog.push_back(id);
++        }
++    }
++    return llama_sampler_init(&common_empty_reply_guard_i, ctx);
++}
++
+ struct common_sampler {
+     common_params_sampling params;
+ 
+     struct llama_sampler * grmr;
+     struct llama_sampler * rbudget;
++    struct llama_sampler * eguard; // empty-reply guard, see above
+     struct llama_sampler * chain;
+ 
+     ring_buffer<llama_token> prev;
+@@ -209,6 +307,7 @@ struct common_sampler * common_sampler_init(
+ 
+     llama_sampler * grmr = nullptr;
+     llama_sampler * rbudget = nullptr;
++    llama_sampler * eguard  = nullptr;
+     llama_sampler * chain = llama_sampler_chain_init(lparams);
+ 
+     std::vector<llama_sampler *> samplers;
+@@ -341,6 +440,10 @@ struct common_sampler * common_sampler_init(
+         }
+     }
+ 
++    if (params.no_empty_reply) {
++        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert);
++    }
++
+     if (params.mirostat == 0) {
+ 
+         bool use_adaptive_p = false; // see below
+@@ -428,10 +531,17 @@ struct common_sampler * common_sampler_init(
+         params.backend_sampling = false;
+     }
+ 
++    if (eguard && params.backend_sampling) {
++        LOG_WRN("%s: backend sampling is not compatible with the empty-reply guard, disabling\n", __func__);
++
++        params.backend_sampling = false;
++    }
++
+     auto * result = new common_sampler {
+         /* .params  = */ params,
+         /* .grmr    = */ grmr,
+         /* .rbudget = */ rbudget,
++        /* .eguard  = */ eguard,
+         /* .chain   = */ chain,
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+@@ -450,6 +560,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
+ 
+     llama_sampler_free(gsmpl->grmr);
+     llama_sampler_free(gsmpl->rbudget);
++    llama_sampler_free(gsmpl->eguard);
+     llama_sampler_free(gsmpl->chain);
+ 
+     delete gsmpl;
+@@ -499,6 +610,10 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
+         llama_sampler_accept(gsmpl->grmr, token);
+     }
+ 
++    if (gsmpl->eguard && is_generated) {
++        llama_sampler_accept(gsmpl->eguard, token);
++    }
++
+     llama_sampler_accept(gsmpl->chain, token);
+ 
+     gsmpl->prev.push_back(token);
+@@ -517,6 +632,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
++        /* .eguard  = */ llama_sampler_clone(gsmpl->eguard),
+         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+@@ -532,9 +648,11 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+ 
+     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
+     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
++    GGML_ASSERT((src->eguard == nullptr) == (dst->eguard == nullptr));
+ 
+     llama_sampler_copy(src->grmr,    dst->grmr);
+     llama_sampler_copy(src->rbudget, dst->rbudget);
++    llama_sampler_copy(src->eguard,  dst->eguard);
+     llama_sampler_copy(src->chain,   dst->chain);
+ 
+     dst->params     = src->params;
+@@ -624,6 +742,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ 
+             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
++            GGML_ASSERT(!gsmpl->eguard  && "using the empty-reply guard in combination with backend sampling is not supported");
+ 
+             for (size_t i = 0; i < cur_p.size; ++i) {
+                 if (cur_p.data[i].id == id) {
+@@ -638,6 +757,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ 
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
++    llama_sampler_apply(gsmpl->eguard, &cur_p);
+ 
+     if (grammar_first && grammar_should_apply(gsmpl)) {
+         llama_sampler_apply(grmr, &cur_p);
+@@ -669,6 +789,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     gsmpl->set_logits(ctx, idx);
+ 
+     llama_sampler_apply(rbudget,  &cur_p);
++    llama_sampler_apply(gsmpl->eguard, &cur_p);
+ 
+     if (grammar_should_apply(gsmpl)) {
+         llama_sampler_apply(grmr,  &cur_p);
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 824aba815..6c0597933 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1448,6 +1448,9 @@ json oaicompat_chat_params_parse(
+     if (!chat_params.stops_after_reasoning.empty()) {
+         llama_params["stop_after_reasoning"] = chat_params.stops_after_reasoning;
+     }
++    if (!chat_params.no_empty_reply_inert.empty()) {
++        llama_params["no_empty_reply_inert"] = chat_params.no_empty_reply_inert;
++    }
+     if (!chat_params.parser.empty()) {
+         llama_params["chat_parser"] = chat_params.parser;
+     }
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 38f1617e6..e25187c9a 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -502,6 +502,26 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+             }
+         }));
+ 
++    add((new field_json("no_empty_reply_inert"))
++        ->set_desc("Tags (reasoning open/close) that do not count as reply content: while only these and whitespace have been generated, end-of-generation tokens are masked. Set by the chat template handling for models that sometimes end the turn with their first token")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            ctx.params.sampling.no_empty_reply = false;
++            ctx.params.sampling.no_empty_reply_inert.clear();
++            const auto & tags = data.at("no_empty_reply_inert");
++            if (tags.is_array()) {
++                for (const auto & tag : tags) {
++                    if (!tag.is_string() || tag.get<std::string>().empty()) {
++                        continue;
++                    }
++                    ctx.params.sampling.no_empty_reply = true;
++                    const auto toks = common_tokenize(ctx.vocab, tag.get<std::string>(), false, true);
++                    if (toks.size() == 1) {
++                        ctx.params.sampling.no_empty_reply_inert.push_back(toks[0]);
++                    }
++                }
++            }
++        }));
++
+     add((new field_json("stop_after_reasoning"))
+         ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+-- 
+2.43.0
+

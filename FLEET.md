@@ -73,10 +73,10 @@ bookkeeping commits. Rollback anchor: tags `pre-merge-2026-10-06`
 
 **Re-derived against upstream (no behaviour change intended):** `-fit` probe/clamp
 (`common/fit.cpp`) uses upstream's `n_streams` again (#29437 revert); `n_ctx_max`
-stays non-const. K2-Horizon pre-tokenizer enum renumbered to
-`LLAMA_VOCAB_PRE_TYPE_K2_HORIZON = 61` (upstream MMBERT took 60). `conversion/base.py`
-keeps our `pytorch_model*.safetensors` fallback plus upstream's
-`model.safetensors.index.json` clause. Compile fixes folded into their owning
+stays non-const. (Superseded by the K2 adoption section below: K2-Horizon model, conversion
+and tokenizer code is upstream's now, so the fork's `pytorch_model*.safetensors` fallback
+in `conversion/base.py` is gone; convert future K2 weights with upstream's converter, which
+takes the chat template from the HF tokenizer.) Compile fixes folded into their owning
 commits: CPU locality `layer_buft` initialiser gets `.alloc_buffer_n`/`.get_alloc_size_n`
 (#23671); `fs_get_cache_directory()` returns `std::filesystem::path` (#29595);
 `tests/test-state-capture.cpp` fills `llama_batch` directly (`common_batch_add`
@@ -88,6 +88,70 @@ removed by the `llama_batch_ext` migration).
 `.bin` files are not interchangeable in either direction; flush `slotSavePath`
 on rollout and on rollback, and update `kvrepl_nstream_convert.py` before the
 image bump (see checklist). The fork's SCKP checkpoint appendix (version 1) is unchanged.
+
+## Upstream sync 2026-10 K2 adoption (rebased onto upstream `4625240437` = tag b11454, added 2026-10-07)
+
+Branch `upstream-sync-2026-10-k2` = upstream `4625240437c6821ee5c2da99e12d4817c6a8f07f`
+(`model : add K2 Horizon dense and MoVA support (#29535)`, tag **b11454**) + the fork
+commits of the 2026-10 sync (base b11444) re-applied on top. Upstream's native K2-Horizon
+support (model, conversion, tokenizer, EOG, chat parser) replaces the fork's copy of it;
+the fork keeps what upstream does not have. `LLAMA_STATE_SEQ_VERSION` is **4 at b11444
+and at b11454** (no change; `include/llama.h` has no `VERSION`/`FLAGS` diff, and
+`src/llama-kv-cache.cpp` / `src/llama-context.cpp` are untouched), so the slot-save
+format, `kvrepl_nstream_convert.py` and `stateSeqVersion: 4` carry over unchanged.
+
+**K2 patches dropped (6), upstream has the same code:** `k2-horizon: adapt to
+hparams.n_ff_exp API drift` (upstream reads `n_ff_exp_arr`), `unicode: add the K2-Horizon
+pre-tokenizer splitter`, `tests: expand K2 Horizon unicode splitter coverage`,
+`unicode: handle K2 Horizon case folding and empty input` (upstream carries all three; token
+ids identical on the real 250,624-token vocab), `vocab: recognize K2-Horizon's <|ifm|im_end|>
+as an EOG token` (same line upstream), `conversion: fix flake8 lint violations in
+k2_horizon.py` (upstream rewrote the file).
+
+**K2 patches replaced by upstream's (6):** `model: K2 Horizon gguf conversion code`,
+`model: loading hparams and tensors in k2-horizon.cpp`, `model: K2 Horizon compute graph`,
+`model: K2 Horizon compute graph adjustment and registering tokenizers`,
+`model: K2 Horizon chat template and accomodate safetensors naming` (upstream's
+`conversion/k2_horizon.py`, `src/models/k2-horizon.cpp`, `models/templates/IFM-K2-Horizon.jinja`),
+and `chat: add K2-Horizon workaround for reasoning-tag auto-detection` (upstream's
+`common/parsers/k2-horizon.cpp` detects the tag per effort). The fleet GGUFs need no
+regeneration: same arch string, KV keys, tensor names and pre-tokenizer enum 61 (checked
+against the official IFM Q4_K_M header; greedy and seeded output identical to the fork's
+graph on a GGUF with the 7B's layout, CPU).
+
+**K2 patches kept and re-derived onto `common/parsers/k2-horizon.cpp` (19):** the chat
+tolerance (any effort's close tag, repeated open tag, tool call with no reasoning close,
+optional section/call end tags, always-parallel calls, args in any order, Kimi-form calls,
+stray tags and harmony delimiters, no tool markup in content without tools, complete-JSON
+gate, never-throw `lenient-fallback`), the sampler guard feeds (`no_empty_reply_inert` /
+`hold` / `open`, `stops_after_reasoning`) and the sampler itself (unchanged),
+`k2_history_reasoning` (`common/chat.cpp`, unchanged). The autoparser K2 block in
+`common/chat-diff-analyzer.cpp` and its K2-only fields are gone. Upstream's
+`common/parsers/k2-horizon.cpp` is the single source for the K2 tag lists.
+
+**Why a plain rebase is not enough (do not "simplify" this away):** upstream routes any
+template containing `<|ifm|im_start|>` and `<ifm|tool_calls>` to its own specialized parser in
+`common_chat_try_specialized_template`, BEFORE the autoparser runs. A rebase that keeps the
+autoparser K2 block applies clean, compiles, and silently disables it: 12 of the 35 QA-proven
+behaviours pass instead of 34, and the EOG-guard inputs come back empty (guard disarmed). The
+fork's `tests/test-chat.cpp` K2 blocks catch the clash, and `test_k2_guard_fields` pins the
+guard inputs. At startup `common_chat_templates_init` renders a K2 template once and the
+server log carries `K2-Horizon parser: guard inert=6 hold=10`; home-infrastructure's
+`deploy-llamacpp-rpc.yml` fails a `k2horizon7b-*` leg without that line. Fixture: `models/templates/k2-horizon.jinja` is the template the official GGUF
+embeds (md5 `2aafe220`), kept only for tests; the K2 blocks run against it and against
+upstream's `IFM-K2-Horizon.jinja`.
+
+**RPC `-sm tensor` (upstream #26610, b11450, RPC protocol major 8):** async graph compute
+with per-uid stored graphs conflicted with the multi-client patches (`rpc : serialize backend
+compute`, `rpc : per-connection backends`, `rpc : keep one bad client from taking down the
+whole server`). Re-derived: every connection owns its backends (created on first compute,
+`comm_states` per connection); `--serialize-compute` keeps one shared backend per device and
+now synchronizes under the device lock (async compute would otherwise let connections
+interleave on it); a failed compute drops the connection (and its stored graph) instead of
+asserting. `sync_all_backends` only touches the backends the connection has. Protocol major is
+8, so masters and workers must run the same image (one fleet image already). Tests:
+`test-rpc-server-multiclient`, `test-rpc-client-timeout`, `test-rpc-multi-server`. No RPC
+worker pool is deployed today, so live exposure is low.
 
 ### Upstream-sync compatibility checklist (run on every sync, before the image bump)
 
@@ -123,6 +187,10 @@ home-infrastructure artifact must change in the same series.
    llama-server pytest suite (`tools/server/tests`, `-m "not slow"`).
 7. Conflicts are resolved against upstream's new structure, never by preserving old
    shape (operator rule); drop a patch outright when upstream made it redundant.
+8. A specialized parser upstream (`common_chat_try_specialized_template`, `common/parsers/`)
+   can pre-empt a fork autoparser workaround: it compiles and applies clean and the
+   workaround never runs. On every sync run `tests/test-chat` (the K2 blocks and
+   `test_k2_guard_fields`) and check the deploy log for `K2-Horizon parser: guard inert=6 hold=10`.
 
 home-infrastructure artifacts to update **before** the `LLAMACPP_REF` bump lands:
 - `deployments/llamacpp-rpc/scripts/kvrepl_nstream_convert.py` (`BIN_VERSION`, any new
@@ -717,12 +785,13 @@ closed). Would be offered upstream as a PR; not opened.
 - **K2-Horizon reasoning tags** (2026-09-25, `8519f34e6`): the template
   opens the reasoning with the tag for the request's `reasoning_effort`, but
   the model does not always close with the same one. At the fleet's "low"
-  it often ends with the "high" tag `</ifm|think>`. The parser workaround in
-  `chat-diff-analyzer.cpp` accepts all three close tags (`end_alts`).
+  it often ends with the "high" tag `</ifm|think>`. The parser
+  (`common/parsers/k2-horizon.cpp` since the 2026-10 K2 adoption; formerly the autoparser
+  workaround in `chat-diff-analyzer.cpp`) accepts all three close tags.
   Symptom when it breaks: empty `content`, the whole reply plus a raw
   `</ifm|...>` tag in `reasoning_content`. The model also sometimes answers,
   emits a second close tag and starts over with a garbled copy. Content ends
-  at any close tag after the reasoning (`analyze_content::stray_ends`), and
+  at any close tag after the reasoning (`stray_ends` in `common/parsers/k2-horizon.cpp`), and
   generation stops there too. The server gets the same tags as
   `stop_after_reasoning`: stop strings that count only once one of them has
   closed the reasoning, so the dropped remainder is never decoded. Neither
@@ -805,10 +874,8 @@ closed). Would be offered upstream as a PR; not opened.
   p99 3500 chars, ~1200 tokens at p99, x2), then EOG is released again and a
   debug line is logged; the cap only restores the old behaviour, it never
   truncates. Still out of the sampler chain, cloned/reset with the sampler,
-  never masks the last candidate. The tag list lives once, in the K2 block of
-  `common/chat-diff-analyzer.cpp` (this fork's parser is derived from the
-  template, so there is no separate constants file; the names match upstream
-  PR ggml-org/llama.cpp#29535's k2-horizon.cpp).
+  never masks the last candidate. The tag list lives once, in
+  `common/parsers/k2-horizon.cpp` (upstream's K2 parser, ggml-org/llama.cpp#29535).
   Reproduction: NOT reproduced naturally in ~220 opencode-shaped runs (replay
   of the stalled turns, padded 0-50K ctx, stream + non-stream, effort low,
   temp 0.6-1.0: 0 Kimi openers; the trigger probably needs opencode's real
@@ -904,11 +971,12 @@ closed). Would be offered upstream as a PR; not opened.
   R17 live 4 independent seeds 0 empty / 0 runaway / 0 badcall; F7 t3 19/20 OK;
   R01 0/48, R01b 0/48 (baseline fleet build: 4/144 on junk-history replay, 20/20
   leaks at medium/high effort). Pending: garage R17 and a decode-speed check.
-  **Upstream rebase point:** ggml-org/llama.cpp PR
-  [#29535](https://github.com/ggml-org/llama.cpp/pull/29535) (open, K2 Horizon
-  support). When it lands, rebase onto it; our patches still needed on top: the
-  EOG guard, bare `<ifm|tool_call>`, Kimi-form opener, `<|close|>` leak,
-  optional-before-required argument order, and the repetition breaker.
+  **Upstream:** ggml-org/llama.cpp PR
+  [#29535](https://github.com/ggml-org/llama.cpp/pull/29535) landed (b11454, 2026-10-07 sync).
+  Model/conversion/tokenizer/EOG are upstream's now; the EOG guard, bare `<ifm|tool_call>`,
+  Kimi-form opener, `<|close|>` leak, optional-before-required argument order and the
+  repetition breaker stay ours, re-derived onto upstream's `common/parsers/k2-horizon.cpp`
+  (see "Upstream sync 2026-10 K2 adoption").
 
 - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's

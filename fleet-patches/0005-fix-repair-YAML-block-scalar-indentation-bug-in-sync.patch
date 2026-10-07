@@ -1,4 +1,4 @@
-From c4fffee0a58053bc2aad9d0e3b7e73015cd74ec9 Mon Sep 17 00:00:00 2001
+From c9f33743442df7ed8d88fee899ceb001afa39805 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 21:01:01 -0500
 Subject: [PATCH] fix: repair YAML block-scalar indentation bug in sync
@@ -6,12 +6,13 @@ Subject: [PATCH] fix: repair YAML block-scalar indentation bug in sync
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+(cherry picked from commit c4fffee0a58053bc2aad9d0e3b7e73015cd74ec9)
 ---
  .github/workflows/sync-fleet-patches.yml | 19 ++++++++++++-------
  1 file changed, 12 insertions(+), 7 deletions(-)
 
 diff --git a/.github/workflows/sync-fleet-patches.yml b/.github/workflows/sync-fleet-patches.yml
-index 258a40b59e..35509aa103 100644
+index 258a40b59..35509aa10 100644
 --- a/.github/workflows/sync-fleet-patches.yml
 +++ b/.github/workflows/sync-fleet-patches.yml
 @@ -88,15 +88,20 @@ jobs:

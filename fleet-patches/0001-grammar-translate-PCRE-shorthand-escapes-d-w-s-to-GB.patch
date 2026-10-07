@@ -1,4 +1,4 @@
-From b416db4f3917921d988248d77dfec6c5f97e5196 Mon Sep 17 00:00:00 2001
+From 54b555076d6100be01b6f7cddad8175eaa18f9da Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:05 -0500
 Subject: [PATCH] grammar: translate PCRE shorthand escapes (\d \w \s) to GBNF
@@ -73,6 +73,7 @@ No upstream PR tracks this -- original work, not a vendored port.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
+(cherry picked from commit b416db4f3917921d988248d77dfec6c5f97e5196)
 ---
  common/json-schema-to-grammar.cpp | 82 ++++++++++++++++++++++++++++++-
  1 file changed, 81 insertions(+), 1 deletion(-)

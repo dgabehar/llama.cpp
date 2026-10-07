@@ -852,6 +852,28 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
             LOG_ERR("%s: failed to parse tool use chat template (ignoring it): %s\n", __func__, e.what());
         }
     }
+
+    // K2-Horizon: render once with a tool at startup. The parser logs "K2-Horizon parser: guard inert=.. hold=.." (the
+    // deploy workflow greps for it) and this fails loudly if it ever stops feeding the sampler's empty-reply guard
+    // (upstream's specialized parser once pre-empted the fork's workaround and silently disarmed it).
+    if (default_template_src.find("<|ifm|im_start|>") != std::string::npos && default_template_src.find("<ifm|tool_calls>") != std::string::npos) {
+        try {
+            common_chat_msg user;
+            user.role    = "user";
+            user.content = "hi";
+            common_chat_templates_inputs probe;
+            probe.messages              = { user };
+            probe.tools                 = { common_chat_tool{ "probe", "probe", R"({"type":"object","properties":{}})" } };
+            probe.add_generation_prompt = true;
+            probe.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+            const auto params = common_chat_templates_apply(tmpls.get(), probe);
+            if (params.no_empty_reply_inert.empty() || params.no_empty_reply_hold.empty()) {
+                LOG_ERR("%s: K2-Horizon sampler guard NOT armed: the chat parser fed no empty-reply guard inputs\n", __func__);
+            }
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: K2-Horizon startup self-check failed: %s\n", __func__, e.what());
+        }
+    }
     return tmpls;
 }
 
@@ -1183,6 +1205,14 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|end_of_msg|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Kimi K3\n");
         return common_chat_params_init_kimi_k3(tmpl, params);
+    }
+
+    // K2 Horizon - <|ifm|im_start|> turns, <ifm|think*> reasoning picked by reasoning_effort and
+    // <ifm|tool_calls> sections; the three think tag pairs defeat the autoparser's reasoning detection
+    if (src.find("<|ifm|im_start|>") != std::string::npos &&
+        src.find("<ifm|tool_calls>") != std::string::npos) {
+        LOG_DBG("Using specialized template: K2 Horizon\n");
+        return common_chat_params_init_k2_horizon(tmpl, params);
     }
 
     // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged

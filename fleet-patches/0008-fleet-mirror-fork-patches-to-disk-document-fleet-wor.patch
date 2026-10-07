@@ -1,4 +1,4 @@
-From d5a1ba215ebc61399d8796947a82c66d7750da82 Mon Sep 17 00:00:00 2001
+From 5bf7745275061e99aa0d75c23f4dc0298aa4118c Mon Sep 17 00:00:00 2001
 From: dgabehar <dgabehar@gmail.com>
 Date: Tue, 15 Sep 2026 09:14:43 -0500
 Subject: [PATCH] fleet: mirror fork patches to disk, document fleet workflow
@@ -19,6 +19,7 @@ bugs already fixed there, a third -- MTP+grammar corruption -- found
 today, not yet patched).
 
 Assisted-by: Claude Sonnet 5
+(cherry picked from commit d5a1ba215ebc61399d8796947a82c66d7750da82)
 ---
  CLAUDE.md | 2 ++
  1 file changed, 2 insertions(+)

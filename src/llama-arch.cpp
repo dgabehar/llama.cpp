@@ -60,6 +60,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA4,           "gemma4"           },
     { LLM_ARCH_GEMMA4_ASSISTANT, "gemma4-assistant" },
     { LLM_ARCH_GEMMA_EMBEDDING,  "gemma-embedding"  },
+    { LLM_ARCH_GEMMA_EMBEDDING2, "gemma-embedding2" },
     { LLM_ARCH_STARCODER2,       "starcoder2"       },
     { LLM_ARCH_MAMBA,            "mamba"            },
     { LLM_ARCH_MAMBA2,           "mamba2"           },
@@ -278,6 +279,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_SLIDING_WINDOW,               "%s.attention.sliding_window"               },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,       "%s.attention.sliding_window_pattern"       },
     { LLM_KV_ATTENTION_ROPE_PATTERN,                 "%s.attention.rope_pattern"                 },
+    { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,           "%s.attention.value_expert_count"           },
+    { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,      "%s.attention.value_expert_used_count"      },
 
     { LLM_KV_ATTENTION_SCALE,                        "%s.attention.scale"                        },
     { LLM_KV_ATTENTION_OUTPUT_SCALE,                 "%s.attention.output_scale"                 },
@@ -435,10 +438,6 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_XIELU_ALPHA_P,         "xielu.alpha_p"         },
     { LLM_KV_XIELU_BETA,            "xielu.beta"            },
     { LLM_KV_XIELU_EPS,             "xielu.eps"             },
-
-    // K2 Horizon MoVA
-    { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,          "%s.attention.value_expert_count"},
-    { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,     "%s.attention.value_expert_used_count"},
 
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
@@ -739,8 +738,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
-    { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate"},
-    { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps"},
+    { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate" },
+    { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps" },
 };
 
 // declare information about the model weight tensors:
@@ -1051,7 +1050,6 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-    // K2 Horizon MoVA
     {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
 };
@@ -1235,6 +1233,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_K2_HORIZON:
             return false;
         default:
             return true;

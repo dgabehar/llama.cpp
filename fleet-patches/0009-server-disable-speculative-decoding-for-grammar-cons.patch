@@ -1,4 +1,4 @@
-From 3e7b73528e30333296c40860a1213cd75622478c Mon Sep 17 00:00:00 2001
+From 2cdf6bce04a11ccdc36c6e8718424b16b1816e62 Mon Sep 17 00:00:00 2001
 From: dgabehar <dgabehar@gmail.com>
 Date: Tue, 15 Sep 2026 11:50:19 -0500
 Subject: [PATCH] server: disable speculative decoding for grammar-constrained
@@ -47,12 +47,13 @@ the same underlying phenomenon; this fleet already caps
 --spec-draft-n-max at 2 for that).
 
 Assisted-by: Claude Sonnet 5
+(cherry picked from commit 3e7b73528e30333296c40860a1213cd75622478c)
 ---
  tools/server/server-context.cpp | 23 +++++++++++++++++++++++
  1 file changed, 23 insertions(+)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 71a090f2fc..6bdd143665 100644
+index 71a090f2f..6bdd14366 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -521,6 +521,29 @@ struct server_slot {

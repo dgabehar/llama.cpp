@@ -1,0 +1,63 @@
+From b95797a748e3823430905e81162f5e061924065c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 17:18:13 -0500
+Subject: [PATCH] chat : drop whitespace between reasoning end tag and content
+
+K2-Horizon (and any other tag-based reasoning model) can leave a plain
+formatting newline right after its reasoning close tag, most visibly
+when the reasoning block itself is empty at low effort. The generated
+PEG parser had nothing consuming that gap: analyze_content::build_parser
+went straight from the reasoning parser's closer into the content
+capture, so the newline landed at the front of "content" instead of
+being dropped like the whitespace already discarded from a
+whitespace-only reasoning_content.
+
+Reproduced live: 2/10 requests to K2-Horizon-7B (reasoning_effort low,
+reasoning_format auto) returned content starting with "\n". The other
+8/10 returned correct content, some prefixed with the model's own ": "
+text, which must not be stripped.
+
+Fix: consume optional whitespace with p.space() right after the
+reasoning parser, before content starts -- the same pattern already
+used for the JSON response-format path in build_parser. Applied to
+both analyze_content::build_parser branches (always-wrapped and
+stray-ends), gated on ctx.extracting_reasoning so a model with no
+reasoning tags at all keeps any leading whitespace it genuinely emits.
+
+Added test-chat.cpp cases: empty reasoning + newline, empty reasoning +
+": " (must be preserved), non-empty reasoning + double newline. Live
+recheck after the fix: 0/10 leading-whitespace content.
+
+Assisted-by: Claude Sonnet 5
+(cherry picked from commit 599dd43b0edefced31b94ace3e5cc34dce838077)
+---
+ common/chat-auto-parser-generator.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index b78789d8c0..f929546445 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -161,10 +161,18 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+ 
+     if (is_always_wrapped()) {
+         if (ctx.extracting_reasoning) {
+-            return ctx.reasoning_parser + start + p.content(p.until(end)) + end + p.end();
++            // p.space() drops any whitespace the model leaves between the reasoning end tag
++            // and the content start tag (e.g. an empty K2-Horizon reasoning block followed by
++            // a formatting newline) so it never lands at the front of content.
++            return ctx.reasoning_parser + p.space() + start + p.content(p.until(end)) + end + p.end();
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
++    if (ctx.extracting_reasoning) {
++        // Drop whitespace between the reasoning end tag and the content, only when reasoning was
++        // actually parsed out, so a model with no reasoning tags keeps any leading whitespace it emits.
++        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
++    }
+     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
+ }
+ 
+-- 
+2.43.0
+
