@@ -208,6 +208,52 @@ int main(int argc, char ** argv) {
     CHECK(eog_allowed(g));
     llama_sampler_free(g);
 
+    // ---- live loop 2026-09-29 (opencode session ses_f16214d2..., ~1500 tokens): the opener repeated with blank
+    // lines between the repeats, no call ever started. Real text, trimmed. The repeat releases EOG at once.
+    const std::string loop1 = "\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n\n\n\n\n\n";
+    const std::string loop2 = "<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n\n\n\n\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n";
+    for (const std::vector<std::string> & h : { hold, full, std::vector<std::string>() }) {
+        g = common_sampler_init_empty_reply_guard(vocab, {}, h);
+        feed(g, vocab, loop1);
+        CHECK(!eog_allowed(g));             // the first opener still holds
+        feed(g, vocab, loop2);
+        CHECK(eog_allowed(g));              // repeated with no end marker: looping, release
+        feed(g, vocab, "<|tool_calls_section_begin|><|tool_call_begin|>");
+        CHECK(eog_allowed(g));              // and it stays released
+        llama_sampler_free(g);
+    }
+    // a repeated bare call opener is a loop too; a call after a finished one is not
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "<|tool_call_begin|>x<|tool_call_end|><|tool_call_begin|>y");
+    CHECK(!eog_allowed(g));
+    feed(g, vocab, "<|tool_call_begin|>");
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+
+    // the Kimi hold has its own small cap (k_kimi_hold_cap), the native hold keeps 2048
+    const int kcap = 192;
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "<|tool_calls_section_begin|>"); // the cap counts the tokens after the opener marker
+    for (int i = 0; i < kcap - 1; ++i) {
+        llama_sampler_accept(g, g_other);
+    }
+    CHECK(!eog_allowed(g));
+    llama_sampler_accept(g, g_other);
+    CHECK(eog_allowed(g));
+    llama_sampler_free(g);
+    // ... and switching to the native format after the Kimi opener gives the native cap
+    g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
+    feed(g, vocab, "<|tool_calls_section_begin|><|tool_call_begin|>");
+    for (int i = 0; i < 100; ++i) {
+        llama_sampler_accept(g, g_other);
+    }
+    feed(g, vocab, "<ifm|tool_calls>");
+    for (int i = 0; i < cap - 2; ++i) {     // far past the Kimi cap
+        llama_sampler_accept(g, g_other);
+    }
+    CHECK(!eog_allowed(g));
+    llama_sampler_free(g);
+
     // never mask the last candidate standing
     g = common_sampler_init_empty_reply_guard(vocab, {}, hold);
     feed(g, vocab, "<ifm|tool_calls>");
