@@ -1451,6 +1451,9 @@ json oaicompat_chat_params_parse(
     if (!chat_params.no_empty_reply_inert.empty()) {
         llama_params["no_empty_reply_inert"] = chat_params.no_empty_reply_inert;
     }
+    if (!chat_params.no_empty_reply_hold.empty()) {
+        llama_params["no_empty_reply_hold"] = chat_params.no_empty_reply_hold;
+    }
     if (!chat_params.parser.empty()) {
         llama_params["chat_parser"] = chat_params.parser;
     }
