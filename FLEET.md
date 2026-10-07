@@ -135,7 +135,9 @@ template containing `<|ifm|im_start|>` and `<ifm|tool_calls>` to its own special
 autoparser K2 block applies clean, compiles, and silently disables it: 12 of the 35 QA-proven
 behaviours pass instead of 34, and the EOG-guard inputs come back empty (guard disarmed). The
 fork's `tests/test-chat.cpp` K2 blocks catch the clash, and `test_k2_guard_fields` pins the
-guard inputs. Fixture: `models/templates/k2-horizon.jinja` is the template the official GGUF
+guard inputs. At startup `common_chat_templates_init` renders a K2 template once and the
+server log carries `K2-Horizon parser: guard inert=6 hold=10`; home-infrastructure's
+`deploy-llamacpp-rpc.yml` fails a `k2horizon7b-*` leg without that line. Fixture: `models/templates/k2-horizon.jinja` is the template the official GGUF
 embeds (md5 `2aafe220`), kept only for tests; the K2 blocks run against it and against
 upstream's `IFM-K2-Horizon.jinja`.
 
