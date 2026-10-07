@@ -111,7 +111,10 @@ struct ring_buffer {
 
 
 // Empty-reply guard: masks the EOG tokens until the reply holds something besides whitespace and the
-// `inert` tokens (reasoning tags). It sits beside the grammar and the reasoning budget, not in the chain:
+// `inert` tokens (reasoning tags), and again while the text is inside an unfinished Kimi-K2-style tool-call
+// opener (`<|tool_calls_section_begin|>` / `<|tool_call_begin|>` ... its end marker). K2-Horizon spells those
+// with ordinary pieces (they are not vocab tokens) and sometimes stops right after the opener, which the client
+// takes for a finished turn. It sits beside the grammar and the reasoning budget, not in the chain:
 // it must only see generated tokens (the chain also accepts the prompt), and it is cloned/copied with the
 // sampler, so speculative-decoding rollbacks restore its state too.
 struct common_empty_reply_guard {
@@ -119,7 +122,44 @@ struct common_empty_reply_guard {
     std::vector<llama_token> eog;
     std::vector<llama_token> inert;
     bool                     seen_output = false;
+    // unconsumed tail of the generated text (a marker may span pieces) and the Kimi opener state
+    std::string              tail;
+    bool                     in_section = false;
+    bool                     in_call    = false;
 };
+
+static const char * const k_kimi_markers[] = {
+    "<|tool_calls_section_begin|>", "<|tool_calls_section_end|>", "<|tool_call_begin|>", "<|tool_call_end|>",
+};
+
+// consume the Kimi tool-call markers found in `tail`, keeping only what may still be the start of one
+static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
+    for (;;) {
+        size_t best  = std::string::npos;
+        int    which = -1;
+        for (int i = 0; i < 4; ++i) {
+            const size_t pos = ctx->tail.find(k_kimi_markers[i]);
+            if (pos != std::string::npos && pos < best) {
+                best  = pos;
+                which = i;
+            }
+        }
+        if (which < 0) {
+            break;
+        }
+        switch (which) {
+            case 0: ctx->in_section = true;  break;
+            case 1: ctx->in_section = false; ctx->in_call = false; break;
+            case 2: ctx->in_call    = true;  break;
+            case 3: ctx->in_call    = false; break;
+        }
+        ctx->tail.erase(0, best + strlen(k_kimi_markers[which]));
+    }
+    const size_t keep = 27; // longest marker minus one
+    if (ctx->tail.size() > keep) {
+        ctx->tail.erase(0, ctx->tail.size() - keep);
+    }
+}
 
 static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
     return "empty-reply-guard";
@@ -127,13 +167,18 @@ static const char * common_empty_reply_guard_name(const struct llama_sampler * /
 
 static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_token token) {
     auto * ctx = (common_empty_reply_guard *) smpl->ctx;
-    if (ctx->seen_output || llama_vocab_is_eog(ctx->vocab, token)) {
+    if (llama_vocab_is_eog(ctx->vocab, token)) {
         return;
     }
     if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
         return;
     }
     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
+    ctx->tail += piece;
+    common_empty_reply_guard_scan(ctx);
+    if (ctx->seen_output) {
+        return;
+    }
     // a control token that renders as nothing is not an answer either, but is not a whitespace token
     // the model can legitimately chain, so treat anything else than plain whitespace as output
     const bool blank = piece.find_first_not_of(" \t\r\n") == std::string::npos && !piece.empty();
@@ -144,7 +189,7 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
 
 static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
-    if (ctx->seen_output) {
+    if (ctx->seen_output && !ctx->in_section && !ctx->in_call) {
         return;
     }
     // never mask the last candidate standing
@@ -166,7 +211,10 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
 }
 
 static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
-    ((common_empty_reply_guard *) smpl->ctx)->seen_output = false;
+    auto * ctx = (common_empty_reply_guard *) smpl->ctx;
+    ctx->seen_output = false;
+    ctx->tail.clear();
+    ctx->in_section = ctx->in_call = false;
 }
 
 static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_sampler * smpl);
@@ -195,8 +243,8 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
 }
 
-static struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert) {
-    auto * ctx = new common_empty_reply_guard { vocab, {}, inert, false };
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert) {
+    auto * ctx = new common_empty_reply_guard { vocab, {}, inert };
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     for (llama_token id = 0; id < n_vocab; ++id) {
         if (llama_vocab_is_eog(vocab, id)) {
