@@ -160,6 +160,7 @@ struct common_empty_reply_guard {
     // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
     bool                     open_initial = false;
     bool                     r_open       = false;
+    llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
     int                      n_reason     = 0;
     // per token id: 1 = EOG, 2 = tag (built at init)
     std::vector<uint8_t>     flags;
@@ -302,6 +303,26 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
     const bool mask_eog  = common_empty_reply_guard_holds(ctx);
     const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
+    if (ctx->r_open && ctx->n_reason < k_hold_cap && ctx->close_id != LLAMA_TOKEN_NULL) {
+        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
+        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
+        const auto find = [&](llama_token id) -> llama_token_data * {
+            if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
+                return &cur_p->data[id];
+            }
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == id) { return &cur_p->data[i]; }
+            }
+            return nullptr;
+        };
+        float best = -INFINITY;
+        for (llama_token id : ctx->eog) {
+            if (const auto * d = find(id)) { best = std::max(best, d->logit); }
+        }
+        if (auto * c = find(ctx->close_id)) {
+            c->logit = std::max(c->logit, best);
+        }
+    }
     if (!mask_eog && !mask_tags) {
         return;
     }
@@ -372,9 +393,13 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
 }
 
-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, bool reasoning_open) {
+struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, const std::string & reasoning_close) {
     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
-    ctx->open_initial = ctx->r_open = reasoning_open && !ctx->hold.empty();
+    ctx->open_initial = ctx->r_open = !reasoning_close.empty() && !ctx->hold.empty();
+    if (ctx->open_initial) {
+        const auto toks = common_tokenize(vocab, reasoning_close, false, true);
+        ctx->close_id = toks.size() == 1 ? toks[0] : LLAMA_TOKEN_NULL;
+    }
     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
     // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
     for (size_t i = 1; i < ctx->hold.size(); ++i) {

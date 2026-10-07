@@ -170,38 +170,50 @@ int main(int argc, char ** argv) {
         if (t_open.size() == 1 && t_close.size() == 1) {
             const std::vector<llama_token> inert = { t_open[0], t_close[0] };
             // the incident: reasoning text, no close, then EOG
-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
             CHECK(!eog_allowed(g));
             feed(g, vocab, "Next I will run the tests");
             CHECK(!eog_allowed(g));                 // unclosed reasoning: text does not release
+            {   // the wish to end the turn inside the block becomes the close tag (masking alone caused repetition loops)
+                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+                llama_token_data_array p = { d, 3, -1, false };
+                llama_sampler_apply(g, &p);
+                CHECK(std::isinf(d[0].logit) && d[2].logit == 2.0f && d[1].logit == 0.5f);
+            }
             llama_sampler * c3 = llama_sampler_clone(g);
             llama_sampler_accept(g, t_close[0]);
             CHECK(eog_allowed(g));                  // closed
+            {
+                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+                llama_token_data_array p = { d, 3, -1, false };
+                llama_sampler_apply(g, &p);
+                CHECK(d[0].logit == 2.0f && d[2].logit == 0.1f); // untouched once closed
+            }
             CHECK(!eog_allowed(c3));                // the clone kept the open block
             llama_sampler_reset(c3);
             CHECK(!eog_allowed(c3));
             llama_sampler_free(c3);
             llama_sampler_free(g);
             // cap: released after k_hold_cap tokens
-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
             for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
             CHECK(!eog_allowed(g));
             llama_sampler_accept(g, g_other);
             CHECK(eog_allowed(g));
             llama_sampler_free(g);
             // a native call opener inside the block hands over to the call hold
-            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, true); // (the stand-in tags would eat parts of the markers)
+            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, "</"); // (the stand-in tags would eat parts of the markers)
             feed(g, vocab, "x<ifm|tool_calls>");
             CHECK(!eog_allowed(g));
             feed(g, vocab, "</ifm|tool_calls>");
             CHECK(eog_allowed(g));
             llama_sampler_free(g);
             // no tools (no hold) or prompt not in reasoning: never held
-            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, true);
+            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, "</");
             feed(g, vocab, "text");
             CHECK(eog_allowed(g));
             llama_sampler_free(g);
-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, false);
+            g = common_sampler_init_empty_reply_guard(vocab, inert, hold);
             feed(g, vocab, "text");
             CHECK(eog_allowed(g));
             llama_sampler_free(g);
