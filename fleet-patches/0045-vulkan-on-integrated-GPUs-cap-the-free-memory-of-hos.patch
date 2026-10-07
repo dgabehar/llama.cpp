@@ -17,7 +17,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 36 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index bc12d60825..2f7572b30a 100644
+index bc12d6082..2f7572b30 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -15274,6 +15274,31 @@ void ggml_backend_vk_get_device_description(int device, char * description, size

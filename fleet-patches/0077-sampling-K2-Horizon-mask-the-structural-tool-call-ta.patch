@@ -30,7 +30,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  3 files changed, 68 insertions(+), 5 deletions(-)
 
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 53c79049ae..db2d3ecf65 100644
+index 53c79049a..db2d3ecf6 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -153,6 +153,9 @@ struct common_empty_reply_guard {
@@ -98,7 +98,7 @@ index 53c79049ae..db2d3ecf65 100644
      for (llama_token id = 0; id < n_vocab; ++id) {
          if (llama_vocab_is_eog(vocab, id)) {
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 8f473ebde9..6330894594 100644
+index 8f473ebde..633089459 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -156,7 +156,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -111,7 +111,7 @@ index 8f473ebde9..6330894594 100644
      llama_build_and_test(test-grammar-integration.cpp)
      llama_build_and_test(test-llama-grammar.cpp)
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
-index 6623089e6b..62fa0a24c4 100644
+index 6623089e6..62fa0a24c 100644
 --- a/tests/test-empty-reply-guard.cpp
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -263,6 +263,53 @@ int main(int argc, char ** argv) {

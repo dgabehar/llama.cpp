@@ -21,7 +21,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
 
 diff --git a/models/templates/k2-horizon.jinja b/models/templates/k2-horizon.jinja
 new file mode 100644
-index 0000000000..9dc680f7a7
+index 000000000..9dc680f7a
 --- /dev/null
 +++ b/models/templates/k2-horizon.jinja
 @@ -0,0 +1,883 @@
@@ -909,7 +909,7 @@ index 0000000000..9dc680f7a7
 +    {%- endif -%}
 +{%- endif -%}
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index 3005168c38..057e7e5579 100644
+index 3005168c3..057e7e557 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
 @@ -14,6 +14,7 @@

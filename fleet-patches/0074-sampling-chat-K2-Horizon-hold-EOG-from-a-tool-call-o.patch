@@ -39,7 +39,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  7 files changed, 229 insertions(+), 18 deletions(-)
 
 diff --git a/common/chat.h b/common/chat.h
-index fb25620868..82ac217107 100644
+index fb2562086..82ac21710 100644
 --- a/common/chat.h
 +++ b/common/chat.h
 @@ -292,6 +292,9 @@ struct common_chat_params {
@@ -53,7 +53,7 @@ index fb25620868..82ac217107 100644
      common_chat_msg_delimiters          message_delimiters;
  };
 diff --git a/common/common.h b/common/common.h
-index 7f44003d5e..3ecf11f1f5 100644
+index 7f44003d5..3ecf11f1f 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -302,6 +302,9 @@ struct common_params_sampling {
@@ -67,7 +67,7 @@ index 7f44003d5e..3ecf11f1f5 100644
      bool backend_sampling = false;
  
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 6555201e84..e9ee3e9724 100644
+index 6555201e8..e9ee3e972 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -111,34 +111,66 @@ struct ring_buffer {
@@ -253,7 +253,7 @@ index 6555201e84..e9ee3e9724 100644
  
      if (params.mirostat == 0) {
 diff --git a/common/sampling.h b/common/sampling.h
-index fce762f122..bed460c405 100644
+index fce762f12..bed460c40 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
 @@ -45,7 +45,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
@@ -266,7 +266,7 @@ index fce762f122..bed460c405 100644
  void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
  void                    common_sampler_reset (struct common_sampler * gsmpl);
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
-index 873a38c569..f90033bce1 100644
+index 873a38c56..f90033bce 100644
 --- a/tests/test-empty-reply-guard.cpp
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -103,6 +103,120 @@ int main(int argc, char ** argv) {
@@ -391,7 +391,7 @@ index 873a38c569..f90033bce1 100644
      llama_backend_free();
      if (n_fail) {
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 6c05979333..d83caea238 100644
+index 6c0597933..d83caea23 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -1451,6 +1451,9 @@ json oaicompat_chat_params_parse(
@@ -405,7 +405,7 @@ index 6c05979333..d83caea238 100644
          llama_params["chat_parser"] = chat_params.parser;
      }
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index e25187c9af..724f8468cb 100644
+index e25187c9a..724f8468c 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -522,6 +522,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &

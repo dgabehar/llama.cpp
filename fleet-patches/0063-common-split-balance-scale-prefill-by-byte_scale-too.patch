@@ -45,7 +45,7 @@ Assisted-by: Claude Sonnet 5
  3 files changed, 50 insertions(+), 4 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 6fe6affe1f..ddc1740a0c 100644
+index 6fe6affe1..ddc1740a0 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -721,9 +721,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
@@ -62,7 +62,7 @@ index 6fe6affe1f..ddc1740a0c 100644
      }
      // the layer's other ops: its real node count minus the ops timed above (their helper copies excluded)
 diff --git a/common/split-balance.h b/common/split-balance.h
-index 6ee75fe4c4..a6460f23ee 100644
+index 6ee75fe4c..a6460f23e 100644
 --- a/common/split-balance.h
 +++ b/common/split-balance.h
 @@ -85,7 +85,9 @@ struct common_split_calib_layer {
@@ -77,7 +77,7 @@ index 6ee75fe4c4..a6460f23ee 100644
      uint32_t n_head     = 0; // 0: no attention op in this layer
      uint32_t n_head_kv  = 0;
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index 044a30ec0d..2007a5e18f 100644
+index 044a30ec0..2007a5e18 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -193,6 +193,49 @@ static void test_calibrate_cpu() {

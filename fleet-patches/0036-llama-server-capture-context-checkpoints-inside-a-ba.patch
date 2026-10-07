@@ -57,7 +57,7 @@ Assisted-by: Claude Opus 5.5
  create mode 100644 tests/test-state-capture.cpp
 
 diff --git a/include/llama.h b/include/llama.h
-index fbc9ef79a2..bcc11199cd 100644
+index fbc9ef79a..bcc11199c 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -958,6 +958,33 @@ extern "C" {
@@ -95,7 +95,7 @@ index fbc9ef79a2..bcc11199cd 100644
      // Decoding
      //
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index ecd48dd80e..2cee202fa9 100644
+index ecd48dd80..2cee202fa 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
 @@ -595,6 +595,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
@@ -191,7 +191,7 @@ index ecd48dd80e..2cee202fa9 100644
  
      token_vec   .clear();
 diff --git a/src/llama-batch.h b/src/llama-batch.h
-index ff62e26f76..bfd942f691 100644
+index ff62e26f7..bfd942f69 100644
 --- a/src/llama-batch.h
 +++ b/src/llama-batch.h
 @@ -179,6 +179,11 @@ public:
@@ -226,7 +226,7 @@ index ff62e26f76..bfd942f691 100644
      using seq_cpl_t = std::vector<bool>;
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 188da298c2..3866f6836a 100644
+index 188da298c..3866f6836 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1916,6 +1916,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -601,7 +601,7 @@ index 188da298c2..3866f6836a 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 56eea13be7..0e96e27e82 100644
+index 56eea13be..0e96e27e8 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -163,6 +163,10 @@ struct llama_context {
@@ -657,7 +657,7 @@ index 56eea13be7..0e96e27e82 100644
  
      // env: LLAMA_GRAPH_REUSE_DISABLE
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index d01dd44f32..fb9a546c80 100644
+index d01dd44f3..fb9a546c8 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -207,6 +207,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -690,7 +690,7 @@ index d01dd44f32..fb9a546c80 100644
          test-recurrent-state-rollback
 diff --git a/tests/test-state-capture.cpp b/tests/test-state-capture.cpp
 new file mode 100644
-index 0000000000..028eb660dc
+index 000000000..028eb660d
 --- /dev/null
 +++ b/tests/test-state-capture.cpp
 @@ -0,0 +1,231 @@
@@ -926,7 +926,7 @@ index 0000000000..028eb660dc
 +    return n_fail == 0 ? 0 : 1;
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d55326d0a0..c925cb0421 100644
+index d55326d0a..c925cb042 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -265,6 +265,15 @@ struct server_slot {

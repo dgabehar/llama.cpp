@@ -48,7 +48,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 68 insertions(+), 22 deletions(-)
 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 1f3b80b08d..e34906d656 100644
+index 1f3b80b08..e34906d65 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1087,7 +1087,7 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op

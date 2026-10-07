@@ -16,7 +16,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 17 insertions(+)
 
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index 045489df7a..183ca595fb 100644
+index 045489df7..183ca595f 100644
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
 @@ -288,6 +288,23 @@ struct llama_file::impl {

@@ -38,7 +38,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  create mode 100644 tests/test-empty-reply-guard.cpp
 
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index d59cfaa926..6555201e84 100644
+index d59cfaa92..6555201e8 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -111,7 +111,10 @@ struct ring_buffer {
@@ -151,7 +151,7 @@ index d59cfaa926..6555201e84 100644
      for (llama_token id = 0; id < n_vocab; ++id) {
          if (llama_vocab_is_eog(vocab, id)) {
 diff --git a/common/sampling.h b/common/sampling.h
-index 7ebae3df82..fce762f122 100644
+index 7ebae3df8..fce762f12 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
 @@ -44,6 +44,9 @@ struct common_sampler * common_sampler_init(
@@ -165,7 +165,7 @@ index 7ebae3df82..fce762f122 100644
  void                    common_sampler_reset (struct common_sampler * gsmpl);
  struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index c90923a0ae..8f473ebde9 100644
+index c90923a0a..8f473ebde 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -156,6 +156,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -178,7 +178,7 @@ index c90923a0ae..8f473ebde9 100644
      llama_build_and_test(test-llama-grammar.cpp)
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
 new file mode 100644
-index 0000000000..873a38c569
+index 000000000..873a38c56
 --- /dev/null
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -0,0 +1,114 @@

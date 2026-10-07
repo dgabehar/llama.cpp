@@ -82,7 +82,7 @@ Assisted-by: Claude Sonnet 5
  create mode 100644 tests/test-rpc-client-timeout.sh
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index a6b8efd938..6d979af195 100644
+index a6b8efd93..6d979af19 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -33,6 +33,40 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -153,7 +153,7 @@ index a6b8efd938..6d979af195 100644
      }
 diff --git a/tests/test-rpc-client-timeout.cpp b/tests/test-rpc-client-timeout.cpp
 new file mode 100644
-index 0000000000..93413ec027
+index 000000000..93413ec02
 --- /dev/null
 +++ b/tests/test-rpc-client-timeout.cpp
 @@ -0,0 +1,205 @@
@@ -364,7 +364,7 @@ index 0000000000..93413ec027
 +}
 diff --git a/tests/test-rpc-client-timeout.sh b/tests/test-rpc-client-timeout.sh
 new file mode 100644
-index 0000000000..9b35de636b
+index 000000000..9b35de636
 --- /dev/null
 +++ b/tests/test-rpc-client-timeout.sh
 @@ -0,0 +1,83 @@
@@ -452,7 +452,7 @@ index 0000000000..9b35de636b
 +echo "OK: client failed cleanly after ${elapsed}s (bounded by GGML_RPC_CLIENT_TIMEOUT_SEC=2), not a hang"
 +exit 0
 diff --git a/tools/rpc/CMakeLists.txt b/tools/rpc/CMakeLists.txt
-index 1ed0487c88..bab268e09e 100644
+index 1ed0487c8..bab268e09 100644
 --- a/tools/rpc/CMakeLists.txt
 +++ b/tools/rpc/CMakeLists.txt
 @@ -23,6 +23,15 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)

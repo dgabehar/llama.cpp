@@ -17,7 +17,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  2 files changed, 60 insertions(+), 3 deletions(-)
 
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index a47f41d68d..005c0ecc63 100644
+index a47f41d68..005c0ecc6 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -11,6 +11,7 @@
@@ -114,7 +114,7 @@ index a47f41d68d..005c0ecc63 100644
  }
  
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
-index a00cc7d40c..9d8cd43152 100644
+index a00cc7d40..9d8cd4315 100644
 --- a/tests/test-empty-reply-guard.cpp
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -194,6 +194,28 @@ int main(int argc, char ** argv) {

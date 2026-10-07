@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  7 files changed, 55 insertions(+), 17 deletions(-)
 
 diff --git a/common/chat.h b/common/chat.h
-index 80e027dfe6..19b270ccbc 100644
+index 80e027dfe..19b270ccb 100644
 --- a/common/chat.h
 +++ b/common/chat.h
 @@ -295,9 +295,9 @@ struct common_chat_params {
@@ -40,7 +40,7 @@ index 80e027dfe6..19b270ccbc 100644
      common_chat_msg_delimiters          message_delimiters;
  };
 diff --git a/common/common.h b/common/common.h
-index 4febf8edd6..d4e8fdbe5a 100644
+index 4febf8edd..d4e8fdbe5 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -305,8 +305,8 @@ struct common_params_sampling {
@@ -55,7 +55,7 @@ index 4febf8edd6..d4e8fdbe5a 100644
      bool backend_sampling = false;
  
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 34950d3e62..a47f41d68d 100644
+index 34950d3e6..a47f41d68 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -160,6 +160,7 @@ struct common_empty_reply_guard {
@@ -110,7 +110,7 @@ index 34950d3e62..a47f41d68d 100644
      // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
      for (size_t i = 1; i < ctx->hold.size(); ++i) {
 diff --git a/common/sampling.h b/common/sampling.h
-index b58345e320..3f68b57033 100644
+index b58345e32..3f68b5703 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
 @@ -45,7 +45,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
@@ -123,7 +123,7 @@ index b58345e320..3f68b57033 100644
  void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
  void                    common_sampler_reset (struct common_sampler * gsmpl);
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
-index abdb2b9356..a00cc7d40c 100644
+index abdb2b935..a00cc7d40 100644
 --- a/tests/test-empty-reply-guard.cpp
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -170,38 +170,50 @@ int main(int argc, char ** argv) {
@@ -183,7 +183,7 @@ index abdb2b9356..a00cc7d40c 100644
              CHECK(eog_allowed(g));
              llama_sampler_free(g);
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index ef840f0c1e..2a871b034b 100644
+index ef840f0c1..2a871b034 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -1454,8 +1454,8 @@ json oaicompat_chat_params_parse(
@@ -198,7 +198,7 @@ index ef840f0c1e..2a871b034b 100644
      if (!chat_params.parser.empty()) {
          llama_params["chat_parser"] = chat_params.parser;
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index 40939c9762..669410d5be 100644
+index 40939c976..669410d5b 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -541,9 +541,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &

@@ -24,7 +24,7 @@ Assisted-by: Claude Sonnet
  2 files changed, 74 insertions(+)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ff2ea461c4..f88f219eb8 100644
+index ff2ea461c..f88f219eb 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -372,6 +372,65 @@ llama_context::llama_context(
@@ -119,7 +119,7 @@ index ff2ea461c4..f88f219eb8 100644
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 28d386ad7e..ef1793c5a1 100644
+index 28d386ad7..ef1793c5a 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -383,6 +383,10 @@ private:

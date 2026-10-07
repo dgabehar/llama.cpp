@@ -60,7 +60,7 @@ Assisted-by: Claude Sonnet 5
  2 files changed, 45 insertions(+), 3 deletions(-)
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index b47ebcdd29..75c85f604f 100644
+index b47ebcdd2..75c85f604 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -330,7 +330,7 @@ static void common_params_fit_impl(
@@ -104,7 +104,7 @@ index b47ebcdd29..75c85f604f 100644
      }
      add_extra_memory(dmds_full);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 463510caa7..c4b6b23fcf 100644
+index 463510caa..c4b6b23fc 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -212,9 +212,10 @@ llama_kv_cache::llama_kv_cache(

@@ -17,7 +17,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 0bdc0307eb..45d5a7a79e 100644
+index 0bdc0307e..45d5a7a79 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -1,4 +1,5 @@

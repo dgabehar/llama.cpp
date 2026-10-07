@@ -13,7 +13,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 7 insertions(+), 4 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 331c255bf8..62654735ff 100644
+index 331c255bf..62654735f 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -387,8 +387,9 @@ static bool calibrate_device(ggml_backend_dev_t dev, int64_t n_embd, int64_t n_f

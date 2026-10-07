@@ -29,7 +29,7 @@ Signed-off-by: Shikanime Deva <william.phetsinorath@shikanime.studio>
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e9af71228e..f331c8822c 100644
+index e9af71228..f331c8822 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -2713,8 +2713,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir

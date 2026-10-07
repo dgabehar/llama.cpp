@@ -33,7 +33,7 @@ Assisted-by: Claude Sonnet
  2 files changed, 63 insertions(+), 19 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 3feaa772cc..3d3b08842b 100644
+index 3feaa772c..3d3b08842 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -2824,26 +2824,44 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -124,7 +124,7 @@ index 3feaa772cc..3d3b08842b 100644
              if (configs.size() == 2) return 1;
              if (m <= 64 || n <= 64) return 1;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index fd30806ff5..b5d90899bf 100644
+index fd30806ff..b5d90899b 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -10656,6 +10656,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

@@ -22,7 +22,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  2 files changed, 89 insertions(+), 9 deletions(-)
 
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index db2d3ecf65..2a604f0419 100644
+index db2d3ecf6..2a604f041 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -156,6 +156,8 @@ struct common_empty_reply_guard {
@@ -83,7 +83,7 @@ index db2d3ecf65..2a604f0419 100644
  }
  
 diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
-index 62fa0a24c4..cd96b26749 100644
+index 62fa0a24c..cd96b2674 100644
 --- a/tests/test-empty-reply-guard.cpp
 +++ b/tests/test-empty-reply-guard.cpp
 @@ -3,6 +3,9 @@

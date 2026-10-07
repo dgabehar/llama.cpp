@@ -73,7 +73,7 @@ Assisted-by: Claude Sonnet 5
  3 files changed, 122 insertions(+), 76 deletions(-)
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 46810290da..bb455c2bdc 100644
+index 46810290d..bb455c2bd 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -35,6 +35,28 @@ uint32_t common_fit_clamp_ctx_to_free_memory(
@@ -273,7 +273,7 @@ index 46810290da..bb455c2bdc 100644
  
          for (size_t id = 0; id < nd; id++) {
 diff --git a/common/fit.h b/common/fit.h
-index 2ff391b65c..03eefdd9c9 100644
+index 2ff391b65..03eefdd9c 100644
 --- a/common/fit.h
 +++ b/common/fit.h
 @@ -88,6 +88,15 @@ uint32_t common_fit_clamp_ctx_to_free_memory(
@@ -293,7 +293,7 @@ index 2ff391b65c..03eefdd9c9 100644
  common_device_memory_data_vec common_get_device_memory_data(
                           const char * path_model,
 diff --git a/tests/test-fit-clamp.cpp b/tests/test-fit-clamp.cpp
-index db4ecb4176..e11587e48b 100644
+index db4ecb417..e11587e48 100644
 --- a/tests/test-fit-clamp.cpp
 +++ b/tests/test-fit-clamp.cpp
 @@ -1,9 +1,13 @@

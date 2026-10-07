@@ -26,7 +26,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index 8fcae66db4..38be89c9e4 100644
+index 8fcae66db..38be89c9e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1831,8 +1831,13 @@ std::vector<float> common_cpu_split_calibrate() {

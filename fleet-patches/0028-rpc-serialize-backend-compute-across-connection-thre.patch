@@ -15,7 +15,7 @@ Signed-off-by: Shikanime Deva <william.phetsinorath@shikanime.studio>
  1 file changed, 4 insertions(+)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index f331c8822c..e828bbf6f4 100644
+index f331c8822..e828bbf6f 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -2006,6 +2006,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,

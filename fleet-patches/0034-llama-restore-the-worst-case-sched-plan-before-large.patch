@@ -22,7 +22,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 52 insertions(+), 19 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2beb98b9ad..188da298c2 100644
+index 2beb98b9a..188da298c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -686,6 +686,30 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
@@ -110,7 +110,7 @@ index 2beb98b9ad..188da298c2 100644
          res->reset();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index ef1793c5a1..56eea13be7 100644
+index ef1793c5a..56eea13be 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -255,6 +255,9 @@ public:

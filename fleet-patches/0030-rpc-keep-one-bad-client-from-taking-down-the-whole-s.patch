@@ -35,7 +35,7 @@ Assisted-by: Claude Opus 5.5
  3 files changed, 101 insertions(+), 12 deletions(-)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 47ab7e7d77..6f68ae721d 100644
+index 47ab7e7d7..6f68ae721 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -1706,9 +1706,22 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
@@ -124,7 +124,7 @@ index 47ab7e7d77..6f68ae721d 100644
              fflush(stdout);
              c->done.store(true);
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index 3748669f3d..ac25861d67 100644
+index 3748669f3..ac25861d6 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
 @@ -19,10 +19,20 @@
@@ -243,7 +243,7 @@ index 3748669f3d..ac25861d67 100644
  }
  
 diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
-index 2176eebe5b..1b4ad83fff 100644
+index 2176eebe5..1b4ad83ff 100644
 --- a/ggml/src/ggml-rpc/transport.h
 +++ b/ggml/src/ggml-rpc/transport.h
 @@ -21,7 +21,9 @@ struct socket_t {

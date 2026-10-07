@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  1 file changed, 13 insertions(+)
 
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 4bad0357b4..16424c6cd6 100644
+index 4bad0357b..16424c6cd 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -1559,6 +1559,19 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars

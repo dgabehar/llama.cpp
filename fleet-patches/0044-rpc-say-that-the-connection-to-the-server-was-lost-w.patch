@@ -11,7 +11,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 7a9979c35c..a6b8efd938 100644
+index 7a9979c35..a6b8efd93 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -37,7 +37,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");

@@ -18,7 +18,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  1 file changed, 22 insertions(+)
 
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 0339cc77cc..df2c6d93b7 100644
+index 0339cc77c..df2c6d93b 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -852,6 +852,28 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model *

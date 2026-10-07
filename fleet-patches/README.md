@@ -118,14 +118,13 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0084 | `cec58d8b2` | llama : fail restoring a truncated sequence state file instead of aborting |
 | 0085 | `6cc2ec938` | chat: K2-Horizon: port the fleet's parser tolerance onto upstream's k2-horizon.cpp |
 | 0086 | `0619cebbf` | tests: K2-Horizon: port the fleet's parser, history and guard-field tests |
-| 0087 | `9473da157` | fleet: rebuild patch mirror and FLEET.md for the K2-Horizon adoption sync (base 4625240437, b11454) |
-| 0088 | `2f1949ec8` | chat: K2-Horizon: startup self-check that the sampler guard is fed |
+| 0087 | `2f1949ec8` | chat: K2-Horizon: startup self-check that the sampler guard is fed |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
-This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync (88
+This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync (87
 patches; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.

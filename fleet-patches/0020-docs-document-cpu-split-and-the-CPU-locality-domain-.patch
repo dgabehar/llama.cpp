@@ -22,7 +22,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 1 insertion(+)
 
 diff --git a/tools/server/README.md b/tools/server/README.md
-index e401f0f835..eebdc4aaf4 100644
+index e401f0f83..eebdc4aaf 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
 @@ -75,6 +75,7 @@ For the full list of features, please refer to [server's changelog](https://gith

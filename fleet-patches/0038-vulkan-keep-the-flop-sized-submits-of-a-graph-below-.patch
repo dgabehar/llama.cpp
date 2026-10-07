@@ -23,7 +23,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 11 insertions(+)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 9b27a16bea..bc12d60825 100644
+index 9b27a16be..bc12d6082 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -14339,13 +14339,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg

@@ -39,7 +39,7 @@ Assisted-by: Claude Sonnet 5
  2 files changed, 44 insertions(+), 4 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index ddc1740a0c..23151b60b3 100644
+index ddc1740a0..23151b60b 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -391,6 +391,13 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
@@ -79,7 +79,7 @@ index ddc1740a0c..23151b60b3 100644
          ggml_cgraph * g_ops = ggml_new_graph(gctx.get());
          ggml_tensor * y = j == 0 ? ggml_view_1d(gctx.get(), x_hop, n_embd, 0) : x_hop;
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index 2007a5e18f..41de538bc0 100644
+index 2007a5e18..41de538bc 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -236,6 +236,38 @@ static void test_byte_scale_affects_prefill() {

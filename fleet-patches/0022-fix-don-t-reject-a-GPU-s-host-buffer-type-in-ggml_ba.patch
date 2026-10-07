@@ -38,7 +38,7 @@ Assisted-by: Claude Sonnet
  1 file changed, 10 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index d67ad27195..87d43d5b1f 100644
+index d67ad2719..87d43d5b1 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -622,15 +622,19 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st

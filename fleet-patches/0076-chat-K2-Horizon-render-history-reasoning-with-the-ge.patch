@@ -28,7 +28,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  1 file changed, 51 insertions(+)
 
 diff --git a/common/chat.cpp b/common/chat.cpp
-index 8d2d8a140b..4bad0357b4 100644
+index 8d2d8a140..4bad0357b 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
 @@ -25,6 +25,7 @@

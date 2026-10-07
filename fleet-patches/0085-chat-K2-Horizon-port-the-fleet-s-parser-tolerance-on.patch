@@ -31,7 +31,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  1 file changed, 266 insertions(+), 80 deletions(-)
 
 diff --git a/common/parsers/k2-horizon.cpp b/common/parsers/k2-horizon.cpp
-index 687a893cee..c82fc0dbbc 100644
+index 687a893ce..c82fc0dbb 100644
 --- a/common/parsers/k2-horizon.cpp
 +++ b/common/parsers/k2-horizon.cpp
 @@ -1,6 +1,10 @@

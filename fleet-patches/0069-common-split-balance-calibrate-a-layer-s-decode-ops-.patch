@@ -72,7 +72,7 @@ Assisted-by: Claude Sonnet 5
  2 files changed, 155 insertions(+), 45 deletions(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index 23151b60b3..e94f3f28d2 100644
+index 23151b60b..e94f3f28d 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -394,14 +394,44 @@ static bool calibrate_device(ggml_backend_dev_t dev, const common_split_calib_mo
@@ -267,7 +267,7 @@ index 23151b60b3..e94f3f28d2 100644
      if (m.nodes_tg_layer > 0.0) {
          t_decode  += std::max(0.0, m.nodes_tg_layer - timed_tg) * t_op_tg;
 diff --git a/tests/test-split-balance.cpp b/tests/test-split-balance.cpp
-index 41de538bc0..e125c08514 100644
+index 41de538bc..e125c0851 100644
 --- a/tests/test-split-balance.cpp
 +++ b/tests/test-split-balance.cpp
 @@ -268,6 +268,72 @@ static void test_calibrate_context_memory_budget() {

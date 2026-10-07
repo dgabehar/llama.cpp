@@ -28,7 +28,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 8 insertions(+), 3 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d80b78de37..61423b789e 100644
+index d80b78de3..61423b789 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -272,6 +272,9 @@ struct server_slot {

@@ -20,7 +20,7 @@ Assisted-by: Claude Opus 5.5
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/common/split-balance.cpp b/common/split-balance.cpp
-index bf39ab1406..0bdc0307eb 100644
+index bf39ab140..0bdc0307e 100644
 --- a/common/split-balance.cpp
 +++ b/common/split-balance.cpp
 @@ -82,9 +82,13 @@ double common_split_predict_prefill(

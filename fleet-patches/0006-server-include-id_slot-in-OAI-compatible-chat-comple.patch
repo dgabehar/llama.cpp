@@ -23,7 +23,7 @@ existing field removed or renamed.
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index a5c33c056b..25eb4a24fa 100644
+index a5c33c056..25eb4a24f 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -445,7 +445,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {

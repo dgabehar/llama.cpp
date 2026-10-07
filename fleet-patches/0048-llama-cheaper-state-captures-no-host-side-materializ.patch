@@ -21,7 +21,7 @@ Assisted-by: Claude Opus 5.5
  2 files changed, 84 insertions(+), 27 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3866f6836a..54c053f9e6 100644
+index 3866f6836..54c053f9e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3440,37 +3440,36 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
@@ -217,7 +217,7 @@ index 3866f6836a..54c053f9e6 100644
              state_capture_pool.push_back(std::move(buf));
          }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 0e96e27e82..0b78c34dbc 100644
+index 0e96e27e8..0b78c34db 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -40,6 +40,13 @@ struct llama_memory_buffer {

@@ -28,7 +28,7 @@ Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
  4 files changed, 114 insertions(+), 30 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f7401c5208..3df9181708 100644
+index f7401c520..3df918170 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3027,11 +3027,14 @@ public:
@@ -79,7 +79,7 @@ index f7401c5208..3df9181708 100644
  
      return io.n_bytes();
 diff --git a/tests/test-save-load-state.cpp b/tests/test-save-load-state.cpp
-index 43a513ae5e..64985af25e 100644
+index 43a513ae5..64985af25 100644
 --- a/tests/test-save-load-state.cpp
 +++ b/tests/test-save-load-state.cpp
 @@ -661,6 +661,47 @@ static bool test_state_restore_failure(struct llama_model * model, const struct
@@ -169,7 +169,7 @@ index 43a513ae5e..64985af25e 100644
  
      for (const auto & [name, restore_failed] : cases) {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b020921737..a5a4d9319c 100644
+index b02092173..a5a4d9319 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -2732,8 +2732,14 @@ private:
@@ -190,7 +190,7 @@ index b020921737..a5a4d9319c 100644
          }
          buf.resize(n);
 diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
-index ba64808af6..cbd8f4a1d2 100644
+index ba64808af..cbd8f4a1d 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
 @@ -131,6 +131,47 @@ def test_slot_restore_legacy_token_list():

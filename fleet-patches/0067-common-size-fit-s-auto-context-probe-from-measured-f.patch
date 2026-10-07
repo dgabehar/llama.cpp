@@ -131,7 +131,7 @@ Assisted-by: Claude Sonnet 5
  create mode 100644 tests/test-fit-clamp.cpp
 
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 75c85f604f..46810290da 100644
+index 75c85f604..46810290d 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -22,6 +22,19 @@ void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg) {
@@ -227,7 +227,7 @@ index 75c85f604f..46810290da 100644
                  try {
                      dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 diff --git a/common/fit.h b/common/fit.h
-index 1a6785ae35..2ff391b65c 100644
+index 1a6785ae3..2ff391b65 100644
 --- a/common/fit.h
 +++ b/common/fit.h
 @@ -70,6 +70,24 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
@@ -256,7 +256,7 @@ index 1a6785ae35..2ff391b65c 100644
  common_device_memory_data_vec common_get_device_memory_data(
                           const char * path_model,
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index fb9a546c80..c90923a0ae 100644
+index fb9a546c8..c90923a0a 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -258,6 +258,7 @@ llama_build_and_test(test-json-schema.cpp)
@@ -269,7 +269,7 @@ index fb9a546c80..c90923a0ae 100644
  llama_build_and_test(test-log.cpp)
 diff --git a/tests/test-fit-clamp.cpp b/tests/test-fit-clamp.cpp
 new file mode 100644
-index 0000000000..db4ecb4176
+index 000000000..db4ecb417
 --- /dev/null
 +++ b/tests/test-fit-clamp.cpp
 @@ -0,0 +1,85 @@
