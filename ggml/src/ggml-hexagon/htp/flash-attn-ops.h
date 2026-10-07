@@ -34,8 +34,8 @@ enum htp_fa_kernel_type {
 
 struct htp_fa_kernel_params {
     uint8_t  kernel_type;        // enum htp_fa_kernel_type
-    uint8_t  is_q_fp32;          // 1 = Q type is F32, 0 = F16
-    uint8_t  is_dst_fp32;        // 1 = dst type is F32, 0 = F16
+    uint8_t  head_split;         // 1 = partition by KV heads in multicore, 0 = token partition
+    uint8_t  flags;              // reserved
     uint8_t  n_threads;          // Number of threads to run
 
     // Common parameters
@@ -247,6 +247,7 @@ static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, siz
 }
 
 #define FA_HVX_BLOCK_SIZE 64
+#define FA_HVX_G_MAX      8
 
 struct hvx_fa_vtcm_layout {
     size_t off_q;
@@ -275,11 +276,11 @@ static inline void hvx_fa_vtcm_layout_build(struct hvx_fa_vtcm_layout * L,
     const size_t size_k_row_padded = hex_round_up(DK * sizeof(__fp16), 128);
     const size_t size_v_row_padded = hex_round_up(DV * sizeof(__fp16), 128);
 
-    const size_t size_q_block = size_q_row_padded * 1;
+    const size_t size_q_block = size_q_row_padded * FA_HVX_G_MAX;
     const size_t size_k_block = size_k_row_padded * FA_HVX_BLOCK_SIZE;
     const size_t size_v_block = size_v_row_padded * FA_HVX_BLOCK_SIZE;
     const size_t size_m_block = hex_round_up(FA_HVX_BLOCK_SIZE * sizeof(__fp16), 128);
-    const size_t size_vkq_acc = hex_round_up(DV * sizeof(float), 128);
+    const size_t size_vkq_acc = hex_round_up(DV * sizeof(float), 128) * FA_HVX_G_MAX;
     const size_t size_sinks   = hex_round_up(n_heads * sizeof(float), 128);
 
     size_t off = 0;

@@ -1498,7 +1498,7 @@ void common_split_balance_apply(
         return caps;
     };
 
-    const std::string cache_path = fs_get_cache_directory() + "split-balance.json";
+    const std::string cache_path = (fs_get_cache_directory() / "split-balance.json").string();
     common_split_workload wl;
     wl.n_prompt = params.split_workload_prompt;
     wl.n_gen    = params.split_workload_gen;

@@ -1,4 +1,4 @@
-From 4449b934f379540184d6ca3c2f565ca29e8dcb3f Mon Sep 17 00:00:00 2001
+From b416db4f3917921d988248d77dfec6c5f97e5196 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:05 -0500
 Subject: [PATCH] grammar: translate PCRE shorthand escapes (\d \w \s) to GBNF

@@ -1,0 +1,237 @@
+From 640423072756b24eadbcc6367e352e08463de46f Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 30 Sep 2026 10:51:27 -0500
+Subject: [PATCH] K2 guard: turn an end of turn inside an unclosed reasoning
+ block into the block's close tag
+
+Masking EOG alone in an open reasoning block (previous commit) pushed some replayed turns into 4096-token
+repetition loops. The close tag now takes the best EOG logit while the block is open (capped), so the
+model's wish to stop becomes 'close the reasoning'.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat-auto-parser-generator.cpp |  8 ++++----
+ common/chat.h                         |  6 +++---
+ common/common.h                       |  4 ++--
+ common/sampling.cpp                   | 29 +++++++++++++++++++++++++--
+ common/sampling.h                     |  2 +-
+ tests/test-empty-reply-guard.cpp      | 22 +++++++++++++++-----
+ tools/server/server-common.cpp        |  4 ++--
+ tools/server/server-schema.cpp        |  5 +++--
+ 8 files changed, 59 insertions(+), 21 deletions(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index f02a5d7aef..6df4c21e3f 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -76,10 +76,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
+             std::string gp = data.generation_prompt;
+             gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
+-            for (const auto & tag : autoparser.no_empty_reply_inert) {
+-                if (tag.compare(0, 2, "</") != 0 && gp.size() >= tag.size() &&
+-                    gp.compare(gp.size() - tag.size(), tag.size(), tag) == 0) {
+-                    data.no_empty_reply_open = true;
++            const auto & inert = autoparser.no_empty_reply_inert; // (open, close) pairs
++            for (size_t i = 0; i + 1 < inert.size(); i += 2) {
++                if (gp.size() >= inert[i].size() && gp.compare(gp.size() - inert[i].size(), inert[i].size(), inert[i]) == 0) {
++                    data.no_empty_reply_open = inert[i + 1];
+                 }
+             }
+         }
+diff --git a/common/chat.h b/common/chat.h
+index 80e027dfe6..19b270ccbc 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -295,9 +295,9 @@ struct common_chat_params {
+     // tool-call tag pairs { section open, close, inner open, close, ... } when tools are offered: EOG is masked from
+     // an opener until the section is closed and the inner tags are balanced (capped)
+     std::vector<std::string>            no_empty_reply_hold;
+-    // the generation prompt ends inside an open reasoning block (tools offered): the reply starts in reasoning, and
+-    // EOG stays masked until that block is closed (or a call opens), capped
+-    bool                                no_empty_reply_open = false;
++    // the generation prompt ends inside an open reasoning block (tools offered): the close tag of that block. The reply
++    // starts in reasoning, and an end of turn there is turned into that close tag (capped), see the empty-reply guard
++    std::string                         no_empty_reply_open;
+     std::string                         parser;
+     common_chat_msg_delimiters          message_delimiters;
+ };
+diff --git a/common/common.h b/common/common.h
+index cd10baf215..c6b7aeec66 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -305,8 +305,8 @@ struct common_params_sampling {
+     // native tool-call tag pairs (tools offered), see common_chat_params::no_empty_reply_hold: EOG is also masked
+     // from an opener until the section is closed and its inner tags are balanced, capped
+     std::vector<std::string>  no_empty_reply_hold;
+-    // the prompt ends inside an open reasoning block: hold EOG until it closes (tools offered only), capped
+-    bool                      no_empty_reply_open = false;
++    // the prompt ends inside an open reasoning block (tools offered only): its close tag; EOG there becomes that tag, capped
++    std::string               no_empty_reply_open;
+ 
+     bool backend_sampling = false;
+ 
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 34950d3e62..a47f41d68d 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -160,6 +160,7 @@ struct common_empty_reply_guard {
+     // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
+     bool                     open_initial = false;
+     bool                     r_open       = false;
++    llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
+     int                      n_reason     = 0;
+     // per token id: 1 = EOG, 2 = tag (built at init)
+     std::vector<uint8_t>     flags;
+@@ -302,6 +303,26 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
+     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
+     const bool mask_eog  = common_empty_reply_guard_holds(ctx);
+     const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
++    if (ctx->r_open && ctx->n_reason < k_hold_cap && ctx->close_id != LLAMA_TOKEN_NULL) {
++        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
++        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
++        const auto find = [&](llama_token id) -> llama_token_data * {
++            if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
++                return &cur_p->data[id];
++            }
++            for (size_t i = 0; i < cur_p->size; ++i) {
++                if (cur_p->data[i].id == id) { return &cur_p->data[i]; }
++            }
++            return nullptr;
++        };
++        float best = -INFINITY;
++        for (llama_token id : ctx->eog) {
++            if (const auto * d = find(id)) { best = std::max(best, d->logit); }
++        }
++        if (auto * c = find(ctx->close_id)) {
++            c->logit = std::max(c->logit, best);
++        }
++    }
+     if (!mask_eog && !mask_tags) {
+         return;
+     }
+@@ -372,9 +393,13 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
+             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
+ }
+ 
+-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, bool reasoning_open) {
++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, const std::string & reasoning_close) {
+     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+-    ctx->open_initial = ctx->r_open = reasoning_open && !ctx->hold.empty();
++    ctx->open_initial = ctx->r_open = !reasoning_close.empty() && !ctx->hold.empty();
++    if (ctx->open_initial) {
++        const auto toks = common_tokenize(vocab, reasoning_close, false, true);
++        ctx->close_id = toks.size() == 1 ? toks[0] : LLAMA_TOKEN_NULL;
++    }
+     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
+     // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
+     for (size_t i = 1; i < ctx->hold.size(); ++i) {
+diff --git a/common/sampling.h b/common/sampling.h
+index b58345e320..3f68b57033 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -45,7 +45,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
+ 
+ // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
+ // the empty-reply guard sampler (see sampling.cpp); a common_sampler owns one when params.no_empty_reply is set
+-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {}, bool reasoning_open = false);
++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {}, const std::string & reasoning_close = "");
+ 
+ void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
+ void                    common_sampler_reset (struct common_sampler * gsmpl);
+diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
+index abdb2b9356..a00cc7d40c 100644
+--- a/tests/test-empty-reply-guard.cpp
++++ b/tests/test-empty-reply-guard.cpp
+@@ -170,38 +170,50 @@ int main(int argc, char ** argv) {
+         if (t_open.size() == 1 && t_close.size() == 1) {
+             const std::vector<llama_token> inert = { t_open[0], t_close[0] };
+             // the incident: reasoning text, no close, then EOG
+-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
+             CHECK(!eog_allowed(g));
+             feed(g, vocab, "Next I will run the tests");
+             CHECK(!eog_allowed(g));                 // unclosed reasoning: text does not release
++            {   // the wish to end the turn inside the block becomes the close tag (masking alone caused repetition loops)
++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
++                llama_token_data_array p = { d, 3, -1, false };
++                llama_sampler_apply(g, &p);
++                CHECK(std::isinf(d[0].logit) && d[2].logit == 2.0f && d[1].logit == 0.5f);
++            }
+             llama_sampler * c3 = llama_sampler_clone(g);
+             llama_sampler_accept(g, t_close[0]);
+             CHECK(eog_allowed(g));                  // closed
++            {
++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
++                llama_token_data_array p = { d, 3, -1, false };
++                llama_sampler_apply(g, &p);
++                CHECK(d[0].logit == 2.0f && d[2].logit == 0.1f); // untouched once closed
++            }
+             CHECK(!eog_allowed(c3));                // the clone kept the open block
+             llama_sampler_reset(c3);
+             CHECK(!eog_allowed(c3));
+             llama_sampler_free(c3);
+             llama_sampler_free(g);
+             // cap: released after k_hold_cap tokens
+-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
+             for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
+             CHECK(!eog_allowed(g));
+             llama_sampler_accept(g, g_other);
+             CHECK(eog_allowed(g));
+             llama_sampler_free(g);
+             // a native call opener inside the block hands over to the call hold
+-            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, true); // (the stand-in tags would eat parts of the markers)
++            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, "</"); // (the stand-in tags would eat parts of the markers)
+             feed(g, vocab, "x<ifm|tool_calls>");
+             CHECK(!eog_allowed(g));
+             feed(g, vocab, "</ifm|tool_calls>");
+             CHECK(eog_allowed(g));
+             llama_sampler_free(g);
+             // no tools (no hold) or prompt not in reasoning: never held
+-            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, true);
++            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, "</");
+             feed(g, vocab, "text");
+             CHECK(eog_allowed(g));
+             llama_sampler_free(g);
+-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, false);
++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold);
+             feed(g, vocab, "text");
+             CHECK(eog_allowed(g));
+             llama_sampler_free(g);
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index ebec0ccfb0..3cb4fefbab 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1453,8 +1453,8 @@ json oaicompat_chat_params_parse(
+     if (!chat_params.no_empty_reply_hold.empty()) {
+         llama_params["no_empty_reply_hold"] = chat_params.no_empty_reply_hold;
+     }
+-    if (chat_params.no_empty_reply_open) {
+-        llama_params["no_empty_reply_open"] = true;
++    if (!chat_params.no_empty_reply_open.empty()) {
++        llama_params["no_empty_reply_open"] = chat_params.no_empty_reply_open;
+     }
+     if (!chat_params.parser.empty()) {
+         llama_params["chat_parser"] = chat_params.parser;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 40939c9762..669410d5be 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -541,9 +541,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+         }));
+ 
+     add((new field_json("no_empty_reply_open"))
+-        ->set_desc("The prompt ends inside an open reasoning block: with tools offered, end-of-generation tokens are masked until the block is closed or a tool call opens, capped. Set by the chat template handling")
++        ->set_desc("Close tag of the reasoning block the prompt ends inside (tools offered): an end-of-generation token there is turned into this tag, capped. Set by the chat template handling")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+-            ctx.params.sampling.no_empty_reply_open = data.at("no_empty_reply_open").is_boolean() && data.at("no_empty_reply_open").get<bool>();
++            const auto & tag = data.at("no_empty_reply_open");
++            ctx.params.sampling.no_empty_reply_open = tag.is_string() ? tag.get<std::string>() : std::string();
+         }));
+ 
+     add((new field_json("stop_after_reasoning"))
+-- 
+2.43.0
+

@@ -18,7 +18,10 @@ workflow (CI-verifies a `LLAMACPP_REF` bump, don't pre-build locally).
 `.github/workflows/sync-with-upstream.yml` (this fork's own CI, patch 0005 in
 `fleet-patches/`) rebases this branch onto `upstream/master` weekly and
 on-dispatch, force-pushing a clean rebase or opening a tracking issue on
-conflict.
+conflict. At ~100 fork commits that rebase cannot succeed unattended; do a
+deliberate sync every 2-3 weeks (see "Upstream sync" below) and treat the weekly
+job as a notifier. `fleet-patches/regenerate.sh` takes `BASE=<sha> TIP=HEAD` for a
+branch built on a pinned upstream commit.
 
 ## Fleet patch maintenance (added 2026-09-15)
 
@@ -44,6 +47,95 @@ rule for this repo. Regenerate the mirror afterward.
 applies to this fork too, not just upstream contributions (`AGENTS.md`'s
 push/PR restriction is written for upstream, but this fork follows the same
 discipline by standing convention).
+
+## Upstream sync 2026-10 (rebased onto upstream `4f5406761`, added 2026-10-06)
+
+Branch `upstream-sync-2026-10` = upstream `4f5406761517648c23dbd60ea5ade37f77a316c9`
+(`HIP: use -O0 for host code in debug builds (#29795)`, tag **b11444**; the
+trial notes called it b11439, the SHA is authoritative) + 100 fork commits
+(`fleet-patches/` was rebuilt from scratch; patch numbers changed, refer to
+patches by subject). It was built by cherry-picking the 103 code/test fork
+commits of `fleet-patches` @ `25d47f832` and skipping the ~56 mirror/FLEET.md
+bookkeeping commits. Rollback anchor: tags `pre-merge-2026-10-06`
+(`25d47f832`) and `pre-merge-2026-10-06-deployed` (`b16c58a80`, the deployed
+`LLAMACPP_REF`).
+
+**Dropped patches (3):**
+- `ggml-alloc: finalize view init in a pass after all buft max_size splits`
+  -- superseded by upstream #23671 (`ggml_backend_buft_alloc_buffer_n_default`
+  initialises views inside each split item, `ggml/src/ggml-backend.cpp`). Needs
+  the MTP + `--parallel 3` checkpoint-creation canary (the original
+  `GGML_ASSERT(tensor->data != NULL)` repro) before it is considered verified.
+- `server: fix 2 test_completion.py tests broken by test-only bugs` -- upstream
+  rewrote the same assertion.
+- the second copy of `server: don't update the prompt cache of a busy slot picked
+  by id_slot` (hotfix cherry-pick with identical content).
+
+**Re-derived against upstream (no behaviour change intended):** `-fit` probe/clamp
+(`common/fit.cpp`) uses upstream's `n_streams` again (#29437 revert); `n_ctx_max`
+stays non-const. K2-Horizon pre-tokenizer enum renumbered to
+`LLAMA_VOCAB_PRE_TYPE_K2_HORIZON = 61` (upstream MMBERT took 60). `conversion/base.py`
+keeps our `pytorch_model*.safetensors` fallback plus upstream's
+`model.safetensors.index.json` clause. Compile fixes folded into their owning
+commits: CPU locality `layer_buft` initialiser gets `.alloc_buffer_n`/`.get_alloc_size_n`
+(#23671); `fs_get_cache_directory()` returns `std::filesystem::path` (#29595);
+`tests/test-state-capture.cpp` fills `llama_batch` directly (`common_batch_add`
+removed by the `llama_batch_ext` migration).
+
+**New slot-save format (breaking):** upstream #28498 bumped `LLAMA_STATE_SEQ_VERSION`
+3 -> 4 and `LLAMA_SESSION_VERSION` 10 -> 11 and writes two extra u32 (`n_rot_k`,
+`n_rot_v`) after `v_trans`/`n_layer` in every attention KV block. v3 and v4
+`.bin` files are not interchangeable in either direction; flush `slotSavePath`
+on rollout and on rollback, and update `kvrepl_nstream_convert.py` before the
+image bump (see checklist). The fork's SCKP checkpoint appendix (version 1) is unchanged.
+
+### Upstream-sync compatibility checklist (run on every sync, before the image bump)
+
+Our patches must stay 100% compatible with what home-infrastructure consumes.
+On every sync, diff `OLD_BASE..NEW_BASE` for the items below; any change means a
+home-infrastructure artifact must change in the same series.
+
+1. `include/llama.h`: `LLAMA_STATE_SEQ_VERSION`, `LLAMA_SESSION_VERSION`,
+   `LLAMA_STATE_SEQ_FLAGS_*`. `git diff OLD..NEW -- include/llama.h | rg 'VERSION|FLAGS'`.
+2. `src/llama-kv-cache.cpp`: `state_write_data` / `state_read_data` field order
+   (v_trans, n_layer, then K rows, V rows) and `state_write_meta`.
+3. `src/llama-memory-recurrent.cpp`, `llama-memory-hybrid*.cpp`,
+   `llama-kv-cache-iswa.cpp`: `state_write*` order and what each writes (r/s
+   rows, per-seq headers).
+4. `src/llama-context.cpp` `state_seq_*` header (magic `ggsq`, version check,
+   `.dft` companion handling) and `tools/server/server-context.cpp`: our SCKP
+   appendix (`SLOT_CKPT_VERSION`, `save_slot_checkpoints`) and the `/slots`,
+   `/slots/<id>?action=save|restore` and `/props` JSON keys
+   (`id_slot`, `is_processing`, `n_saved`, `n_restored`, `filename`, `n_ctx`).
+5. Flags the fleet uses (values-*.yaml `extraArgs`, chart templates): extract with
+   `rg -oN -h -- '--?[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
+   in home-infrastructure (non-comment lines), then confirm every
+   flag appears in the new `llama-server --help` (current set: `--parallel/-np`,
+   `--batch-size`, `--ubatch-size`, `--spec-type {ngram-mod,draft-dflash}`,
+   `--spec-draft-n-max`, `--model-draft`, `--chat-template-kwargs`, `--cache-ram`,
+   `--no-cache-idle-slots`, `--slot-save-path`, `--cpu-split`, `--split-balance`,
+   `--split-workload`, `--split-calibrate`, `--cache-type-k/v`, `-fa`, `-ngl`,
+   `--n-cpu-moe`, `-ts`, `--rpc`, `--fit`, `--reasoning-format`, `--embeddings`).
+6. Buffer-type / backend interface (`ggml/src/ggml-backend-impl.h`), batch API
+   (`llama_batch_ext`) and `common/` helper signatures: these produce compile breaks
+   in our out-of-tree initialisers and tests; a clean `git merge`/rebase is not proof.
+   Always build (`GGML_VULKAN=ON GGML_RPC=ON`, tests on) and run `ctest` + the
+   llama-server pytest suite (`tools/server/tests`, `-m "not slow"`).
+7. Conflicts are resolved against upstream's new structure, never by preserving old
+   shape (operator rule); drop a patch outright when upstream made it redundant.
+
+home-infrastructure artifacts to update **before** the `LLAMACPP_REF` bump lands:
+- `deployments/llamacpp-rpc/scripts/kvrepl_nstream_convert.py` (`BIN_VERSION`, any new
+  per-attention-block fields, `_copy_attn_section`, layout doc) and
+  `tests/test-kvrepl-nstream-convert.py` fixtures; real round trip with
+  `tests/kvrepl-real-restore-proof.py`.
+- `slot-cache-sync` / `slot-cache-gc` CronJobs (`templates/master/`): version gate so
+  mixed-version nodes do not exchange saves; plan the `slotSavePath` flush.
+- `scripts/litellm_custom_callbacks.py` (consumes `id_slot`, `/slots` `is_processing`,
+  slot save/restore `filename`) and the `tests/test_litellm_*slot*.py` tests.
+- `values-*.yaml` `extraArgs` (flag check above).
+- Then bump `LLAMACPP_REF` in `deployments/llamacpp-rpc/image/Dockerfile` (40-char SHA of
+  the merged fork commit) and let CI build the image.
 
 ## QA requirement for every fork-exclusive change (added 2026-09-18)
 
@@ -545,6 +637,45 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
 - **ASan gotcha:** `test-rpc-multi-server` and `test-rpc-server-multiclient`
   report the RPC backend's intentionally never-freed registries as leaks.
   Run ctest under ASan with `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1`.
+
+## Truncated slot-save restore no longer aborts (D1, added 2026-10-06)
+
+Branch `upstream-sync-2026-10-d1` (one commit on `upstream-sync-2026-10`).
+Dawn QA defect D1: `/slots/<id>?action=restore` of a save file truncated by 1
+byte, 4096 bytes or half hit `GGML_ASSERT(nread <= state_size)` in
+`llama_context::state_seq_load_file` and killed llama-server (the file stays
+on disk, so a restart does not clear it; this fleet replicates saves between
+nodes, so a half-written copy is a real input). Reproduces on the old fleet
+build (state v3) and the 2026-10 sync (state v4); the fix is format-independent.
+
+Root cause: `llama_file::read_raw` deliberately tolerates reading past EOF
+(zero-fills, so model loading can read direct-I/O alignment padding).
+`llama_io_read_file` (the sequence-state file reader) inherited that, so a
+short file "read" fine, `nread` overran `state_size` and the assert fired. The
+in-memory reader (`llama_io_read_buffer`) already bounds-checks and throws.
+
+Fix (no on-disk format change, v3 and v4 files behave the same):
+- `src/llama-context.cpp`: `llama_io_read_file::read` / `read_tensor` throw
+  when the request exceeds the bytes left in the file (checked before the
+  `read_tensor` staging allocation, so a corrupt length cannot drive a huge
+  allocation). The existing catch in `llama_state_seq_load_file` turns it into
+  a return of 0, which the server reports as HTTP 400 "Unable to restore
+  slot: ...". `state_seq_read_data` now also `seq_rm`s the sequence when the
+  restore throws part-way, so a short read leaves no partial sequence (this
+  was visible on DeepSeek-V4, whose last-read component left cells behind).
+- `tools/server/server-context.cpp`: the SCKP checkpoint appendix reader
+  bounds a buffer length by the bytes left in the file instead of a fixed
+  16 GiB cap (a corrupt length of a few GiB could OOM a memory-limited pod).
+  A bad appendix is still just ignored (restore succeeds without
+  checkpoints, as before). The `.dft` companion is read whole by size and
+  already validated, so it needed no change.
+- Tests: `test-save-load-state` (case "file, truncated by 1 byte / 4096 bytes
+  / half" across all 129 arch models) and `test_slot_save.py::test_slot_restore_truncated_file`.
+  Both fail before the fix (abort) and pass after.
+
+Upstream check (b11445+11, `51ce9c11a`, 2026-10-06): no fix or open PR for the
+truncated-file assert (related but different: #27530 merged, #29723/#29700
+closed). Would be offered upstream as a PR; not opened.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 

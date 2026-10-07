@@ -28,7 +28,12 @@ static bool decode_segs(llama_context * ctx, const std::vector<seg> & segs) {
     llama_batch batch = llama_batch_init(n, 0, 1);
     for (const auto & sg : segs) {
         for (llama_pos p = sg.p0; p < sg.p1; ++p) {
-            common_batch_add(batch, tok(sg.seq_id, p), p, { sg.seq_id }, p + 1 == sg.p1);
+            const int32_t i = batch.n_tokens++;
+            batch.token[i]     = tok(sg.seq_id, p);
+            batch.pos[i]       = p;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = sg.seq_id;
+            batch.logits[i]    = p + 1 == sg.p1;
         }
     }
     const bool ok = llama_decode(ctx, batch) == 0;

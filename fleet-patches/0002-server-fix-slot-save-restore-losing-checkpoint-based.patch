@@ -1,4 +1,4 @@
-From 4790afadf9eabf0f9b484f15af3014a19d335af4 Mon Sep 17 00:00:00 2001
+From 54b9a9e2dd6ec8f80be9beb9d179dacfb16fafea Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:28 -0500
 Subject: [PATCH] server: fix slot save/restore losing checkpoint-based cache
@@ -93,10 +93,10 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 179 insertions(+), 2 deletions(-)
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b6835e4345..c4a533825b 100644
+index d1af984e67..71a090f2fc 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -2371,6 +2371,128 @@ private:
+@@ -2575,6 +2575,128 @@ private:
                  cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
      }
  
@@ -225,7 +225,7 @@ index b6835e4345..c4a533825b 100644
      // returns false to decline the task, it is offered again after the decode is done
      bool process_single_task(server_task && task, bool is_yielding) {
          // while yielding, an encode / decode is running and only reading the server state is safe
-@@ -2579,6 +2701,32 @@ private:
+@@ -2784,6 +2906,32 @@ private:
                          break;
                      }
  
@@ -258,7 +258,7 @@ index b6835e4345..c4a533825b 100644
                      const int64_t t_end = ggml_time_us();
                      const double t_save_ms = (t_end - t_start) / 1000.0;
  
-@@ -2588,7 +2736,7 @@ private:
+@@ -2793,7 +2941,7 @@ private:
                      res->filename = filename;
                      res->is_save  = true;
                      res->n_tokens = slot->prompt.tokens.size();
@@ -267,7 +267,7 @@ index b6835e4345..c4a533825b 100644
                      res->t_ms     = t_save_ms;
                      queue_results.send(std::move(res));
                  } break;
-@@ -2638,12 +2786,41 @@ private:
+@@ -2843,12 +2991,41 @@ private:
  
                          slot->prompt.clear();
                          slot->prompt.tokens = std::move(restored);
@@ -309,7 +309,7 @@ index b6835e4345..c4a533825b 100644
                      const int64_t t_end = ggml_time_us();
                      const double t_restore_ms = (t_end - t_start) / 1000.0;
  
-@@ -2653,7 +2830,7 @@ private:
+@@ -2858,7 +3035,7 @@ private:
                      res->filename = filename;
                      res->is_save  = false;
                      res->n_tokens = slot->prompt.tokens.size();

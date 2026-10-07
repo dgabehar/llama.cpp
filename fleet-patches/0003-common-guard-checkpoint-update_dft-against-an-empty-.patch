@@ -1,4 +1,4 @@
-From f4ed0a034d95ca64962449ad49311a96f86d7960 Mon Sep 17 00:00:00 2001
+From 6fcd12020b678a84facfed47ff516fa22d9cb3a5 Mon Sep 17 00:00:00 2001
 From: Doug Gabehart <dgabehar@gmail.com>
 Date: Wed, 9 Sep 2026 20:53:47 -0500
 Subject: [PATCH] common: guard checkpoint update_dft against an empty draft
@@ -73,10 +73,10 @@ Claude-Session: https://claude.ai/code/session_017R3QNP4GznFWhhf11QY18j
  1 file changed, 17 insertions(+)
 
 diff --git a/common/common.cpp b/common/common.cpp
-index d8319cd9ac..c7d1295c95 100644
+index c301c22ca1..30ff44b14b 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -2305,6 +2305,23 @@ void common_prompt_checkpoint::update_dft(
+@@ -2372,6 +2372,23 @@ void common_prompt_checkpoint::update_dft(
          return;
      }
  

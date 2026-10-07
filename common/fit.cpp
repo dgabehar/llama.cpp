@@ -293,9 +293,9 @@ static void common_params_fit_impl(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    // size the context for all sequences, but keep minimums and alignment per KV stream
-    const uint32_t n_seq_max  = std::max<uint32_t>(1, cparams->n_seq_max);
-    const uint32_t n_streams  = cparams->kv_unified ? 1 : n_seq_max;
+    // with non-unified kv, we need to take into account n_streams
+    // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
+    const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
@@ -366,14 +366,14 @@ static void common_params_fit_impl(
     common_fit_cap_igpu_free_to_host(dmds_full, devs);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-    uint32_t       n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_seq_max, UINT32_MAX);
+    uint32_t       n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
     const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
 
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {
         cparams->n_ctx = n_ctx_max;
-        LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " sequence(s):\n",
-            __func__, n_ctx_max, n_seq_max);
+        LOG_TRC("%s: context size unset -> using %" PRIu32 " for %" PRIu32 " stream(s):\n",
+            __func__, n_ctx_max, n_streams);
 
         // A per-op size ceiling (e.g. Vulkan's maxStorageBufferRange) is not the only way
         // building a context this large can go wrong. On a UMA device the per-layer KV cache
@@ -382,7 +382,7 @@ static void common_params_fit_impl(
         // or a kernel-level allocation stall, neither of which is a catchable std::runtime_error.
         // So size the probe from real measured memory use first, rather than relying only on
         // catching a failure this class of device may never throw in the first place. This
-        // applies regardless of n_seq_max: even a single sequence's native training context can
+        // applies regardless of n_streams: even a single sequence's native training context can
         // be large enough to overshoot a small device's real memory.
         //
         // n_ctx_min_total is small enough to always be safe to build, so measure there to
