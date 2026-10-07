@@ -502,6 +502,26 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("no_empty_reply_inert"))
+        ->set_desc("Tags (reasoning open/close) that do not count as reply content: while only these and whitespace have been generated, end-of-generation tokens are masked. Set by the chat template handling for models that sometimes end the turn with their first token")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.no_empty_reply = false;
+            ctx.params.sampling.no_empty_reply_inert.clear();
+            const auto & tags = data.at("no_empty_reply_inert");
+            if (tags.is_array()) {
+                for (const auto & tag : tags) {
+                    if (!tag.is_string() || tag.get<std::string>().empty()) {
+                        continue;
+                    }
+                    ctx.params.sampling.no_empty_reply = true;
+                    const auto toks = common_tokenize(ctx.vocab, tag.get<std::string>(), false, true);
+                    if (toks.size() == 1) {
+                        ctx.params.sampling.no_empty_reply_inert.push_back(toks[0]);
+                    }
+                }
+            }
+        }));
+
     add((new field_json("stop_after_reasoning"))
         ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
