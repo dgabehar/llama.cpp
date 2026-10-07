@@ -1,0 +1,173 @@
+From 7f07a1b06e0e80b0d399405e86c7e6023a2e1e35 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 09:41:52 -0500
+Subject: [PATCH] sampling: K2-Horizon: mask the structural tool-call tags
+ while no native section is open
+
+With the history reasoning rendered in the generation tag (previous commit) the model no longer repeats the
+open tag or opens a Kimi call, but its first token after the reasoning open tag sometimes skips ahead:
+first-token probes (greedy, garage replay cuts 8/20/24): "<ifm|tool_call>" 0.62 / 0.10 / 0.15 and
+"</ifm|tool_calls>" 0.18 / 0.07 / 0.22 (bare call without its section opener, or a stray close), which
+parsed as reasoning-only turns (11/40 empty on the garage replay with the tag match alone; 0/40 with the
+old rendering, which instead repeated "<ifm|think>" 45-78%). The tags are single vocab tokens, so the guard,
+armed with tools, now masks every tool tag except the section opener while no native section is open;
+inside a section nothing is masked. Never masks the last candidate.
+
+Chat-level (tools offered, reasoning_effort low), live-session and garage replays, guard + normalisation:
+garage stream 0/40, live stream 0/60, garage non-stream 0/40 empty/stuck/Kimi (before: live stream
+16/60 Kimi + 1 empty + 2 stuck). Test: test-empty-reply-guard now also takes a second vocab (llama-bpe,
+special tokens standing in for the K2 tags). Satisfies K2-SAMP-01/07 extensions, K2-REPLAY-09 (design).
+
+Assisted-by: Claude Sonnet 5
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+
+(cherry picked from commit a2ae8f321; re-derived for upstream b11454: the autoparser/test-chat hunks of this patch are carried by the k2-horizon.cpp port commits)
+---
+ common/sampling.cpp              | 24 +++++++++++++---
+ tests/CMakeLists.txt             |  2 +-
+ tests/test-empty-reply-guard.cpp | 47 ++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 53c79049ae..db2d3ecf65 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -153,6 +153,9 @@ struct common_empty_reply_guard {
+     bool                     n_open     = false;  // the native section opener itself was seen during this hold
+     bool                     n_closed   = false;  // ... and its close
+     std::vector<int>         depth;               // open inner tags per inner pair (only counted inside a section)
++    // armed: token ids of every tag except the section opener; masked while no native section is open (a call
++    // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
++    std::vector<llama_token> tag_ids;
+ };
+ 
+ static const char * const k_kimi_markers[] = {
+@@ -237,6 +240,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
+ }
+ 
+ // true while EOG must stay masked (before the caller's "last candidate" check)
++static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx);
+ static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx) {
+     if (!ctx->seen_output) {
+         return true;
+@@ -279,14 +283,19 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
+ 
+ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
+-    if (!common_empty_reply_guard_holds(ctx)) {
++    const bool mask_eog  = common_empty_reply_guard_holds(ctx);
++    const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
++    if (!mask_eog && !mask_tags) {
+         return;
+     }
++    const auto masked = [&](llama_token id) {
++        return (mask_eog  && std::find(ctx->eog.begin(),     ctx->eog.end(),     id) != ctx->eog.end()) ||
++               (mask_tags && std::find(ctx->tag_ids.begin(), ctx->tag_ids.end(), id) != ctx->tag_ids.end());
++    };
+     // never mask the last candidate standing
+     size_t n_other = 0;
+     for (size_t i = 0; i < cur_p->size; ++i) {
+-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) == ctx->eog.end() &&
+-            cur_p->data[i].logit != -INFINITY) {
++        if (!masked(cur_p->data[i].id) && cur_p->data[i].logit != -INFINITY) {
+             n_other++;
+         }
+     }
+@@ -294,7 +303,7 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
+         return;
+     }
+     for (size_t i = 0; i < cur_p->size; ++i) {
+-        if (std::find(ctx->eog.begin(), ctx->eog.end(), cur_p->data[i].id) != ctx->eog.end()) {
++        if (masked(cur_p->data[i].id)) {
+             cur_p->data[i].logit = -INFINITY;
+         }
+     }
+@@ -337,6 +346,13 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
+ struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
+     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
++    // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
++    for (size_t i = 1; i < ctx->hold.size(); ++i) {
++        const auto toks = common_tokenize(vocab, ctx->hold[i], false, true);
++        if (toks.size() == 1) {
++            ctx->tag_ids.push_back(toks[0]);
++        }
++    }
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+     for (llama_token id = 0; id < n_vocab; ++id) {
+         if (llama_vocab_is_eog(vocab, id)) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 8f473ebde9..6330894594 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -156,7 +156,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     llama_build_and_test(test-unicode.cpp)
+     llama_build_and_test(test-sampling.cpp)
+     llama_build_and_test(test-reasoning-budget.cpp)
+-    llama_build_and_test(test-empty-reply-guard.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
++    llama_build_and_test(test-empty-reply-guard.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+     llama_build_and_test(test-grammar-parser.cpp)
+     llama_build_and_test(test-grammar-integration.cpp)
+     llama_build_and_test(test-llama-grammar.cpp)
+diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
+index 6623089e6b..62fa0a24c4 100644
+--- a/tests/test-empty-reply-guard.cpp
++++ b/tests/test-empty-reply-guard.cpp
+@@ -263,6 +263,53 @@ int main(int argc, char ** argv) {
+     CHECK(!std::isinf(d2[0].logit));
+     llama_sampler_free(g);
+ 
++    // ---- structural tags are masked while no native section is open (needs a vocab where the tags are single
++    // tokens; K2's are, here llama-3 special tokens stand in): section = start_header/end_header, inner = begin_of_text/eot
++    if (argc > 2) {
++        llama_model * m2 = llama_model_load_from_file(argv[2], mparams);
++        CHECK(m2 != nullptr);
++        if (m2) {
++            const llama_vocab * v2 = llama_model_get_vocab(m2);
++            const std::vector<std::string> tags = { "<|start_header_id|>", "<|end_header_id|>", "<|begin_of_text|>", "<|reserved_special_token_5|>" };
++            std::vector<llama_token> id;
++            for (const auto & t : tags) {
++                auto tk = common_tokenize(v2, t, false, true);
++                CHECK(tk.size() == 1);
++                id.push_back(tk[0]);
++            }
++            const llama_token ord = common_tokenize(v2, "a", false, false)[0];
++            // which of { section open, section close, inner open, inner close, ordinary } survive
++            auto survivors = [&](llama_sampler * g2) {
++                llama_token_data d[5] = { { id[0], 1.f, 0.f }, { id[1], 1.f, 0.f }, { id[2], 1.f, 0.f }, { id[3], 1.f, 0.f }, { ord, 1.f, 0.f } };
++                llama_token_data_array p = { d, 5, -1, false };
++                llama_sampler_apply(g2, &p);
++                std::string r;
++                for (auto & x : d) { r += std::isinf(x.logit) ? '0' : '1'; }
++                return r;
++            };
++            llama_sampler * g2 = common_sampler_init_empty_reply_guard(v2, {}, tags);
++            llama_sampler_accept(g2, ord);                      // some output, no section yet
++            CHECK(survivors(g2) == "10001");                    // only the opener and ordinary text
++            llama_sampler_accept(g2, id[0]);
++            CHECK(survivors(g2) == "11111");                    // inside the section everything is allowed
++            llama_sampler_accept(g2, id[2]);
++            llama_sampler_accept(g2, id[3]);
++            llama_sampler_accept(g2, id[1]);                    // balanced and closed: outside again
++            CHECK(survivors(g2) == "10001");
++            llama_sampler * g3 = common_sampler_init_empty_reply_guard(v2, {}, {}); // not armed: nothing masked
++            llama_sampler_accept(g3, ord);
++            CHECK(survivors(g3) == "11111");
++            llama_sampler_free(g3);
++            // never mask the last candidate standing
++            llama_token_data d1[1] = { { id[1], 1.f, 0.f } };
++            llama_token_data_array p1 = { d1, 1, -1, false };
++            llama_sampler_apply(g2, &p1);
++            CHECK(!std::isinf(d1[0].logit));
++            llama_sampler_free(g2);
++            llama_model_free(m2);
++        }
++    }
++
+     llama_model_free(model);
+     llama_backend_free();
+     if (n_fail) {
+-- 
+2.43.0
+
