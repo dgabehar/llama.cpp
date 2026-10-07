@@ -852,6 +852,28 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
             LOG_ERR("%s: failed to parse tool use chat template (ignoring it): %s\n", __func__, e.what());
         }
     }
+
+    // K2-Horizon: render once with a tool at startup. The parser logs "K2-Horizon parser: guard inert=.. hold=.." (the
+    // deploy workflow greps for it) and this fails loudly if it ever stops feeding the sampler's empty-reply guard
+    // (upstream's specialized parser once pre-empted the fork's workaround and silently disarmed it).
+    if (default_template_src.find("<|ifm|im_start|>") != std::string::npos && default_template_src.find("<ifm|tool_calls>") != std::string::npos) {
+        try {
+            common_chat_msg user;
+            user.role    = "user";
+            user.content = "hi";
+            common_chat_templates_inputs probe;
+            probe.messages              = { user };
+            probe.tools                 = { common_chat_tool{ "probe", "probe", R"({"type":"object","properties":{}})" } };
+            probe.add_generation_prompt = true;
+            probe.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+            const auto params = common_chat_templates_apply(tmpls.get(), probe);
+            if (params.no_empty_reply_inert.empty() || params.no_empty_reply_hold.empty()) {
+                LOG_ERR("%s: K2-Horizon sampler guard NOT armed: the chat parser fed no empty-reply guard inputs\n", __func__);
+            }
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: K2-Horizon startup self-check failed: %s\n", __func__, e.what());
+        }
+    }
     return tmpls;
 }
 
