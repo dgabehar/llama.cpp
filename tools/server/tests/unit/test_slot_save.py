@@ -757,3 +757,14 @@ def test_request_pinned_to_busy_slot_does_not_touch_its_context():
 
     assert out["a"].status_code == 200
     assert out["a"].body["content"] == solo.body["content"]
+
+
+@pytest.mark.parametrize("action", ["save", "restore", "erase"])
+@pytest.mark.parametrize("id_slot", [99, -1])
+def test_slot_action_nonexistent_slot_is_rejected(action, id_slot, tmp_path):
+    global server
+    server.start()
+    res = server.make_request("POST", f"/slots/{id_slot}?action={action}", data={"filename": "nope.bin"})
+    assert res.status_code == 400
+    assert "Invalid slot ID" in res.body["error"]["message"]
+    assert not (tmp_path / "nope.bin").exists()

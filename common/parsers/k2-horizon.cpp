@@ -288,7 +288,10 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
                         auto any_arg = p.choice();
                         for (const auto & a : required_args) { any_arg |= a; }
                         for (const auto & a : optional_args) { any_arg |= a; }
-                        args = required_args.empty() && optional_args.empty() ? p.eps() : p.rule("tool-" + name + "-args", p.zero_or_more(any_arg));
+                        // At most one slot per parameter: an unbounded repeat let the model loop on one `<ifm|arg_key>` until
+                        // max_tokens (the grammar never forced the call to close), the call was lost and the raw block leaked.
+                        const int n_args = (int) (required_args.size() + optional_args.size());
+                        args = n_args == 0 ? p.eps() : p.rule("tool-" + name + "-args", p.repeat(any_arg, 0, n_args));
                     } else {
                         args = p.permute("tool-" + name + "-args", required_args);
                         if (!optional_args.empty()) {

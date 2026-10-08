@@ -5639,6 +5639,14 @@ void server_routes::init_routes() {
             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        // get_slot_by_id() wraps an out-of-range id around (meant for completions' id_slot); a slot action on a
+        // slot that does not exist must fail instead of silently acting on slot (id % n_slots)
+        if (id_slot < 0 || id_slot >= params.n_parallel) {
+            res->error(format_error_response(
+                string_format("Invalid slot ID %d (this server has %d slots)", id_slot, params.n_parallel),
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
 
         std::string action = req.get_param("action");
 
