@@ -429,7 +429,12 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
 }
 
 struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, const std::string & reasoning_close) {
-    auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+    auto * ctx = new common_empty_reply_guard();
+    ctx->vocab = vocab;
+    ctx->inert = inert;
+    if (hold.size() >= 2 && hold.size() % 2 == 0) {
+        ctx->hold = hold;
+    }
     ctx->open_initial = ctx->r_open = !reasoning_close.empty() && !ctx->hold.empty();
     if (ctx->open_initial) {
         const auto toks = common_tokenize(vocab, reasoning_close, false, true);
