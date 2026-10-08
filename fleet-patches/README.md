@@ -124,11 +124,11 @@ The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
-This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync (87
-patches; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
+This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync and extended on 2026-10-08
+with the K2 fixes (0088, 0089) and the sync-workflow removal (0090): 90 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
-full workflow this fits into (weekly upstream rebase, when to add a new
-patch vs. amend an existing one, the `sync-with-upstream` CI workflow).
+full workflow this fits into (when to add a new patch vs. amend an existing one; upstream syncs are manual merges since the
+K2 adoption, the `sync-with-upstream` CI workflow is disabled).

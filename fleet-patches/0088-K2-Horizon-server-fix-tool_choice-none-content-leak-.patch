@@ -1,0 +1,233 @@
+From 44d4952e128689a6b3a726887d9067f9f1076f97 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 7 Oct 2026 20:13:15 -0500
+Subject: [PATCH] K2-Horizon/server: fix tool_choice none content leak, bound
+ call args, reject bad slot ids
+
+(a) A parsed turn that is legitimately empty (K2: empty reasoning block, then a
+tool call that tool_choice none drops) fell back to the raw generated text in
+the non-streaming chat/responses/anthropic result, leaking
+`</ifm|think_faster>` into content. A result that went through update() now
+always uses the parsed message.
+
+(b) The lenient K2 call grammar allowed any number of argument slots per call
+(zero_or_more), so the model could loop on one `<ifm|arg_key>` to max_tokens
+(Dawn QA fixture 7). Bound it to one slot per parameter.
+
+(c) POST /slots/{id}?action=save|restore|erase wrapped an out-of-range id
+around (get_slot_by_id is meant for completions' id_slot), so /slots/99 acted
+on slot 99 % n_slots. Reject ids outside [0, n_parallel) with a 400.
+
+Tests: test-chat (arg bound, server result), server test_slot_save.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/parsers/k2-horizon.cpp             |  5 +-
+ tests/test-chat.cpp                       | 69 +++++++++++++++++++++++
+ tools/server/server-context.cpp           |  8 +++
+ tools/server/server-task.cpp              | 15 ++++-
+ tools/server/tests/unit/test_slot_save.py | 11 ++++
+ 5 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/common/parsers/k2-horizon.cpp b/common/parsers/k2-horizon.cpp
+index c82fc0dbb..debaa2bf9 100644
+--- a/common/parsers/k2-horizon.cpp
++++ b/common/parsers/k2-horizon.cpp
+@@ -288,7 +288,10 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
+                         auto any_arg = p.choice();
+                         for (const auto & a : required_args) { any_arg |= a; }
+                         for (const auto & a : optional_args) { any_arg |= a; }
+-                        args = required_args.empty() && optional_args.empty() ? p.eps() : p.rule("tool-" + name + "-args", p.zero_or_more(any_arg));
++                        // At most one slot per parameter: an unbounded repeat let the model loop on one `<ifm|arg_key>` until
++                        // max_tokens (the grammar never forced the call to close), the call was lost and the raw block leaked.
++                        const int n_args = (int) (required_args.size() + optional_args.size());
++                        args = n_args == 0 ? p.eps() : p.rule("tool-" + name + "-args", p.repeat(any_arg, 0, n_args));
+                     } else {
+                         args = p.permute("tool-" + name + "-args", required_args);
+                         if (!optional_args.empty()) {
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 057e7e557..134db6c81 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -8,6 +8,7 @@
+ #include "../src/llama-grammar.h"
+ #include "../src/unicode.h"
+ #include "../tools/server/server-chat.h"
++#include "../tools/server/server-task.h"
+ #include "chat-auto-parser.h"
+ #include "chat.h"
+ #include "common.h"
+@@ -5542,6 +5543,30 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+                 .expect_reasoning("Reasoning here.")
+                 .expect_content("Sure, it is git.example.co")
+                 .run();
++            // a call has at most one slot per parameter: a model looping on one `<ifm|arg_key>` (seen live: fixture 7 ran
++            // to max_tokens) is cut off by the grammar instead of being allowed to repeat forever
++            {
++                const std::string one_arg =
++                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n";
++                tst.test(one_arg + "</ifm|tool_call>\n</ifm|tool_calls>")
++                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                    .tools({ k2_bash_tool })
++                    .expect_tool_calls({ ls_call })
++                    .run();
++                bool rejected = false;
++                try {
++                    tst.test(one_arg + "<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
++                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                        .tools({ k2_bash_tool })
++                        .expect_tool_calls({ ls_call })
++                        .run();
++                } catch (const std::exception &) {
++                    rejected = true;  // neither the parser nor the grammar takes a second `command` slot
++                }
++                if (!rejected) {
++                    throw std::runtime_error("K2: the grammar allows a repeated argument slot (unbounded arg loop)");
++                }
++            }
+         }
+ 
+         // K2-Horizon: a call in the Kimi form (`<|tool_call_begin|>...`) and parse failures. The lazy grammar only
+@@ -8181,6 +8206,49 @@ static void test_k2_history_reasoning() {
+     LOG_ERR("%s passed\n", __func__);
+ }
+ 
++// K2-Horizon: a turn whose parse is legitimately empty (empty reasoning, then a tool call that tool_choice none drops)
++// must be returned empty by the server. The non-streaming response used to fall back to the raw generated text and
++// leaked `</ifm|think_faster>` into `content`.
++static void test_k2_empty_parse_is_not_raw_text() {
++    LOG_DBG("%s\n", __func__);
++    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
++
++    common_chat_msg user;
++    user.role    = "user";
++    user.content = "List the files.";
++    common_chat_tool bash{ "bash", "Executes a bash command",
++                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
++
++    common_chat_templates_inputs inputs;
++    inputs.messages              = { user };
++    inputs.add_generation_prompt = true;
++    inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
++    inputs.tools                 = { bash };
++    inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
++    inputs.chat_template_kwargs["reasoning_effort"] = "\"low\"";
++    const auto cp = common_chat_templates_apply(tmpls.get(), inputs);
++
++    common_chat_parser_params pp(cp);
++    pp.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
++    pp.parser.load(cp.parser);
++
++    // what the server holds after stop_after_reasoning cut `</ifm|think_faster><ifm|tool_calls>...` at the call
++    for (const char * generated : { "</ifm|think_faster>", "</ifm|think_faster>\n" }) {
++        task_result_state state(pp);
++        server_task_result_cmpl_final res;
++        res.res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
++        res.stream   = false;
++        res.stop     = STOP_TYPE_WORD;
++        res.content  = generated;
++        res.update(state);
++        const json out = res.to_json();
++        const json msg = out.at("choices").at(0).at("message");
++        assert_equals(std::string(""), msg.value("content", std::string("")));
++        assert_equals(std::string("assistant"), msg.at("role").get<std::string>());
++    }
++    LOG_ERR("%s passed\n", __func__);
++}
++
+ // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
+ // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
+ // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
+@@ -8651,6 +8719,7 @@ int main(int argc, char ** argv) {
+         test_developer_role_to_system_workaround();
+         test_k2_history_reasoning();
+         test_k2_guard_fields();
++        test_k2_empty_parse_is_not_raw_text();
+         test_deepseek_v4_thinking_retention();
+         test_deepseek_v4_tool_result_ordering();
+         test_template_generation_prompt();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a5a4d9319..135d07d7a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5639,6 +5639,14 @@ void server_routes::init_routes() {
+             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+             return res;
+         }
++        // get_slot_by_id() wraps an out-of-range id around (meant for completions' id_slot); a slot action on a
++        // slot that does not exist must fail instead of silently acting on slot (id % n_slots)
++        if (id_slot < 0 || id_slot >= params.n_parallel) {
++            res->error(format_error_response(
++                string_format("Invalid slot ID %d (this server has %d slots)", id_slot, params.n_parallel),
++                ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
+ 
+         std::string action = req.get_param("action");
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index f231c8931..e2a34017b 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -431,8 +431,11 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
+ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+     std::string finish_reason = "length";
+     common_chat_msg msg;
+-    if (!oaicompat_msg.empty()) {
++    if (!oaicompat_msg.empty() || is_updated) {
++        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
++        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
+         msg = oaicompat_msg;
++        msg.role = "assistant";
+     } else {
+         msg.role = "assistant";
+         msg.content = content;
+@@ -546,8 +549,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
+ 
+ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
+     common_chat_msg msg;
+-    if (!oaicompat_msg.empty()) {
++    if (!oaicompat_msg.empty() || is_updated) {
++        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
++        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
+         msg = oaicompat_msg;
++        msg.role = "assistant";
+     } else {
+         msg.role = "assistant";
+         msg.content = content;
+@@ -756,8 +762,11 @@ json server_task_result_cmpl_final::to_json_anthropic() {
+     json content_blocks = json::array();
+ 
+     common_chat_msg msg;
+-    if (!oaicompat_msg.empty()) {
++    if (!oaicompat_msg.empty() || is_updated) {
++        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
++        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
+         msg = oaicompat_msg;
++        msg.role = "assistant";
+     } else {
+         msg.role = "assistant";
+         msg.content = content;
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index cbd8f4a1d..d5f87d1bf 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -757,3 +757,14 @@ def test_request_pinned_to_busy_slot_does_not_touch_its_context():
+ 
+     assert out["a"].status_code == 200
+     assert out["a"].body["content"] == solo.body["content"]
++
++
++@pytest.mark.parametrize("action", ["save", "restore", "erase"])
++@pytest.mark.parametrize("id_slot", [99, -1])
++def test_slot_action_nonexistent_slot_is_rejected(action, id_slot, tmp_path):
++    global server
++    server.start()
++    res = server.make_request("POST", f"/slots/{id_slot}?action={action}", data={"filename": "nope.bin"})
++    assert res.status_code == 400
++    assert "Invalid slot ID" in res.body["error"]["message"]
++    assert not (tmp_path / "nope.bin").exists()
+-- 
+2.43.0
+

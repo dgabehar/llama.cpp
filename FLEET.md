@@ -15,13 +15,27 @@ against (a specific commit SHA, never the floating branch name). See that
 repo's `deployments/llamacpp-rpc/AGENTS.md` for the image-build side of this
 workflow (CI-verifies a `LLAMACPP_REF` bump, don't pre-build locally).
 
-`.github/workflows/sync-with-upstream.yml` (this fork's own CI, patch 0005 in
-`fleet-patches/`) rebases this branch onto `upstream/master` weekly and
-on-dispatch, force-pushing a clean rebase or opening a tracking issue on
-conflict. At ~100 fork commits that rebase cannot succeed unattended; do a
-deliberate sync every 2-3 weeks (see "Upstream sync" below) and treat the weekly
-job as a notifier. `fleet-patches/regenerate.sh` takes `BASE=<sha> TIP=HEAD` for a
-branch built on a pinned upstream commit.
+Upstream syncs are manual: merge an `upstream-sync-YYYY-MM` branch into this branch (see "Upstream sync"
+below). The old `.github/workflows/sync-with-upstream.yml` (weekly rebase + force-push) and
+`.github/workflows/sync-fleet-patches.yml` were disabled once the branch became merge-based, and
+`sync-fleet-patches.yml` was removed on 2026-10-08 (mirror patch 0090) -- a rebase + force-push would
+clobber the merge history. `fleet-patches/regenerate.sh` needs `BASE=<last merged upstream sha>
+TIP=origin/fleet-patches EXCLUDE=<old pre-landing tip>` on this branch (see the script header):
+`BASE=4625240437c6821ee5c2da99e12d4817c6a8f07f EXCLUDE=38773736370e66abffbdb1af4805612055e87953`.
+
+## K2 fixes after the adoption (added 2026-10-08)
+
+Fork PR #16 (mirror patch 0088), found by Dawn QA on the K2 canary and identical on the old image:
+- `tool_choice:"none"` with tools offered leaked `</ifm|think_faster>` into `content`: the non-streaming result
+  (`tools/server/server-task.cpp`) fell back to the raw text when the parsed message was empty. A result that went
+  through `update()` now always uses the parsed message (chat, responses, anthropic).
+- A runaway `<ifm|tool_calls>` loop to `length`: the lenient K2 grammar (`common/parsers/k2-horizon.cpp`) allowed
+  unlimited argument slots per call; it now allows one per parameter, so the call must close.
+- `/slots/<bad id>?action=save|restore|erase` wrapped out-of-range ids (`id % n_slots`) and saved a real slot; ids
+  outside [0, n_parallel) now return 400 (`tools/server/server-context.cpp`).
+Fork PR #17 (patch 0089): `-Werror=missing-field-initializers` in the empty-reply guard init (`common/sampling.cpp`)
+failed the gcc arm64 CI build. Fork PR #18 (patch 0090) removed the disabled sync workflow. A 482-char hex tool
+argument that never completes is model repetition (offline grammar check accepts it), not a parser bug.
 
 ## Fleet patch maintenance (added 2026-09-15)
 
