@@ -431,8 +431,11 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     std::string finish_reason = "length";
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (!oaicompat_msg.empty() || is_updated) {
+        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
+        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
         msg = oaicompat_msg;
+        msg.role = "assistant";
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -546,8 +549,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (!oaicompat_msg.empty() || is_updated) {
+        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
+        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
         msg = oaicompat_msg;
+        msg.role = "assistant";
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -756,8 +762,11 @@ json server_task_result_cmpl_final::to_json_anthropic() {
     json content_blocks = json::array();
 
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (!oaicompat_msg.empty() || is_updated) {
+        // a parsed turn that came out empty (K2-Horizon: an empty reasoning block, a dropped tool call under
+        // tool_choice none) is empty; only a result that was never parsed falls back to the raw text
         msg = oaicompat_msg;
+        msg.role = "assistant";
     } else {
         msg.role = "assistant";
         msg.content = content;

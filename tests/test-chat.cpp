@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -5542,6 +5543,30 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 .expect_reasoning("Reasoning here.")
                 .expect_content("Sure, it is git.example.co")
                 .run();
+            // a call has at most one slot per parameter: a model looping on one `<ifm|arg_key>` (seen live: fixture 7 ran
+            // to max_tokens) is cut off by the grammar instead of being allowed to repeat forever
+            {
+                const std::string one_arg =
+                    "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n";
+                tst.test(one_arg + "</ifm|tool_call>\n</ifm|tool_calls>")
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ k2_bash_tool })
+                    .expect_tool_calls({ ls_call })
+                    .run();
+                bool rejected = false;
+                try {
+                    tst.test(one_arg + "<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ k2_bash_tool })
+                        .expect_tool_calls({ ls_call })
+                        .run();
+                } catch (const std::exception &) {
+                    rejected = true;  // neither the parser nor the grammar takes a second `command` slot
+                }
+                if (!rejected) {
+                    throw std::runtime_error("K2: the grammar allows a repeated argument slot (unbounded arg loop)");
+                }
+            }
         }
 
         // K2-Horizon: a call in the Kimi form (`<|tool_call_begin|>...`) and parse failures. The lazy grammar only
@@ -8181,6 +8206,49 @@ static void test_k2_history_reasoning() {
     LOG_ERR("%s passed\n", __func__);
 }
 
+// K2-Horizon: a turn whose parse is legitimately empty (empty reasoning, then a tool call that tool_choice none drops)
+// must be returned empty by the server. The non-streaming response used to fall back to the raw generated text and
+// leaked `</ifm|think_faster>` into `content`.
+static void test_k2_empty_parse_is_not_raw_text() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "List the files.";
+    common_chat_tool bash{ "bash", "Executes a bash command",
+                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+
+    common_chat_templates_inputs inputs;
+    inputs.messages              = { user };
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+    inputs.tools                 = { bash };
+    inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
+    inputs.chat_template_kwargs["reasoning_effort"] = "\"low\"";
+    const auto cp = common_chat_templates_apply(tmpls.get(), inputs);
+
+    common_chat_parser_params pp(cp);
+    pp.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    pp.parser.load(cp.parser);
+
+    // what the server holds after stop_after_reasoning cut `</ifm|think_faster><ifm|tool_calls>...` at the call
+    for (const char * generated : { "</ifm|think_faster>", "</ifm|think_faster>\n" }) {
+        task_result_state state(pp);
+        server_task_result_cmpl_final res;
+        res.res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+        res.stream   = false;
+        res.stop     = STOP_TYPE_WORD;
+        res.content  = generated;
+        res.update(state);
+        const json out = res.to_json();
+        const json msg = out.at("choices").at(0).at("message");
+        assert_equals(std::string(""), msg.value("content", std::string("")));
+        assert_equals(std::string("assistant"), msg.at("role").get<std::string>());
+    }
+    LOG_ERR("%s passed\n", __func__);
+}
+
 // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
 // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
 // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
@@ -8651,6 +8719,7 @@ int main(int argc, char ** argv) {
         test_developer_role_to_system_workaround();
         test_k2_history_reasoning();
         test_k2_guard_fields();
+        test_k2_empty_parse_is_not_raw_text();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
