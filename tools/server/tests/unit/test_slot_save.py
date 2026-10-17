@@ -340,7 +340,7 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
     # a real generation must clearly outlast the timeout below: the tiny test model stops at its
     # 2048-token training context after ~0.7 s on a GPU, so shift the context and keep going
     server.n_ctx = 8192
-    server.n_predict = 12000
+    server.n_predict = 6000
     server.enable_ctx_shift = True
     server.slot_action_timeout_ms = 500
     server.start()
@@ -349,10 +349,10 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
     def keep_slot_busy():
         r = server.make_request("POST", "/completion", data={
             "prompt": "Tell me a very long, very detailed story about dragons:",
-            "n_predict": 12000,
+            "n_predict": 6000,  # 12000 took more than 90 s on the arm64 CI runner under xdist (2026-10-17)
             "ignore_eos": True,  # the tiny model ends its story early otherwise
             "id_slot": 0,
-        }, timeout=90)
+        }, timeout=180)
         busy["status_code"] = r.status_code
     t = threading.Thread(target=keep_slot_busy)
     t.start()
@@ -369,14 +369,14 @@ def test_slot_action_timeout_returns_error_instead_of_hanging():
     assert elapsed < 10  # must fail fast (bounded by slot_action_timeout_ms), not hang
 
     # the cancelled save must not have disturbed the real, unrelated busy completion.
-    # join timeout must exceed keep_slot_busy()'s own request timeout above (90s) --
+    # join timeout must exceed keep_slot_busy()'s own request timeout above (180s) --
     # it was previously 30s, tighter than the busy request's own 60s HTTP timeout, so
     # under real CI parallelism (pytest-xdist running several other CPU-heavy
     # completions concurrently) an 8000-token generation legitimately taking
     # 30-60+ wall-clock seconds would fail this join on timing alone, unrelated to
     # any real regression (observed live: CI failure with the busy thread still
     # alive after 30s while several sibling tests logged 7-14s call times each).
-    t.join(timeout=100)
+    t.join(timeout=190)
     assert not t.is_alive()
     assert busy.get("status_code") == 200
 
