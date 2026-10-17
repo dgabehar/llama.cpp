@@ -31,6 +31,8 @@ n=0
 for sha in $(git rev-list --reverse --no-merges "$BASE..$TIP" ${EXCLUDE:+"^$EXCLUDE"}); do
     case "$(git log -1 --format=%s "$sha")" in
         "fleet: rebuild patch mirror"*|"fleet: regenerate patch mirror"*|"fleet: regenerate.sh"*|"Land "*) continue ;;
+        # superseded by upstream's own slot checkpoint + draft-state persistence (2026-10-17 sync); kept in history only
+        "server: fix slot save/restore losing checkpoint-based cache reuse") continue ;;
     esac
     n=$((n + 1))
     git format-patch --no-numbered --start-number "$n" -1 -o fleet-patches "$sha" >/dev/null

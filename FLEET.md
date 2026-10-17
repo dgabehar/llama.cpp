@@ -62,6 +62,32 @@ applies to this fork too, not just upstream contributions (`AGENTS.md`'s
 push/PR restriction is written for upstream, but this fork follows the same
 discipline by standing convention).
 
+## Upstream sync 2026-10-17 (merged upstream `ea0c4c2c8`, added 2026-10-17)
+
+Branch `upstream-sync-2026-10b`: `git merge upstream/master` into `fleet-patches` (merge commit, no rebase). Rollback
+anchor: tag `pre-merge-2026-10-17` (`a1dc7a9f9`). `regenerate.sh` now takes `BASE=ea0c4c2c85fb183ec0fbd30a1af4e4275a18a064`
+(same `EXCLUDE`); mirror = 89 patches.
+
+**Superseded by upstream (dropped from the mirror):** `server: fix slot save/restore losing checkpoint-based cache reuse`
+(vendored PR #26004 checkpoint appendix + the `.dft` companion file). Upstream now writes checkpoints and the draft state
+into the slot file itself (`save_slot_checkpoints`/`save_slot_draft`); old saves with a `.dft` companion restore without
+the draft state.
+
+**Re-derived:**
+- K2-Horizon parser (`common/parsers/k2-horizon.cpp`): fork lenient logic on upstream's index-based rule names
+  (`foreach_function`/`foreach_parameter` now pass indexes).
+- Empty-reply guard fields (`stops_after_reasoning`, `no_empty_reply_*`) travel through `common_chat_session` getters into
+  the same request fields the schema reads; `common_chat_params::parser` is now a `common_peg_arena`.
+- `common_chat_peg_parse` lenient fallback uses `ctx.input` (the input is moved into the parse context upstream).
+- RPC: multi-client server kept; upstream `ggml/src/ggml-rpc/log.h` macros adopted (`GGML_RPC_DEBUG` is a level now).
+- Vulkan `ggml_backend_vk_get_device_memory`: upstream's heap-budget clamp (#29277) combined with the iGPU host-RAM cap.
+- Tests: upstream folded the state tests into `test-llama-context`; the truncated-state-file cases were ported to
+  `tests/llama-context/cases-kv.cpp`; `test-chat.cpp` fork tests use `common_chat_session`.
+
+Verified: build with `GGML_VULKAN=ON GGML_RPC=ON`; ctest `test-chat`, `test-chat-peg-parser`, `test-chat-auto-parser`,
+`test-chat-template`, `test-empty-reply-guard`, `test-cpu-device-split`, `test-llama-context`, `test-generate-models`.
+Not yet: GPU benchmark on the 8060S, image CI, deploy.
+
 ## Upstream sync 2026-10 (rebased onto upstream `4f5406761`, added 2026-10-06)
 
 Branch `upstream-sync-2026-10` = upstream `4f5406761517648c23dbd60ea5ade37f77a316c9`
