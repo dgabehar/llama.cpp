@@ -12117,6 +12117,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next routed experts (512 experts, top-10): ~bs*10/512 rows per expert, far below the batch size.
+    // gate/up are m=2560,k=640 and down is m=640,k=2560; batch sizes bracket the prefill ubatch.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        for (int bs : {64, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
