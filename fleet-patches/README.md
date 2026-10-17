@@ -121,6 +121,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0087 | `44d4952e1` | K2-Horizon/server: fix tool_choice none content leak, bound call args, reject bad slot ids |
 | 0088 | `5d9445b34` | sampling: value-initialize the empty-reply guard (fixes -Werror=missing-field-initializers on gcc arm64 CI) |
 | 0089 | `ef002595f` | ci: remove the disabled sync-fleet-patches workflow |
+| 0090 | `c291b7775` | tests: slot-action timeout test runs a 6000-token busy request (12000 outran its 90 s HTTP timeout on the arm64 runner) |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
