@@ -318,6 +318,7 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
+    if (const char * e = getenv("LLAMA_FUSED_GDN_CH")) { cparams.fused_gdn_ch = atoi(e) != 0; } // bench only
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
