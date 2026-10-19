@@ -1096,11 +1096,13 @@ struct peg_test_case {
 struct make_peg_parser {
     common_chat_templates *       tmpls_;
     common_chat_templates_inputs  inputs_;
+    common_chat_session           proto_; // built (the template rendered) once, copied per parse
 
-    make_peg_parser(common_chat_templates * tmpls, const common_chat_templates_inputs & inputs) : tmpls_(tmpls), inputs_(inputs) {}
+    make_peg_parser(common_chat_templates * tmpls, const common_chat_templates_inputs & inputs) :
+        tmpls_(tmpls), inputs_(inputs), proto_(tmpls, nullptr, inputs) {}
 
     common_chat_msg parse(const std::string & msg, bool is_partial) const {
-        common_chat_session session(tmpls_, nullptr, inputs_);
+        common_chat_session session = proto_;
         const common_chat_input chunk(msg);
         return is_partial ? session.feed(chunk) : session.finish(chunk);
     }
@@ -5623,17 +5625,23 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 return b == std::string::npos ? std::string() : v.substr(b, v.find_last_not_of(" \n") + 1 - b);
             };
             // parse every prefix as a stream would (the diffs must stay valid), then the whole text
+            // one session fed a code point at a time (a session per prefix re-renders the template every time, O(n^2))
             auto stream_parse = [](const make_peg_parser & parser, const std::string & text) {
-                common_chat_msg prev;
+                common_chat_session session = parser.proto_;
+                common_chat_msg     prev;
                 prev.role = "assistant";
-                for (size_t i = 1; i < text.size(); ++i) {
-                    common_chat_msg cur = parser.parse(text.substr(0, i), true);
+                for (size_t b = 0; b < text.size();) {
+                    size_t e = b + 1;
+                    while (e < text.size() && (text[e] & 0xC0) == 0x80) {
+                        ++e;
+                    }
+                    common_chat_input chunk(text.substr(b, e - b));
+                    common_chat_msg   cur = e < text.size() ? session.feed(chunk) : session.finish(chunk);
                     common_chat_msg_diff::compute_diffs(prev, cur);
                     prev = cur;
+                    b    = e;
                 }
-                common_chat_msg whole = parser.parse(text, false);
-                common_chat_msg_diff::compute_diffs(prev, whole);
-                return whole;
+                return prev;
             };
 
             const std::vector<std::string> kimi = {
