@@ -144,10 +144,10 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
             data.generation_prompt += THINK_END + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PREFIX);
 
         auto literals = [&](const std::vector<std::string> & tags) {
@@ -164,7 +164,7 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
         std::optional<common_peg_parser> kimi_first;  // just the first call, up to its end tag (what ends reasoning)
         if (lenient && uses_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !has_response_format) {
             common_peg_parser kimi_choice = p.choice();
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
                 auto open = p.tool_open(p.optional(p.literal("functions.")) + p.tool_name(p.literal(name)) +
@@ -241,14 +241,15 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
                 // a block whose own end tag is missing still ends at the section end or at the next call
                 auto close_peek = p.peek(p.space() + p.choice({ p.literal(CALL_END), p.literal(SECTION_END), p.literal(CALL_START) }));
 
-                foreach_function(inputs.tools, [&](const json & tool) {
+                foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                     const auto & function = tool.at("function");
                     std::string  name     = function.at("name");
+                    const std::string tool_id = std::to_string(tool_index);
 
                     std::vector<common_peg_parser> required_args;
                     std::vector<common_peg_parser> optional_args;
-                    foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
-                        auto rule_name = "tool-" + name + "-arg-" + param.name;
+                    foreach_parameter(function, [&](size_t param_index, const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
+                        auto rule_name = "tool-" + tool_id + "-arg-" + std::to_string(param_index);
                         auto types     = param.schema->value_types();
                         auto arg_value = arg_string;
                         if (!types.has(common_chat_schema::TYPE_STRING)) {
@@ -291,15 +292,15 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
                         // At most one slot per parameter: an unbounded repeat let the model loop on one `<ifm|arg_key>` until
                         // max_tokens (the grammar never forced the call to close), the call was lost and the raw block leaked.
                         const int n_args = (int) (required_args.size() + optional_args.size());
-                        args = n_args == 0 ? p.eps() : p.rule("tool-" + name + "-args", p.repeat(any_arg, 0, n_args));
+                        args = n_args == 0 ? p.eps() : p.rule("tool-" + tool_id + "-args", p.repeat(any_arg, 0, n_args));
                     } else {
-                        args = p.permute("tool-" + name + "-args", required_args);
+                        args = p.permute("tool-" + tool_id + "-args", required_args);
                         if (!optional_args.empty()) {
                             args = args + p.zero_or_more(p.choice(optional_args));
                         }
                     }
 
-                    tool_choice |= p.rule("tool-" + name, p.tool(
+                    tool_choice |= p.rule("tool-" + tool_id, p.tool(
                         p.tool_open(CALL_START + p.tool_name(p.literal(name)) + "\n") + p.tool_args(args) +
                         p.tool_close(lenient ? close_peek : p.peek(p.space() + p.literal(CALL_END)))));
                 });
@@ -359,12 +360,10 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
         return root;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED);
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         if (data.grammar_lazy) {

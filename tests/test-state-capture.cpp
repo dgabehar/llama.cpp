@@ -7,6 +7,7 @@
 
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -166,6 +167,13 @@ static void run_case(const char * name, llama_model * model, llama_context_param
 }
 
 int main(int argc, char ** argv) {
+    // the "two seqs" case batches multiple sequences; hybrid archs reserve the final pp graph with
+    // n_seqs = 1 and re-reserve by design, which GGML_SCHED_DEBUG_REALLOC (CI: GGML_SCHED_NO_REALLOC) aborts on
+#ifdef _WIN32
+    _putenv_s("GGML_SCHED_DEBUG_REALLOC", "0");
+#else
+    setenv("GGML_SCHED_DEBUG_REALLOC", "0", 1);
+#endif
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

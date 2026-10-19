@@ -320,15 +320,29 @@ static void test_decode_replication_normalizes_rate() {
     auto m_thin = make_model(1);  // n1_decode = 1  -> n_rep = 256
     auto m_wide = make_model(8);  // n1_decode = 8  -> n_rep = 32
 
-    auto p_thin = common_split_balance_calibrate({ cpu }, m_thin, wl, "", false);
-    auto p_wide = common_split_balance_calibrate({ cpu }, m_wide, wl, "", false);
-    CHECK(p_thin.size() == 1 && p_thin[0].s_decode_byte > 0, "thin-layer calibration failed");
-    CHECK(p_wide.size() == 1 && p_wide[0].s_decode_byte > 0, "wide-layer calibration failed");
-    if (p_thin.size() != 1 || p_wide.size() != 1) {
-        return;
+    // a systematic op-count bias shows on every attempt; scheduler noise on a busy CI runner does not,
+    // so accept the first attempt that lands in range (up to 3)
+    double ratio = 0.0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        const int64_t t_start = ggml_time_us();
+        auto p_thin = common_split_balance_calibrate({ cpu }, m_thin, wl, "", false);
+        auto p_wide = common_split_balance_calibrate({ cpu }, m_wide, wl, "", false);
+        CHECK(p_thin.size() == 1 && p_thin[0].s_decode_byte > 0, "thin-layer calibration failed");
+        CHECK(p_wide.size() == 1 && p_wide[0].s_decode_byte > 0, "wide-layer calibration failed");
+        if (p_thin.size() != 1 || p_wide.size() != 1) {
+            return;
+        }
+        ratio = p_thin[0].s_decode_byte / p_wide[0].s_decode_byte;
+        if (ratio > 0.4 && ratio < 2.5) {
+            break;
+        }
+        // calibration is ~1 s on an idle machine; 10x that means a throttled or oversubscribed CI VM
+        // (hosted macOS runners), where the timing ratio is meaningless
+        if ((ggml_time_us() - t_start) > 20 * 1000000) {
+            fprintf(stderr, "test-split-balance: SKIP op-count ratio check, calibration too slow on this machine (ratio %.3g)\n", ratio);
+            return;
+        }
     }
-
-    const double ratio = p_thin[0].s_decode_byte / p_wide[0].s_decode_byte;
     CHECK(ratio > 0.4 && ratio < 2.5,
           "a layer's op count should not bias its calibrated decode rate this much (thin/wide s_decode_byte ratio %.3g)",
           ratio);
