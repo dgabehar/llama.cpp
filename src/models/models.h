@@ -17,6 +17,16 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// width-(conv_kernel_size - 1) window of concat(prefix, new_tokens) without materializing it (delta-net-base.cpp)
+ggml_tensor * build_conv_window(
+        ggml_context * ctx0,
+        ggml_tensor  * prefix,
+        ggml_tensor  * new_tokens,
+        int64_t        dm1,
+        int64_t        conv_channels,
+        int64_t        n_seqs,
+        int64_t        s_idx);
+
 //
 // base classes
 //
@@ -2682,6 +2692,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
         // one conv history per cache tensor: delta-net and PLE each have their own
+        // same history/tails as build_conv_state_at, but returns {state, new_tokens} for
+        // ggml_ssm_conv_split instead of materializing concat(state, transpose(x))
+        std::pair<ggml_tensor *, ggml_tensor *> build_conv_state_split(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                            int   il);
+
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
