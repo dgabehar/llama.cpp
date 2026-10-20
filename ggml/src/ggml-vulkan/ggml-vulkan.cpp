@@ -313,6 +313,17 @@ uint32_t ggml_vk_concat_unit_size(ggml_type type) {
     }
     return 1;
 }
+// dim 0 concat of a transposed (contiguous along dim 1) src1: the generic shader reads it with a large stride
+// along the fastest dst axis, so route it to the shared-memory tile shader.
+static bool ggml_vk_concat_use_tiled(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (ggml_is_quantized(dst->type) || ggml_get_op_params_i32(dst, 0) != 0) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(src1->type);
+    return src1->nb[0] > ts && src1->nb[1] == ts && src1->ne[0] > 1 && src1->ne[1] > 1 &&
+           (uint64_t) dst->ne[2] * dst->ne[3] <= 65535 && dst->ne[0] < 65535*32 && dst->ne[1] < 65535*32;
+}
+
 bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0->type != src1->type || src0->type != dst->type) {
         return false;
@@ -3409,6 +3420,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_tiled_i8, "concat_tiled_i8", concat_tiled_i8_len, concat_tiled_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_tiled_i16, "concat_tiled_i16", concat_tiled_i16_len, concat_tiled_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_tiled_i32, "concat_tiled_i32", concat_tiled_i32_len, concat_tiled_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_tiled_i64, "concat_tiled_i64", concat_tiled_i64_len, concat_tiled_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
@@ -8812,6 +8827,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
+        if (ggml_vk_concat_use_tiled(src0, src1, dst)) {
+            switch (ggml_vk_concat_unit_size(src0->type)) {
+            case 1: return ctx->device->pipeline_concat_tiled_i8;
+            case 2: return ctx->device->pipeline_concat_tiled_i16;
+            case 4: return ctx->device->pipeline_concat_tiled_i32;
+            case 8: return ctx->device->pipeline_concat_tiled_i64;
+            default: return nullptr;
+            }
+        }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
             return ctx->device->pipeline_concat_i8;
@@ -9774,6 +9798,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { 512, CEIL_DIV(ne, 512), 1 };
             } else {
                 elements = { ne, 1, 1 };
+            }
+            if (op == GGML_OP_CONCAT && ggml_vk_concat_use_tiled(src0, src1, dst)) {
+                // one workgroup per 32x32 tile of dst dims 0,1; z walks dims 2,3
+                elements = { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) (dst->ne[2] * dst->ne[3]) };
             }
 
             if (pipeline == ctx->device->pipeline_cpy_transpose_02_32 ||

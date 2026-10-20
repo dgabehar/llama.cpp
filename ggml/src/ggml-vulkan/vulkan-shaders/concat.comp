@@ -3,6 +3,53 @@
 #include "types.glsl"
 #include "generic_binary_head.glsl"
 
+#ifdef CONCAT_TILED
+// dim 0 concat where src1 is a transposed contiguous tensor (src1 is contiguous along dim 1, not dim 0).
+// Generic path reads src1 with a large stride along the fastest dst axis. Here a 32x32 tile of src1
+// is staged in shared memory: loaded coalesced along dst dim 1, stored coalesced along dst dim 0.
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+shared D_TYPE tile[32][33]; // [i0 within tile][i1 within tile], padded against bank conflicts
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint base0 = gl_WorkGroupID.x * 32;
+    const uint base1 = gl_WorkGroupID.y * 32;
+    const uint i3 = gl_WorkGroupID.z / p.ne22;
+    const uint i2 = gl_WorkGroupID.z - i3 * p.ne22;
+
+    // src1 column that tile row 0 holds (negative if the tile starts inside src0)
+    const int jb = int(base0) - int(p.ne00);
+
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        const uint r0 = ly + 8 * r;
+        const int  j0 = jb + int(r0);
+        const uint i1 = base1 + lx;
+        if (j0 >= 0 && uint(j0) < p.ne10 && i1 < p.ne21) {
+            tile[r0][lx] = D_TYPE(data_b[get_boffset() + i3*p.nb13 + i2*p.nb12 + i1*p.nb11 + uint(j0)*p.nb10]);
+        }
+    }
+    barrier();
+
+    const uint i0 = base0 + lx;
+    if (i0 >= p.ne20) {
+        return;
+    }
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        const uint i1l = ly + 8 * r;
+        const uint i1 = base1 + i1l;
+        if (i1 < p.ne21) {
+            const uint dst_idx = i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
+            if (i0 < p.ne00) {
+                data_d[get_doffset() + dst_idx] = D_TYPE(data_a[get_aoffset() + i3*p.nb03 + i2*p.nb02 + i1*p.nb01 + i0*p.nb00]);
+            } else {
+                data_d[get_doffset() + dst_idx] = tile[lx][i1l];
+            }
+        }
+    }
+}
+#else
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
@@ -39,3 +86,4 @@ void main() {
     }
 #endif
 }
+#endif

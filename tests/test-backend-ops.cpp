@@ -7119,6 +7119,34 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT of a recurrent conv state with a transposed activation along dim 0, as in the
+// gated-delta-net / PLE conv history: a is [d_conv-1, channels, n_seqs], b is transpose of [channels, n_tokens, n_seqs]
+struct test_concat_transposed : public test_case {
+    const ggml_type type;
+    const int64_t d_conv_m1;
+    const int64_t channels;
+    const int64_t n_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, d_conv_m1, channels, n_tokens, n_seqs);
+    }
+
+    test_concat_transposed(ggml_type type = GGML_TYPE_F32, int64_t d_conv_m1 = 3,
+            int64_t channels = 10240, int64_t n_tokens = 2048, int64_t n_seqs = 1)
+        : type(type), d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, d_conv_m1, channels, n_seqs);
+        ggml_set_name(a, "a");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, channels, n_tokens, n_seqs);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, x), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -11525,6 +11553,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // transposed src1 (tiled Vulkan path), incl. sizes that are not multiples of the 32x32 tile
+    // (the CPU reference concat has no transposed-src1 path for 8-byte types)
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I8 }) {
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 10240, 2048, 1));
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2));
+        test_cases.emplace_back(new test_concat_transposed(type, 40, 33, 31, 3));
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 64, 1, 1));
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
@@ -12195,6 +12232,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, type, { 2*17408, n_tokens, 1, 1 }, 0, false));
             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
         }
+    }
+
+    // conv-state concat with a transposed activation (qwen4exp / delta-net conv history)
+    for (int64_t n_tokens : { 512, 2048 }) {
+        test_cases.emplace_back(new test_concat_transposed(GGML_TYPE_F32, 3, 10240, n_tokens, 1));
     }
 
     // CONT of a 0<->2 permute at DeepSeek-V4 lightning-indexer shapes:
