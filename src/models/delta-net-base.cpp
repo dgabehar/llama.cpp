@@ -456,7 +456,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 // kernel width. The straddling case is the one the old concat-based code got
 // "for free"; here it costs a small (at most dm1-wide) concat instead of one
 // sized by the full n_t.
-static ggml_tensor * build_conv_window(
+ggml_tensor * build_conv_window(
         ggml_context * ctx0,
         ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
         ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], possibly non-contiguous
