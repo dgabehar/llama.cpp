@@ -4404,17 +4404,19 @@ struct test_ssm_conv_split : public test_case {
     const std::array<int64_t, 3> ne_new_tokens; // [n_t, d_inner, n_s], logical shape
     const std::array<int64_t, 2> ne_c;          // [d_conv, d_inner]
     const bool transpose_new;
+    const bool silu; // apply ggml_silu to the result, as the qwen35/qwen4exp callers do
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne_prefix, ne_new_tokens, ne_c, transpose_new);
+        return VARS_TO_STR6(type, ne_prefix, ne_new_tokens, ne_c, transpose_new, silu);
     }
 
     test_ssm_conv_split(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 3> ne_prefix     = {3, 10, 1},
             std::array<int64_t, 3> ne_new_tokens = {10, 10, 1},
             std::array<int64_t, 2> ne_c          = {4, 10},
-            bool transpose_new = false)
-        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new) {}
+            bool transpose_new = false,
+            bool silu = false)
+        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new), silu(silu) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * prefix = ggml_new_tensor_3d(ctx, type, ne_prefix[0], ne_prefix[1], ne_prefix[2]);
@@ -4432,7 +4434,63 @@ struct test_ssm_conv_split : public test_case {
         }
 
         ggml_tensor * out = ggml_ssm_conv_split(ctx, prefix, new_tokens, c);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
         return out;
+    }
+};
+
+// Graph-level mimic of qwen4exp's GDN conv: gather the conv state rows, qkv = mul_mat(w, x),
+// split conv on transpose(qkv), silu, and write the new tail back into the SAME state row that
+// was gathered. The write-back depends only on qkv, not on the gather, so this checks that the
+// backend orders the gather before the write.
+struct test_ssm_conv_split_graph : public test_case {
+    const int64_t channels, n_t, n_embd;
+
+    std::string vars() override { return VARS_TO_STR3(channels, n_t, n_embd); }
+
+    test_ssm_conv_split_graph(int64_t channels = 10240, int64_t n_t = 2048, int64_t n_embd = 128)
+        : channels(channels), n_t(n_t), n_embd(n_embd) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t dm1 = 3;
+        ggml_tensor * state_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dm1 * channels, 4);
+        ggml_tensor * ids       = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * w         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, channels);
+        ggml_tensor * x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t);
+        ggml_tensor * kern      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+
+        ggml_tensor * rows  = ggml_get_rows(ctx, state_all, ids);
+        ggml_tensor * state = ggml_reshape_3d(ctx, rows, dm1, channels, 1);
+
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w, x);
+        qkv = ggml_reshape_3d(ctx, qkv, channels, n_t, 1);
+        ggml_tensor * nt = ggml_transpose(ctx, qkv);
+
+        // tail = last dm1 tokens of nt, made contiguous (n_t >= dm1)
+        ggml_tensor * tv = ggml_view_3d(ctx, nt, dm1, channels, 1, nt->nb[1], nt->nb[2], (n_t - dm1) * nt->nb[0]);
+        tv->nb[0] = nt->nb[0];
+        ggml_tensor * dst = ggml_view_2d(ctx, state_all, dm1 * channels, 1, state_all->nb[1], 0);
+        ggml_tensor * cp  = ggml_cpy(ctx, ggml_cont(ctx, tv), dst);
+
+        ggml_tensor * conv = ggml_ssm_conv_split(ctx, state, nt, kern);
+        conv = ggml_silu(ctx, conv);
+
+        // make the output depend on the write-back so both are in the graph
+        ggml_tensor * cp_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, cp), dm1 * channels);
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, conv, channels * n_t), cp_flat, 0);
     }
 };
 
@@ -9871,6 +9929,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {d_conv - 1, d_inner, 4}, {64, d_inner, 4}, {d_conv, d_inner}, transpose_new));
             }
         }
+    }
+
+    // model-shaped (qwen4exp GDN: d_conv 4, 10240 channels), transposed x, then silu
+    for (int64_t n_t : {1, 2, 3, 7, 33, 100, 512, 2048}) {
+        for (int64_t n_s : {1, 2}) {
+            for (bool silu : {false, true}) {
+                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 10240, n_s}, {n_t, 10240, n_s}, {4, 10240}, true, silu));
+            }
+        }
+    }
+
+    for (int64_t n_t : {64, 512, 2048}) {
+        test_cases.emplace_back(new test_ssm_conv_split_graph(10240, n_t));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
