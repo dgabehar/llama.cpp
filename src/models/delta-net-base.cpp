@@ -470,11 +470,20 @@ ggml_tensor * build_conv_window(
         return prefix;
     }
 
-    if (s_idx >= dm1) {
-        return ggml_view_3d(ctx0, new_tokens,
-                dm1, conv_channels, n_seqs,
+    // new_tokens is typically a transpose: nb[0] is a whole row, not sizeof(float).
+    // ggml_view_3d would reset nb[0] to the element size and read adjacent channels
+    // instead of adjacent tokens, so restore the real stride and make the window contiguous.
+    auto new_tokens_window = [&](int64_t n, int64_t first) {
+        ggml_tensor * v = ggml_view_3d(ctx0, new_tokens,
+                n, conv_channels, n_seqs,
                 new_tokens->nb[1], new_tokens->nb[2],
-                (s_idx - dm1) * new_tokens->nb[0]);
+                first * new_tokens->nb[0]);
+        v->nb[0] = new_tokens->nb[0];
+        return ggml_cont(ctx0, v);
+    };
+
+    if (s_idx >= dm1) {
+        return new_tokens_window(dm1, s_idx - dm1);
     }
 
     ggml_tensor * prefix_part =
@@ -483,13 +492,7 @@ ggml_tensor * build_conv_window(
                 prefix->nb[1], prefix->nb[2],
                 s_idx * prefix->nb[0]);
 
-    ggml_tensor * new_tokens_part =
-        ggml_view_3d(ctx0, new_tokens,
-                s_idx, conv_channels, n_seqs,
-                new_tokens->nb[1], new_tokens->nb[2],
-                0);
-
-    return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
+    return ggml_concat(ctx0, prefix_part, new_tokens_window(s_idx, 0), 0);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_state(
