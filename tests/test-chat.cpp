@@ -16,6 +16,7 @@
 #include "log.h"
 
 #include <random>
+#include <cmath>
 #include <algorithm>
 #include <exception>
 #include <fstream>
@@ -2172,6 +2173,31 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     })";
 
     {
+        // Qwen3 (autoparser): tool_choice none with tools offered, a call the model emits anyway is neither a call
+        // nor content
+        auto tst = peg_tester("models/templates/Qwen-Qwen3-0.6B.jinja", detailed_debug);
+        const std::string call = "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>";
+        tst.test("Hello, world!\nWhat's up?\n\n" + call)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .tools({ special_function_tool })
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+        tst.test("<think>\nI'm\nthinking\n</think>\n\n" + call)
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("")
+            .run();
+        tst.test("Hello, world!\nWhat's up?\n\n" + call)
+            .tools({ special_function_tool })
+            .expect_content("Hello, world!\nWhat's up?")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+    }
+
+    {
         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
 
@@ -2199,6 +2225,30 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call)
             .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
+
+        // tool_choice none with tools offered: a call the model emits anyway (Qwen3.8 QA) is neither a call nor content,
+        // the raw <tool_call> block used to be returned as the message content
+        for (bool thinking : { false, true }) {
+            const std::string call =
+                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+            const std::string prefix = thinking ? "I'm\nthinking\n</think>\n\n" : "";
+            tst.test(prefix + "Hello, world!\nWhat's up?\n\n" + call)
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(thinking ? "I'm\nthinking" : "")
+                .expect_content("Hello, world!\nWhat's up?")
+                .run();
+            tst.test(prefix + call)
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(thinking ? "I'm\nthinking" : "")
+                .expect_content("")
+                .run();
+        }
 
         tst.test(
                "I'm\nthinking\n</think>\n\n"
@@ -8342,6 +8392,67 @@ static void test_k2_empty_parse_is_not_raw_text() {
     LOG_ERR("%s passed\n", __func__);
 }
 
+// tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
+// the raw <tool_call> block came back as content). The chat params name the opener and the session bans it when it is
+// one special token; a plain-text opener (several tokens) is left alone. Both routes: the Qwen3-Coder/Qwen3.5 parser
+// and the autoparser (Qwen3). The repo's vocab files have no <tool_call> token, so the ban itself is checked against
+// a real Qwen GGUF when TEST_CHAT_QWEN_GGUF names one (loaded vocab-only).
+static void test_tool_choice_none_suppresses_call_opener() {
+    LOG_DBG("%s\n", __func__);
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the weather in Paris?";
+
+    const char *       real = getenv("TEST_CHAT_QWEN_GGUF");
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only         = true;
+    for (const char * vocab_path : { "models/ggml-vocab-qwen35.gguf", real }) {
+        if (vocab_path == nullptr || *vocab_path == 0) {
+            continue;
+        }
+        llama_model * model = llama_model_load_from_file(vocab_path, mparams);
+        if (model == nullptr) {
+            throw std::runtime_error(std::string("failed to load ") + vocab_path);
+        }
+        const llama_vocab * vocab  = llama_model_get_vocab(model);
+        const auto          opener = common_tokenize(vocab, "<tool_call>", false, true);
+        const bool          single = opener.size() == 1 && llama_vocab_get_attr(vocab, opener[0]) != LLAMA_TOKEN_ATTR_NORMAL;
+        if (vocab_path == real && !single) {
+            throw std::runtime_error(std::string(vocab_path) + ": <tool_call> is not one special token");
+        }
+
+        for (const char * path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" }) {
+            auto tmpls = read_templates(path);
+            for (auto choice : { COMMON_CHAT_TOOL_CHOICE_NONE, COMMON_CHAT_TOOL_CHOICE_AUTO }) {
+                common_chat_templates_inputs inputs;
+                inputs.messages              = { user };
+                inputs.add_generation_prompt = true;
+                inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+                inputs.tools                 = { special_function_tool };
+                inputs.tool_choice           = choice;
+
+                const bool none = choice == COMMON_CHAT_TOOL_CHOICE_NONE;
+                if (common_chat_templates_apply(tmpls.get(), inputs).suppressed_tokens !=
+                    (none ? std::vector<std::string>{ "<tool_call>" } : std::vector<std::string>{})) {
+                    throw std::runtime_error(std::string(path) + ": unexpected suppressed_tokens");
+                }
+
+                common_chat_session    session(tmpls.get(), vocab, inputs);
+                common_params_sampling sampling;
+                session.apply_sampling(sampling);
+                const bool banned = std::any_of(sampling.logit_bias.begin(), sampling.logit_bias.end(), [](const llama_logit_bias & lb) {
+                    return std::isinf(lb.bias) && lb.bias < 0;
+                });
+                if (banned != (none && single)) {
+                    throw std::runtime_error(std::string(path) + " / " + vocab_path + ": unexpected <tool_call> ban " + (banned ? "present" : "missing"));
+                }
+            }
+        }
+        llama_model_free(model);
+    }
+    LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
+}
+
 // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
 // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
 // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
@@ -8958,6 +9069,7 @@ int main(int argc, char ** argv) {
         test_k2_history_reasoning();
         test_k2_guard_fields();
         test_k2_empty_parse_is_not_raw_text();
+        test_tool_choice_none_suppresses_call_opener();
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();

@@ -318,6 +318,8 @@ struct common_chat_params {
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
+    // never sampled, e.g. the tool call opener under tool_choice none; applied only to a text that is one special token
+    std::vector<std::string>            suppressed_tokens;
     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
     // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
     std::vector<std::string>            no_empty_reply_inert;
@@ -455,6 +457,7 @@ class common_chat_session {
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers;
     std::set<llama_token>               preserved_tokens;
+    std::vector<llama_token>            suppressed_tokens;
     std::vector<std::string>            stops;
     std::vector<std::string>            stops_after_reasoning_;
     std::vector<std::string>            no_empty_reply_inert_;

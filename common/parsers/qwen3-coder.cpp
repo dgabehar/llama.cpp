@@ -183,9 +183,19 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                    (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
         }
 
+        // tool_choice none with tools offered: a call the model emits anyway is neither a call nor content
+        if (has_tools) {
+            return generation_prompt + (reasoning << p.content(p.until_one_of(tool_call_starts)) << p.rest());
+        }
+
         // Content only parser
         return generation_prompt + (reasoning << p.content(p.rest()));
     });
+
+    if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+        // the tools stay in the prompt, so the model may still open a call: keep it from sampling the opener
+        data.suppressed_tokens = { "<tool_call>" };
+    }
 
     if (include_grammar) {
         data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;

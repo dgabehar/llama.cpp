@@ -17,6 +17,7 @@
 #include "peg-parser.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -1834,6 +1835,14 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
         preserved_tokens = std::move(resolved.preserved_tokens);
         grammar_triggers = std::move(resolved.grammar_triggers);
 
+        for (const auto & text : applied.suppressed_tokens) {
+            const auto ids = common_tokenize(vocab, text, false, true);
+            // a plain-text marker is left alone: banning one of its pieces would ban ordinary words
+            if (ids.size() == 1 && llama_vocab_get_attr(vocab, ids[0]) != LLAMA_TOKEN_ATTR_NORMAL) {
+                suppressed_tokens.push_back(ids[0]);
+            }
+        }
+
         delimiters.tokenize(vocab);
     } else {
         grammar_triggers = std::move(applied.grammar_triggers);
@@ -1856,6 +1865,9 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
     sampling.generation_prompt = generation_prompt_text;
     sampling.preserved_tokens.insert(preserved_tokens.begin(), preserved_tokens.end());
     sampling.grammar_triggers.insert(sampling.grammar_triggers.end(), grammar_triggers.begin(), grammar_triggers.end());
+    for (const auto token : suppressed_tokens) {
+        sampling.logit_bias.push_back({ token, -INFINITY });
+    }
 }
 
 const common_chat_msg & common_chat_session::feed(const common_chat_input & chunk) {
