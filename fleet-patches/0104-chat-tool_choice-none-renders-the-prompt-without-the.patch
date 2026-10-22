@@ -1,0 +1,164 @@
+From 51648513290d0f159156573afd0807eac3b15ec0 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 22 Oct 2026 16:57:24 -0500
+Subject: [PATCH] chat: tool_choice none renders the prompt without the tools
+
+Follow-up to fork PR #22. Real-model QA (home-infrastructure PR #469,
+docs/qa/toolchoice-none-real-model-2026-10-22.md) found the raw <tool_call>
+leak gone, but with the tools still in the prompt small models (Qwen3.5
+0.8B/4B) wrote the call in other markup (<tool_code>, <function_call>,
+<function=call>, <tool_response>) that no opener cut catches. Decided by Doug:
+omit the tools from the prompt under tool_choice none, as other servers do.
+
+common_chat_templates_apply_jinja renders without the tools list when
+tool_choice is none. The tool-use template is still picked from the request's
+tools, so a history with assistant tool calls and tool results renders as
+before. K2-Horizon keeps the tools: its parser drops a call itself (PR #16).
+auto, required and requests without tools are unchanged. No grammar or
+trigger is built under none, as before. The session's drop/cut/ban from
+PR #22 stays as the safety net for a model that imitates a call from the
+history.
+
+Test (tests/test-chat.cpp, failing first: functionary v3.1 still rendered the
+tools): test_tool_choice_none_omits_tools renders every template in
+models/templates with a tool under none (66 describe tools): the definition is
+gone, none renders wherever the no-tools prompt renders, K2-Horizon's prompt
+is unchanged; and a Qwen3.5 history with a call and its result still renders
+the call and the <tool_response>.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp     |  6 ++++
+ tests/test-chat.cpp | 84 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 90 insertions(+)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index f29bbe21d..823c99870 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1371,6 +1371,12 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
+     const auto & tmpl =
+         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
++    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && tmpl.params_init != common_chat_params_init_k2_horizon) {
++        // tool_choice none: the tools are not rendered, so the model has nothing to call (small models wrote the call
++        // in other markup when they stayed in the prompt). The tool-use template is still picked, so a history with
++        // tool calls and results renders as before. K2-Horizon keeps them: its parser drops a call itself.
++        params.tools = json();
++    }
+     const auto & src             = tmpl.source();
+     const auto & caps            = tmpl.original_caps();
+     std::vector<common_chat_msg>        trimmed_messages;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 7b61c5035..faa2443cc 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -19,6 +19,7 @@
+ #include <cmath>
+ #include <algorithm>
+ #include <exception>
++#include <filesystem>
+ #include <fstream>
+ #include <functional>
+ #include <iostream>
+@@ -8575,6 +8576,88 @@ static void test_k2_empty_parse_is_not_raw_text() {
+ // under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
+ // repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
+ // TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
++// tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
++// saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
++// definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
++// drops calls itself) keeps the tools. A history with a tool call and its result still renders (Qwen3.5).
++static void test_tool_choice_none_omits_tools() {
++    LOG_DBG("%s\n", __func__);
++    common_chat_msg user;
++    user.role    = "user";
++    user.content = "What is the weather in Paris?";
++
++    size_t checked = 0;
++    for (const auto & entry : std::filesystem::directory_iterator("models/templates")) {
++        const std::string path = entry.path().string();
++        if (entry.path().extension() != ".jinja") {
++            continue;
++        }
++        common_chat_templates_ptr tmpls;
++        try {
++            tmpls = read_templates(path);
++        } catch (const std::exception &) {
++            continue;
++        }
++        common_chat_templates_inputs inputs;
++        inputs.messages              = { user };
++        inputs.add_generation_prompt = true;
++        std::string plain;
++        try {
++            plain = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
++        } catch (const std::exception &) {
++            continue; // not a template this check can render
++        }
++        inputs.tools = { special_function_tool };
++        std::string with_tools;
++        try {
++            with_tools = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
++        } catch (const std::exception &) {
++            continue;
++        }
++        if (with_tools.find("I'm special") == std::string::npos) {
++            continue; // the template does not describe tools
++        }
++        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
++        std::string none;
++        try {
++            none = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
++        } catch (const std::exception & e) {
++            throw std::runtime_error(path + ": tool_choice none fails to render: " + e.what());
++        }
++        const bool k2 = with_tools.find("<|ifm|im_start|>") != std::string::npos;
++        if (k2 ? none != with_tools : none.find("I'm special") != std::string::npos) {
++            throw std::runtime_error(path + (k2 ? ": K2-Horizon prompt changed under tool_choice none" :
++                                                  ": tool_choice none still renders the tools"));
++        }
++        checked++;
++    }
++    if (checked < 20) {
++        throw std::runtime_error("tool_choice none prompt check covered only " + std::to_string(checked) + " templates");
++    }
++
++    // history: an earlier call and its result still render under none
++    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
++    common_chat_msg call;
++    call.role       = "assistant";
++    call.tool_calls = { { "special_function", R"({"arg1": 1})", "call_1" } };
++    common_chat_msg result;
++    result.role         = "tool";
++    result.tool_call_id = "call_1";
++    result.content      = "The answer is 42.";
++    common_chat_templates_inputs inputs;
++    inputs.messages              = { user, call, result };
++    inputs.add_generation_prompt = true;
++    inputs.tools                 = { special_function_tool };
++    inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
++    const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
++    assert_contains(prompt, "<function=special_function>");
++    assert_contains(prompt, "<tool_response>\nThe answer is 42.");
++    if (prompt.find("I'm special") != std::string::npos) {
++        throw std::runtime_error("Qwen3.5: tool_choice none still renders the tools with a tool history");
++    }
++    LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
++}
++
+ static void test_tool_choice_none_suppresses_call_opener() {
+     LOG_DBG("%s\n", __func__);
+     common_chat_msg user;
+@@ -9255,6 +9338,7 @@ int main(int argc, char ** argv) {
+         test_k2_guard_fields();
+         test_k2_empty_parse_is_not_raw_text();
+         test_tool_choice_none_suppresses_call_opener();
++        test_tool_choice_none_omits_tools();
+         test_translate_gemma();
+         test_deepseek_v4_thinking_retention();
+         test_deepseek_v4_tool_result_ordering();
+-- 
+2.43.0
+
