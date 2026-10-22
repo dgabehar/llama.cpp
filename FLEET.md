@@ -45,19 +45,22 @@ the model still opens a call, and every template's content-only parser under non
 `test-chat`'s tool-call cases: ~20 dedicated parsers leaked the call or threw a parse error, e.g. gemma4, deepseek
 v3.2/v4, minimax-m3, kimi-k2, lfm2, ling3, ministral3, minicpm5, muse, llm-jp, command-r7b, cohere2moe).
 
-Fix, in one place (`common_chat_session`, which the server and every template route through): under none it also
-builds the template's tool_choice auto params, parses with that parser and drops the calls (falling back to the none
-parser if it fails, with its content cut at the first call opener), and bans every call opener that is one special token
-(-inf logit bias), so the call is not generated at all. The content is left-trimmed after extracted reasoning, as the
-none parsers do. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony pattern set anchored
-on `<|...|>`) or one special token. A parser that drops calls itself opts out (`drops_calls_under_none`, K2-Horizon).
+Fix, in one place (`common_chat_session`, which the server and every template route through): under none the reply is
+still parsed by the template's none parser (so a reply with no call is exactly what none gave before), its content cut
+at the first call opener (and its reasoning too when the reasoning block is never closed, DeepSeek V4); a partial
+opener is held back while streaming. If the none parser fails on the call (muse, cohere2moe, ...) the tool_choice auto
+parser's message is used without its calls. Every call opener that is one special token is banned (-inf logit bias),
+so the call is not generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony
+pattern set anchored on `<|...|>`) or one special token; only word openers and `<|`-anchored patterns cut (anchors
+kept, so harmony's `^\s+to$` never cuts prose). A parser that drops calls itself opts out (`drops_calls_under_none`,
+K2-Horizon).
 
 Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
 (`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.
 
-Checks: `test-chat` runs every complete tool_choice auto case again under none and requires the same reasoning and
-content and no call, runs every reply with no call under none against the template's own none parser (both streamed
-byte by byte), and fails unless the content-only templates are exactly the three above;
+Checks: `test-chat` runs every complete tool_choice auto case again under none and requires no call and no opener in
+the content, runs every reply with no call under none against the template's own none parser (both streamed byte by
+byte), and fails unless the content-only templates are exactly the three above;
 `test_tool_choice_none_suppresses_call_opener` checks the ban on the repo's gemma-4 vocab, and on a real Qwen vocab
 when `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8 gguf>` is set (vocab-only load).
 
