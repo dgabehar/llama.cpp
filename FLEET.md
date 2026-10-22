@@ -47,15 +47,17 @@ v3.2/v4, minimax-m3, kimi-k2, lfm2, ling3, ministral3, minicpm5, muse, llm-jp, c
 
 Fix, in one place (`common_chat_session`, which the server and every template route through): under none it also
 builds the template's tool_choice auto params, parses with that parser and drops the calls (falling back to the none
-parser if it fails), and bans every call opener that is one special token (-inf logit bias), so the call is not
-generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony pattern set anchored
+parser if it fails, with its content cut at the first call opener), and bans every call opener that is one special token
+(-inf logit bias), so the call is not generated at all. The content is left-trimmed after extracted reasoning, as the
+none parsers do. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony pattern set anchored
 on `<|...|>`) or one special token. A parser that drops calls itself opts out (`drops_calls_under_none`, K2-Horizon).
 
 Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
 (`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.
 
 Checks: `test-chat` runs every complete tool_choice auto case again under none and requires the same reasoning and
-content and no call (templates kept content-only are listed at the end of the run);
+content and no call, runs every reply with no call under none against the template's own none parser (both streamed
+byte by byte), and fails unless the content-only templates are exactly the three above;
 `test_tool_choice_none_suppresses_call_opener` checks the ban on the repo's gemma-4 vocab, and on a real Qwen vocab
 when `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8 gguf>` is set (vocab-only load).
 
