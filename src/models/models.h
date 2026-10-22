@@ -2691,7 +2691,6 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
         // same history/tails as build_conv_state_at, but returns {state, new_tokens} for
         // ggml_ssm_conv_split instead of materializing concat(state, transpose(x))
         std::pair<ggml_tensor *, ggml_tensor *> build_conv_state_split(
@@ -2702,6 +2701,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                         int64_t   channels,
                             int   il);
 
+        // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,

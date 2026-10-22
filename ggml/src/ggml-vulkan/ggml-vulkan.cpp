@@ -315,7 +315,7 @@ uint32_t ggml_vk_concat_unit_size(ggml_type type) {
 }
 // dim 0 concat of a transposed (contiguous along dim 1) src1: the generic shader reads it with a large stride
 // along the fastest dst axis, so route it to the shared-memory tile shader.
-static bool ggml_vk_concat_use_tiled(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+static bool ggml_vk_concat_use_tiled(const ggml_tensor * /*src0*/, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_is_quantized(dst->type) || ggml_get_op_params_i32(dst, 0) != 0) {
         return false;
     }
@@ -16196,7 +16196,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_CONV_SPLIT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // src[2] is the conv kernel; ne[0] = d_conv taps, gathered into float v[16] in ssm_conv_split.comp
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->ne[0] <= 16;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:

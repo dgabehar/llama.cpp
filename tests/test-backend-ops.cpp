@@ -7127,19 +7127,28 @@ struct test_concat_transposed : public test_case {
     const int64_t channels;
     const int64_t n_tokens;
     const int64_t n_seqs;
+    const int64_t ne3;
+    const int64_t a_skip; // > 0: a is a column-offset view into a wider tensor (qwen4exp window concat)
 
     std::string vars() override {
-        return VARS_TO_STR5(type, d_conv_m1, channels, n_tokens, n_seqs);
+        return VARS_TO_STR7(type, d_conv_m1, channels, n_tokens, n_seqs, ne3, a_skip);
     }
 
     test_concat_transposed(ggml_type type = GGML_TYPE_F32, int64_t d_conv_m1 = 3,
-            int64_t channels = 10240, int64_t n_tokens = 2048, int64_t n_seqs = 1)
-        : type(type), d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+            int64_t channels = 10240, int64_t n_tokens = 2048, int64_t n_seqs = 1,
+            int64_t ne3 = 1, int64_t a_skip = 0)
+        : type(type), d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs),
+          ne3(ne3), a_skip(a_skip) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, d_conv_m1, channels, n_seqs);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, d_conv_m1 + a_skip, channels, n_seqs, ne3);
         ggml_set_name(a, "a");
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, channels, n_tokens, n_seqs);
+        if (a_skip > 0) {
+            a = ggml_view_4d(ctx, a, d_conv_m1, channels, n_seqs, ne3, a->nb[1], a->nb[2], a->nb[3],
+                    a_skip * a->nb[0]);
+            ggml_set_name(a, "a_view");
+        }
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, type, channels, n_tokens, n_seqs, ne3);
         ggml_set_name(x, "x");
         ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, x), 0);
         ggml_set_name(out, "out");
@@ -11560,6 +11569,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2));
         test_cases.emplace_back(new test_concat_transposed(type, 40, 33, 31, 3));
         test_cases.emplace_back(new test_concat_transposed(type, 3, 64, 1, 1));
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 64, 2, 1));        // smallest tiled n_tokens
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2, 3));   // ne3 > 1
+        test_cases.emplace_back(new test_concat_transposed(type, 2, 100, 37, 2, 1, 1)); // strided src0 view
+        test_cases.emplace_back(new test_concat_transposed(type, 1, 33, 2, 3, 2, 2));  // all three
     }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
