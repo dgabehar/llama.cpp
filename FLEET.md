@@ -37,16 +37,27 @@ Fork PR #17 (patch 0089): `-Werror=missing-field-initializers` in the empty-repl
 failed the gcc arm64 CI build. Fork PR #18 (patch 0090) removed the disabled sync workflow. A 482-char hex tool
 argument that never completes is model repetition (offline grammar check accepts it), not a parser bug.
 
-## Qwen3.x tool_choice none (added 2026-10-22)
+## tool_choice none, all templates (added 2026-10-22)
 
 Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B, same class as the K2 leak above: with tools offered and
 `tool_choice:"none"` the raw `<tool_call>...</tool_call>` block came back as `content`. The tools stay in the prompt, so
-the model still opens a call, and the content-only parser used under none (`common/parsers/qwen3-coder.cpp` for
-Qwen3.5/3.8, the autoparser for Qwen3 and other marker templates) returned it verbatim. Now `common_chat_params::
-suppressed_tokens` names the opener and `common_chat_session` bans it (-inf logit bias, only when it is one special
-token), and the content parser drops a call the model spells out anyway. Check: `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8
-gguf> build/bin/test-chat` (vocab-only load) also covers the ban against a real vocab. Other specialized parsers (gemma4,
-deepseek, minimax, ...) were not audited for this; gpt-oss already returns empty content for a call under none.
+the model still opens a call, and every template's content-only parser under none returned it verbatim (an audit of
+`test-chat`'s tool-call cases: ~20 dedicated parsers leaked the call or threw a parse error, e.g. gemma4, deepseek
+v3.2/v4, minimax-m3, kimi-k2, lfm2, ling3, ministral3, minicpm5, muse, llm-jp, command-r7b, cohere2moe).
+
+Fix, in one place (`common_chat_session`, which the server and every template route through): under none it also
+builds the template's tool_choice auto params, parses with that parser and drops the calls (falling back to the none
+parser if it fails), and bans every call opener that is one special token (-inf logit bias), so the call is not
+generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony pattern set anchored
+on `<|...|>`) or one special token. A parser that drops calls itself opts out (`drops_calls_under_none`, K2-Horizon).
+
+Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
+(`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.
+
+Checks: `test-chat` runs every complete tool_choice auto case again under none and requires the same reasoning and
+content and no call (templates kept content-only are listed at the end of the run);
+`test_tool_choice_none_suppresses_call_opener` checks the ban on the repo's gemma-4 vocab, and on a real Qwen vocab
+when `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8 gguf>` is set (vocab-only load).
 
 ## Fleet patch maintenance (added 2026-09-15)
 
