@@ -1902,6 +1902,12 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                 parser_params.format      = as_auto->format;
                 parser_params.parser      = std::move(as_auto->parser);
                 call_openers              = as_auto->grammar_triggers;
+                // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
+                for (const auto & tag : as_auto->preserved_tokens) {
+                    if (tag.find("tool") != std::string::npos) {
+                        call_section_tags.push_back(tag);
+                    }
+                }
             }
         }
     }
@@ -1931,7 +1937,7 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
     }
     // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
     // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
-    const auto cut_at_openers = [&](std::string & text) {
+    const auto cut_at_openers = [&](std::string & text) -> bool {
         size_t cut = std::string::npos;
         for (const auto & opener : call_openers) {
             size_t pos = std::string::npos;
@@ -1953,13 +1959,62 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
             }
             cut = std::min(cut, pos);
         }
-        if (cut != std::string::npos) {
+        // a section tag right before the call (Kimi-K2's `<|tool_calls_section_begin|>` wraps `<|tool_call_begin|>`)
+        // goes with it; while streaming one at the end is held back until it is known not to open a call
+        bool found = cut != std::string::npos;
+        if (!found && is_partial) {
+            cut = text.size();
+        }
+        for (bool backed = cut != std::string::npos; backed;) {
+            backed = false;
+            const size_t end = text.find_last_not_of(" \t\r\n", cut == 0 ? std::string::npos : cut - 1);
+            const size_t len = cut == 0 || end == std::string::npos ? 0 : end + 1;
+            for (const auto & tag : call_section_tags) {
+                if (!tag.empty() && len >= tag.size() && text.compare(len - tag.size(), tag.size(), tag) == 0) {
+                    cut    = len - tag.size();
+                    found  = true;
+                    backed = true;
+                    break;
+                }
+                if (is_partial && cut == text.size()) {
+                    const size_t p = string_find_partial_stop(text, tag);
+                    if (p != std::string::npos && p + tag.size() > text.size()) {
+                        cut   = p;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if (found && cut != std::string::npos && cut < text.size()) {
             text.resize(cut);
         }
+        return found;
     };
-    cut_at_openers(msg.content);
+    const std::string none_content = msg.content;
+    const bool        has_call     = cut_at_openers(msg.content) && none_content.size() > msg.content.size();
+    if (has_call) {
+        // text the model writes after the call is content too (Ling 3): the auto parser's content past what the
+        // none parser gave before the call
+        try {
+            const auto as_auto = common_chat_parse(input, is_partial, parser_params);
+            const std::string before = trim_whitespace(msg.content);
+            const size_t      at     = before.empty() ? 0 : as_auto.content.find(before);
+            if (!as_auto.tool_calls.empty() && at != std::string::npos) {
+                const std::string after = as_auto.content.substr(at + before.size());
+                if (!trim_whitespace(after).empty()) {
+                    msg.content += after;
+                }
+            }
+        } catch (const std::exception &) {
+        }
+    }
+    // a thinking end tag that is also a call opener (DeepSeek V4 ends the reasoning at `<｜DSML｜tool_calls>`) does not
+    // close the reasoning here: the call it starts is what has to be cut
     const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
-        return !end.empty() && input.text.find(end) != std::string::npos;
+        const bool is_opener = std::any_of(call_openers.begin(), call_openers.end(), [&](const common_grammar_trigger & o) {
+            return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && trim_whitespace(o.value) == trim_whitespace(end);
+        });
+        return !end.empty() && !is_opener && input.text.find(end) != std::string::npos;
     });
     if (msg.content.empty() && !reasoning_closed) {
         cut_at_openers(msg.reasoning_content);

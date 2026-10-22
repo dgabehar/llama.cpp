@@ -1665,10 +1665,22 @@ class peg_test_builder {
             // (a closed reasoning may mention an opener, Ministral 3; an unclosed one is cut like the content)
             const auto final_msg = session.finish(common_chat_input(tc_.input));
             assert_equals((size_t) 0, final_msg.tool_calls.size());
-            const auto & ends = session.thinking_end_tags();
+            const auto & ends    = session.thinking_end_tags();
+            const auto & openers = session.call_openers_for_test();
             const bool closed = std::any_of(ends.begin(), ends.end(), [&](const std::string & e) {
-                return !e.empty() && tc_.input.find(e) != std::string::npos;
+                const bool is_opener = std::any_of(openers.begin(), openers.end(), [&](const common_grammar_trigger & o) {
+                    return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && string_strip(o.value) == string_strip(e);
+                });
+                return !e.empty() && !is_opener && tc_.input.find(e) != std::string::npos;
             });
+            // the content is what auto gives before the call; an unclosed reasoning block keeps it as reasoning
+            const bool same_content = string_strip(final_msg.content) == string_strip(tc_.expect.content);
+            const bool kept_in_reasoning = !closed && final_msg.content.empty() &&
+                string_strip(final_msg.reasoning_content) == string_strip(tc_.expect.reasoning_content + tc_.expect.content);
+            if (!same_content && !kept_in_reasoning) {
+                throw std::runtime_error(tester_.template_path() + ": tool_choice none content [" + final_msg.content +
+                                         "] is not the auto content [" + tc_.expect.content + "]");
+            }
             for (const auto & opener : session.call_openers_for_test()) {
                 const std::string word = string_strip(opener.value);
                 if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
@@ -4444,6 +4456,22 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     // instead of an empty <think></think> pair.
     {
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.jinja", detailed_debug);
+        // tool_choice none: thinking, then a call with no </think> (V4 ends the reasoning at the call), the call is cut
+        // out of the reasoning
+        tst.test(
+               "Let me check the time\n\n"
+               "<｜DSML｜tool_calls>\n"
+               "<｜DSML｜invoke name=\"get_time\">\n"
+               "<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜tool_calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .expect_reasoning("Let me check the time")
+            .expect_content("")
+            .run();
 
         // Pure content (non-thinking mode; generation prompt ends with </think>)
         tst.test("Hello, world!\nWhat's up?")
@@ -6188,6 +6216,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Kimi-K2-Instruct
         auto tst2 = peg_tester("models/templates/Kimi-K2-Instruct.jinja", detailed_debug);
         tst2.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+        // tool_choice none: the call goes, and so does the section tag around it
+        tst2.test(
+               "Sure.<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .expect_content("Sure.")
+            .run();
         tst2.test(
                "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
                "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
