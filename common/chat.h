@@ -478,6 +478,8 @@ class common_chat_session {
     common_chat_parser_params  parser_params;
     common_chat_parser_params  none_parser_params; // drop_calls: the tool_choice none parser, used if the auto one fails
     bool                       drop_calls = false;
+    bool                       ltrim_content = false;             // drop_calls: as the none parser after the reasoning
+    std::vector<common_grammar_trigger> call_openers;             // drop_calls: cut the none parser's content here
     common_chat_msg_delimiters delimiters;
     common_chat_input          input;
     common_chat_msg            result;

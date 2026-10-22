@@ -1901,6 +1901,10 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                 none_parser_params        = parser_params;
                 parser_params.format      = as_auto->format;
                 parser_params.parser      = std::move(as_auto->parser);
+                call_openers              = as_auto->grammar_triggers;
+                // the none parsers drop the whitespace between the reasoning end tag and the content, the auto ones
+                // keep it (it is the separator before a call)
+                ltrim_content = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && applied.supports_thinking;
             }
         }
     }
@@ -1919,9 +1923,40 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
     try {
         msg = common_chat_parse(input, is_partial, parser_params);
     } catch (const std::exception &) {
-        return common_chat_parse(input, is_partial, none_parser_params);
+        // the auto parser rejects a call it cannot take (unknown tool, text after the call): the none parser's content,
+        // cut at the first call opener (all of them are tags, see the constructor)
+        msg = common_chat_parse(input, is_partial, none_parser_params);
+        size_t cut = std::string::npos;
+        for (const auto & opener : call_openers) {
+            size_t pos = std::string::npos;
+            if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                pos = msg.content.find(trim_whitespace(opener.value));
+            } else if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) {
+                std::string pattern = opener.value;
+                if (!pattern.empty() && pattern.front() == '^') {
+                    pattern.erase(0, 1);
+                }
+                if (!pattern.empty() && pattern.back() == '$') {
+                    pattern.pop_back();
+                }
+                std::smatch m;
+                try {
+                    if (std::regex_search(msg.content, m, std::regex(pattern))) {
+                        pos = m.position(0);
+                    }
+                } catch (const std::regex_error &) {
+                }
+            }
+            cut = std::min(cut, pos);
+        }
+        if (cut != std::string::npos) {
+            msg.content.resize(cut);
+        }
     }
     msg.tool_calls.clear();
+    if (ltrim_content) {
+        msg.content.erase(0, std::min(msg.content.size(), msg.content.find_first_not_of(" \t\r\n")));
+    }
     return msg;
 }
 
