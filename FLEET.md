@@ -37,6 +37,35 @@ Fork PR #17 (patch 0089): `-Werror=missing-field-initializers` in the empty-repl
 failed the gcc arm64 CI build. Fork PR #18 (patch 0090) removed the disabled sync workflow. A 482-char hex tool
 argument that never completes is model repetition (offline grammar check accepts it), not a parser bug.
 
+## tool_choice none, all templates (added 2026-10-22)
+
+Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B, same class as the K2 leak above: with tools offered and
+`tool_choice:"none"` the raw `<tool_call>...</tool_call>` block came back as `content`. The tools stay in the prompt, so
+the model still opens a call, and every template's content-only parser under none returned it verbatim (an audit of
+`test-chat`'s tool-call cases: ~20 dedicated parsers leaked the call or threw a parse error, e.g. gemma4, deepseek
+v3.2/v4, minimax-m3, kimi-k2, lfm2, ling3, ministral3, minicpm5, muse, llm-jp, command-r7b, cohere2moe).
+
+Fix, in one place (`common_chat_session`, which the server and every template route through): under none the reply is
+still parsed by the template's none parser (so a reply with no call is exactly what none gave before), its content cut
+at the first call opener (and its reasoning too when the reasoning block is never closed, DeepSeek V4, whose
+`<｜DSML｜tool_calls>` is both a thinking end tag and the opener); a template tool tag right before the call goes with
+it (Kimi-K2's `<|tool_calls_section_begin|>`); text after the call is kept from the auto parser's content (Ling 3); a
+partial opener or tool tag is held back while streaming. If the none parser fails on the call (muse, cohere2moe, ...) the tool_choice auto
+parser's message is used without its calls. Every call opener that is one special token is banned (-inf logit bias),
+so the call is not generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony
+pattern set anchored on `<|...|>`) or one special token; only word openers and `<|`-anchored patterns cut (anchors
+kept, so harmony's `^\s+to$` never cuts prose). A parser that drops calls itself opts out (`drops_calls_under_none`,
+K2-Horizon).
+
+Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
+(`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.
+
+Checks: `test-chat` runs every complete tool_choice auto case again under none and requires no call, no opener in
+the content and the auto case's content (whitespace-trimmed; an unclosed reasoning may keep it as reasoning), runs every reply with no call under none against the template's own none parser (both streamed byte by
+byte), and fails unless the content-only templates are exactly the three above;
+`test_tool_choice_none_suppresses_call_opener` checks the ban on the repo's gemma-4 vocab, and on a real Qwen vocab
+when `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8 gguf>` is set (vocab-only load).
+
 ## Fleet patch maintenance (added 2026-09-15)
 
 Every fork-exclusive commit on `fleet-patches` is also mirrored to a

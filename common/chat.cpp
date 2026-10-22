@@ -17,6 +17,7 @@
 #include "peg-parser.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -1797,6 +1798,23 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     return msg;
 }
 
+// a tool call opener that cannot be ordinary text: a word that starts with or contains a tag (`<tool_call>`,
+// `[TOOL_CALLS]`, `]<]minimax[>[<tool_call>`), or a pattern of a set anchored on special tokens (harmony:
+// `<\|start\|>assistant(\s+to)` and its continuation `^\s+to$`). Plain words (`functools`, `Action:`) and `>>>` are not.
+static bool is_tag_like_call_opener(const common_grammar_trigger & trigger, bool patterns_anchored) {
+    static const std::regex tag(R"(<[A-Za-z_/|][^<>\s]*>)");
+    const std::string opener = trim_whitespace(trigger.value);
+    switch (trigger.type) {
+        case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+            return !opener.empty() && (opener[0] == '<' || opener[0] == '[' || std::regex_search(opener, tag));
+        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+            return patterns_anchored;
+        default:
+            return false;
+    }
+}
+
 common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
                                          const llama_vocab *                  vocab,
                                          const common_chat_templates_inputs & inputs,
@@ -1839,10 +1857,170 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
         grammar_triggers = std::move(applied.grammar_triggers);
     }
 
+    // tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call, and the
+    // template's content-only parser would return it verbatim as content (Qwen3.8 QA, K2 fork PR #16). Every template
+    // has a parser for its calls: parse as under auto, drop the calls, and ban an opener that is one special token so
+    // the call is not generated at all. Only when every opener is tag-like or one special token: a plain-word opener
+    // (`functools`, `Action:`) can be ordinary text, so it keeps the content-only parser.
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && applied.drops_calls_under_none) {
+        drop_calls         = true;
+        none_parser_params = parser_params;
+    } else if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
+        auto auto_inputs        = inputs;
+        auto_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        std::optional<common_chat_params> as_auto;
+        try {
+            as_auto = common_chat_templates_apply(tmpls, auto_inputs);
+        } catch (const std::exception & e) {
+            LOG_DBG("%s: no tool_choice auto parser to drop calls with: %s\n", __func__, e.what());
+        }
+        if (as_auto && as_auto->generation_prompt == applied.generation_prompt && !as_auto->grammar_triggers.empty()) {
+            bool tag_like          = true;
+            bool patterns_anchored = false;
+            for (const auto & trigger : as_auto->grammar_triggers) {
+                patterns_anchored = patterns_anchored || (trigger.type != COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
+                                                          trigger.value.find("<\\|") != std::string::npos);
+            }
+            std::vector<llama_token> banned;
+            for (const auto & trigger : as_auto->grammar_triggers) {
+                const std::string opener = trim_whitespace(trigger.value);
+                bool special = false;
+                if (vocab && trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                    const auto ids = common_tokenize(vocab, opener, false, true);
+                    special = ids.size() == 1 &&
+                              (llama_vocab_get_attr(vocab, ids[0]) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED));
+                    if (special) {
+                        banned.push_back(ids[0]);
+                    }
+                }
+                tag_like = tag_like && (special || is_tag_like_call_opener(trigger, patterns_anchored));
+            }
+            suppressed = std::move(banned);
+            if (tag_like) {
+                drop_calls                = true;
+                none_parser_params        = parser_params;
+                parser_params.format      = as_auto->format;
+                parser_params.parser      = std::move(as_auto->parser);
+                call_openers              = as_auto->grammar_triggers;
+                // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
+                for (const auto & tag : as_auto->preserved_tokens) {
+                    if (tag.find("tool") != std::string::npos) {
+                        call_section_tags.push_back(tag);
+                    }
+                }
+            }
+        }
+    }
+
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !params.echo) {
         // start from the prefill so it is not emitted as part of the first delta
-        result = common_chat_parse(input, true, parser_params);
+        result = parse(true);
     }
+}
+
+common_chat_msg common_chat_session::parse(bool is_partial) const {
+    if (!drop_calls) {
+        return common_chat_parse(input, is_partial, parser_params);
+    }
+    // tool_choice none: the none parser's message (a reply with no call is exactly what none gave before), its content
+    // cut at the first call opener. Only a word opener (all of them are tags, see the constructor) or a pattern on a
+    // special token (`<\|`) cuts, anchors kept, so a pattern like harmony's `^\s+to$` never matches prose. While
+    // streaming, a partial word opener at the end is held back, so the content only grows.
+    common_chat_msg msg;
+    try {
+        msg = common_chat_parse(input, is_partial, none_parser_params);
+    } catch (const std::exception &) {
+        // the none parser fails on the call (muse, cohere2moe, ...): the auto parser's message without its calls
+        msg = common_chat_parse(input, is_partial, parser_params);
+        msg.tool_calls.clear();
+        return msg;
+    }
+    // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
+    // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
+    const auto cut_at_openers = [&](std::string & text) -> bool {
+        size_t cut = std::string::npos;
+        for (const auto & opener : call_openers) {
+            size_t pos = std::string::npos;
+            if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                const std::string word = trim_whitespace(opener.value);
+                pos = text.find(word);
+                if (pos == std::string::npos && is_partial) {
+                    pos = string_find_partial_stop(text, word);
+                }
+            } else if ((opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) &&
+                       opener.value.find("<\\|") != std::string::npos) {
+                std::smatch m;
+                try {
+                    if (std::regex_search(text, m, std::regex(opener.value))) {
+                        pos = m.position(0);
+                    }
+                } catch (const std::regex_error &) {
+                }
+            }
+            cut = std::min(cut, pos);
+        }
+        // a section tag right before the call (Kimi-K2's `<|tool_calls_section_begin|>` wraps `<|tool_call_begin|>`)
+        // goes with it; while streaming one at the end is held back until it is known not to open a call
+        bool found = cut != std::string::npos;
+        if (!found && is_partial) {
+            cut = text.size();
+        }
+        for (bool backed = cut != std::string::npos; backed;) {
+            backed = false;
+            const size_t end = text.find_last_not_of(" \t\r\n", cut == 0 ? std::string::npos : cut - 1);
+            const size_t len = cut == 0 || end == std::string::npos ? 0 : end + 1;
+            for (const auto & tag : call_section_tags) {
+                if (!tag.empty() && len >= tag.size() && text.compare(len - tag.size(), tag.size(), tag) == 0) {
+                    cut    = len - tag.size();
+                    found  = true;
+                    backed = true;
+                    break;
+                }
+                if (is_partial && cut == text.size()) {
+                    const size_t p = string_find_partial_stop(text, tag);
+                    if (p != std::string::npos && p + tag.size() > text.size()) {
+                        cut   = p;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if (found && cut != std::string::npos && cut < text.size()) {
+            text.resize(cut);
+        }
+        return found;
+    };
+    const std::string none_content = msg.content;
+    const bool        has_call     = cut_at_openers(msg.content) && none_content.size() > msg.content.size();
+    if (has_call) {
+        // text the model writes after the call is content too (Ling 3): the auto parser's content past what the
+        // none parser gave before the call
+        try {
+            const auto as_auto = common_chat_parse(input, is_partial, parser_params);
+            const std::string before = trim_whitespace(msg.content);
+            const size_t      at     = before.empty() ? 0 : as_auto.content.find(before);
+            if (!as_auto.tool_calls.empty() && at != std::string::npos) {
+                const std::string after = as_auto.content.substr(at + before.size());
+                if (!trim_whitespace(after).empty()) {
+                    msg.content += after;
+                }
+            }
+        } catch (const std::exception &) {
+        }
+    }
+    // a thinking end tag that is also a call opener (DeepSeek V4 ends the reasoning at `<｜DSML｜tool_calls>`) does not
+    // close the reasoning here: the call it starts is what has to be cut
+    const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
+        const bool is_opener = std::any_of(call_openers.begin(), call_openers.end(), [&](const common_grammar_trigger & o) {
+            return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && trim_whitespace(o.value) == trim_whitespace(end);
+        });
+        return !end.empty() && !is_opener && input.text.find(end) != std::string::npos;
+    });
+    if (msg.content.empty() && !reasoning_closed) {
+        cut_at_openers(msg.reasoning_content);
+    }
+    msg.tool_calls.clear();
+    return msg;
 }
 
 void common_chat_session::apply_sampling(common_params_sampling & sampling) const {
@@ -1856,12 +2034,15 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
     sampling.generation_prompt = generation_prompt_text;
     sampling.preserved_tokens.insert(preserved_tokens.begin(), preserved_tokens.end());
     sampling.grammar_triggers.insert(sampling.grammar_triggers.end(), grammar_triggers.begin(), grammar_triggers.end());
+    for (const auto token : suppressed) {
+        sampling.logit_bias.push_back({ token, -INFINITY });
+    }
 }
 
 const common_chat_msg & common_chat_session::feed(const common_chat_input & chunk) {
     GGML_ASSERT(!finished && "feed() after finish()");
     input.append(chunk);
-    auto msg = common_chat_parse(input, true, parser_params);
+    auto msg = parse(true);
     if (!msg.empty()) {
         result = std::move(msg);
     }
@@ -1872,7 +2053,7 @@ const common_chat_msg & common_chat_session::finish(const common_chat_input & ch
     GGML_ASSERT(!finished && "finish() called twice");
     finished = true;
     input.append(chunk);
-    auto msg = common_chat_parse(input, false, parser_params);
+    auto msg = parse(false);
     if (!msg.empty()) {
         result = std::move(msg);
     }

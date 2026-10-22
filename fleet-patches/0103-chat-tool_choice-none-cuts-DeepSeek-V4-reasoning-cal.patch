@@ -1,0 +1,214 @@
+From da19f59e8e308fd803681b3a45c2089e52599d24 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 22 Oct 2026 14:29:03 -0500
+Subject: [PATCH] chat: tool_choice none cuts DeepSeek V4 reasoning calls and
+ Kimi-K2 section tags
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fourth review follow-up to 8120c3ced, 64a4084b3, 727dd3ead and de3105f80.
+
+- DeepSeek V4 / V4-Flash list `<｜DSML｜tool_calls>` as a thinking end tag, so
+  a call counted as closing the reasoning and stayed in reasoning_content. A
+  thinking end tag that is also a call opener no longer counts as a close.
+- Kimi-K2 (not K2-Horizon) left `<|tool_calls_section_begin|>` in the content:
+  the opener is the inner `<|tool_call_begin|>`. A template tool tag (a
+  preserved token of the auto params that names "tool") right before the cut
+  now goes with the call; while streaming one at the end, or a partial one, is
+  held back, so the content only grows.
+- Ling 3 writes text after the call, which the cut dropped: when a call was
+  cut, the auto parser's content past what came before the call is appended.
+
+Tests (tests/test-chat.cpp): the tool_choice none sweep's call cases now also
+require the auto case's content (whitespace-trimmed; an unclosed reasoning may
+keep it as reasoning), with the same opener-aware "closed" check; new none
+cases for DeepSeek V4 (thinking, call, no </think>) and Kimi-K2's section tag,
+both failing on de3105f80.
+
+Verified CPU-only with Qwen3.5-0.8B-Q8_0 through llama-server: tool_choice
+none returns plain text in stream on/off x thinking on/off; auto still returns
+the call.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp     | 63 ++++++++++++++++++++++++++++++++++++++++++---
+ common/chat.h       |  1 +
+ tests/test-chat.cpp | 40 ++++++++++++++++++++++++++--
+ 3 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index d7b675486..f29bbe21d 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1902,6 +1902,12 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+                 parser_params.format      = as_auto->format;
+                 parser_params.parser      = std::move(as_auto->parser);
+                 call_openers              = as_auto->grammar_triggers;
++                // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
++                for (const auto & tag : as_auto->preserved_tokens) {
++                    if (tag.find("tool") != std::string::npos) {
++                        call_section_tags.push_back(tag);
++                    }
++                }
+             }
+         }
+     }
+@@ -1931,7 +1937,7 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
+     }
+     // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
+     // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
+-    const auto cut_at_openers = [&](std::string & text) {
++    const auto cut_at_openers = [&](std::string & text) -> bool {
+         size_t cut = std::string::npos;
+         for (const auto & opener : call_openers) {
+             size_t pos = std::string::npos;
+@@ -1953,13 +1959,62 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
+             }
+             cut = std::min(cut, pos);
+         }
+-        if (cut != std::string::npos) {
++        // a section tag right before the call (Kimi-K2's `<|tool_calls_section_begin|>` wraps `<|tool_call_begin|>`)
++        // goes with it; while streaming one at the end is held back until it is known not to open a call
++        bool found = cut != std::string::npos;
++        if (!found && is_partial) {
++            cut = text.size();
++        }
++        for (bool backed = cut != std::string::npos; backed;) {
++            backed = false;
++            const size_t end = text.find_last_not_of(" \t\r\n", cut == 0 ? std::string::npos : cut - 1);
++            const size_t len = cut == 0 || end == std::string::npos ? 0 : end + 1;
++            for (const auto & tag : call_section_tags) {
++                if (!tag.empty() && len >= tag.size() && text.compare(len - tag.size(), tag.size(), tag) == 0) {
++                    cut    = len - tag.size();
++                    found  = true;
++                    backed = true;
++                    break;
++                }
++                if (is_partial && cut == text.size()) {
++                    const size_t p = string_find_partial_stop(text, tag);
++                    if (p != std::string::npos && p + tag.size() > text.size()) {
++                        cut   = p;
++                        found = true;
++                    }
++                }
++            }
++        }
++        if (found && cut != std::string::npos && cut < text.size()) {
+             text.resize(cut);
+         }
++        return found;
+     };
+-    cut_at_openers(msg.content);
++    const std::string none_content = msg.content;
++    const bool        has_call     = cut_at_openers(msg.content) && none_content.size() > msg.content.size();
++    if (has_call) {
++        // text the model writes after the call is content too (Ling 3): the auto parser's content past what the
++        // none parser gave before the call
++        try {
++            const auto as_auto = common_chat_parse(input, is_partial, parser_params);
++            const std::string before = trim_whitespace(msg.content);
++            const size_t      at     = before.empty() ? 0 : as_auto.content.find(before);
++            if (!as_auto.tool_calls.empty() && at != std::string::npos) {
++                const std::string after = as_auto.content.substr(at + before.size());
++                if (!trim_whitespace(after).empty()) {
++                    msg.content += after;
++                }
++            }
++        } catch (const std::exception &) {
++        }
++    }
++    // a thinking end tag that is also a call opener (DeepSeek V4 ends the reasoning at `<｜DSML｜tool_calls>`) does not
++    // close the reasoning here: the call it starts is what has to be cut
+     const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
+-        return !end.empty() && input.text.find(end) != std::string::npos;
++        const bool is_opener = std::any_of(call_openers.begin(), call_openers.end(), [&](const common_grammar_trigger & o) {
++            return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && trim_whitespace(o.value) == trim_whitespace(end);
++        });
++        return !end.empty() && !is_opener && input.text.find(end) != std::string::npos;
+     });
+     if (msg.content.empty() && !reasoning_closed) {
+         cut_at_openers(msg.reasoning_content);
+diff --git a/common/chat.h b/common/chat.h
+index d24fd2ab9..9a2a94cb8 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -481,6 +481,7 @@ class common_chat_session {
+     common_chat_parser_params  none_parser_params; // drop_calls: the tool_choice none parser, used if the auto one fails
+     bool                       drop_calls = false;
+     std::vector<common_grammar_trigger> call_openers;             // drop_calls: cut the none parser's content here
++    std::vector<std::string>            call_section_tags;        // drop_calls: a section tag right before the call goes too
+     common_chat_msg_delimiters delimiters;
+     common_chat_input          input;
+     common_chat_msg            result;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 99ba2fab0..7b61c5035 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -1665,10 +1665,22 @@ class peg_test_builder {
+             // (a closed reasoning may mention an opener, Ministral 3; an unclosed one is cut like the content)
+             const auto final_msg = session.finish(common_chat_input(tc_.input));
+             assert_equals((size_t) 0, final_msg.tool_calls.size());
+-            const auto & ends = session.thinking_end_tags();
++            const auto & ends    = session.thinking_end_tags();
++            const auto & openers = session.call_openers_for_test();
+             const bool closed = std::any_of(ends.begin(), ends.end(), [&](const std::string & e) {
+-                return !e.empty() && tc_.input.find(e) != std::string::npos;
++                const bool is_opener = std::any_of(openers.begin(), openers.end(), [&](const common_grammar_trigger & o) {
++                    return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && string_strip(o.value) == string_strip(e);
++                });
++                return !e.empty() && !is_opener && tc_.input.find(e) != std::string::npos;
+             });
++            // the content is what auto gives before the call; an unclosed reasoning block keeps it as reasoning
++            const bool same_content = string_strip(final_msg.content) == string_strip(tc_.expect.content);
++            const bool kept_in_reasoning = !closed && final_msg.content.empty() &&
++                string_strip(final_msg.reasoning_content) == string_strip(tc_.expect.reasoning_content + tc_.expect.content);
++            if (!same_content && !kept_in_reasoning) {
++                throw std::runtime_error(tester_.template_path() + ": tool_choice none content [" + final_msg.content +
++                                         "] is not the auto content [" + tc_.expect.content + "]");
++            }
+             for (const auto & opener : session.call_openers_for_test()) {
+                 const std::string word = string_strip(opener.value);
+                 if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
+@@ -4444,6 +4456,22 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+     // instead of an empty <think></think> pair.
+     {
+         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.jinja", detailed_debug);
++        // tool_choice none: thinking, then a call with no </think> (V4 ends the reasoning at the call), the call is cut
++        // out of the reasoning
++        tst.test(
++               "Let me check the time\n\n"
++               "<｜DSML｜tool_calls>\n"
++               "<｜DSML｜invoke name=\"get_time\">\n"
++               "<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n"
++               "</｜DSML｜invoke>\n"
++               "</｜DSML｜tool_calls>")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .tools({ get_time_tool })
++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++            .expect_reasoning("Let me check the time")
++            .expect_content("")
++            .run();
+ 
+         // Pure content (non-thinking mode; generation prompt ends with </think>)
+         tst.test("Hello, world!\nWhat's up?")
+@@ -6188,6 +6216,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+         // Kimi-K2-Instruct
+         auto tst2 = peg_tester("models/templates/Kimi-K2-Instruct.jinja", detailed_debug);
+         tst2.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
++        // tool_choice none: the call goes, and so does the section tag around it
++        tst2.test(
++               "Sure.<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
++               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
++            .tools({ special_function_tool })
++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++            .expect_content("Sure.")
++            .run();
+         tst2.test(
+                "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+                "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+-- 
+2.43.0
+

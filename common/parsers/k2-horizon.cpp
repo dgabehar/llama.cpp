@@ -86,6 +86,9 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
         ARG_KEY, ARG_KEY_END, ARG_TYPE, ARG_TYPE_END, ARG_VAL, ARG_VAL_END,
     });
 
+    // tool_choice none: the lenient shapes below drop a call and its stray tags themselves (fork PR #16)
+    data.drops_calls_under_none = true;
+
     data.message_delimiters = {
         { COMMON_CHAT_ROLE_ASSISTANT, "<|ifm|im_start|>assistant" },
         { COMMON_CHAT_ROLE_USER,      "<|ifm|im_start|>user"      },

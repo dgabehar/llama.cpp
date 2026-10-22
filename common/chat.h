@@ -318,6 +318,8 @@ struct common_chat_params {
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
+    // the parser itself drops a call the model emits under tool_choice none, see common_chat_session
+    bool                                drops_calls_under_none = false;
     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
     // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
     std::vector<std::string>            no_empty_reply_inert;
@@ -445,16 +447,27 @@ class common_chat_session {
 
     bool has_template() const { return templated; }
 
+    // tool_choice none with tools offered: a call the model emits anyway is parsed as under auto and then dropped,
+    // so it is neither a tool call nor content (only when every call opener is tag-like or one special token)
+    bool drops_tool_calls() const { return drop_calls; }
+    // call openers that are one special token: never sampled under tool_choice none (needs a vocab)
+    const std::vector<llama_token> & suppressed_tokens() const { return suppressed; }
+    // drop_calls: the openers the content and reasoning are cut at (exposed for tests)
+    const std::vector<common_grammar_trigger> & call_openers_for_test() const { return call_openers; }
+
     const common_chat_msg & feed(const common_chat_input & chunk);
 
     const common_chat_msg & finish(const common_chat_input & chunk = {});
 
   private:
+    common_chat_msg parse(bool is_partial) const;
+
     common_chat_prompt                  prompt_parts;
     std::string                         grammar_text;
     bool                                grammar_lazy = false;
     std::vector<common_grammar_trigger> grammar_triggers;
     std::set<llama_token>               preserved_tokens;
+    std::vector<llama_token>            suppressed;
     std::vector<std::string>            stops;
     std::vector<std::string>            stops_after_reasoning_;
     std::vector<std::string>            no_empty_reply_inert_;
@@ -465,6 +478,10 @@ class common_chat_session {
     std::vector<std::string>            thinking_ends;
 
     common_chat_parser_params  parser_params;
+    common_chat_parser_params  none_parser_params; // drop_calls: the tool_choice none parser, used if the auto one fails
+    bool                       drop_calls = false;
+    std::vector<common_grammar_trigger> call_openers;             // drop_calls: cut the none parser's content here
+    std::vector<std::string>            call_section_tags;        // drop_calls: a section tag right before the call goes too
     common_chat_msg_delimiters delimiters;
     common_chat_input          input;
     common_chat_msg            result;

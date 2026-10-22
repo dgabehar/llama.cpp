@@ -1,0 +1,40 @@
+From 3d8731b2d95d0ef04c885a84c6a67f1d600071da Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Sat, 17 Oct 2026 07:34:04 -0500
+Subject: [PATCH] tests: test-state-capture tolerates by-design re-reserve
+ under GGML_SCHED_NO_REALLOC
+
+Hybrid archs reserve the final pp graph with n_seqs = 1, so the two-seqs case
+re-reserves by design; the upstream realloc diagnostic (set by CI) aborted it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ tests/test-state-capture.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/test-state-capture.cpp b/tests/test-state-capture.cpp
+index 028eb660d..487e917b1 100644
+--- a/tests/test-state-capture.cpp
++++ b/tests/test-state-capture.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <clocale>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -166,6 +167,9 @@ static void run_case(const char * name, llama_model * model, llama_context_param
+ }
+ 
+ int main(int argc, char ** argv) {
++    // the "two seqs" case batches multiple sequences; hybrid archs reserve the final pp graph with
++    // n_seqs = 1 and re-reserve by design, which GGML_SCHED_DEBUG_REALLOC (CI: GGML_SCHED_NO_REALLOC) aborts on
++    setenv("GGML_SCHED_DEBUG_REALLOC", "0", 1);
+     std::setlocale(LC_NUMERIC, "C");
+ 
+     common_params params;
+-- 
+2.43.0
+

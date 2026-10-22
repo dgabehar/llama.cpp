@@ -1,0 +1,118 @@
+From b9e449fdcd7598fdd38ecf0c2590402802e34f7c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 22 Oct 2026 10:19:11 -0500
+Subject: [PATCH] vulkan/tests: guard ssm_conv_split d_conv <= 16, widen
+ concat_transposed coverage
+
+- ggml-vulkan: SSM_CONV_SPLIT unsupported when the conv kernel (src[2]) has
+  more than 16 taps; ssm_conv_split.comp gathers taps into float v[16]
+- test-backend-ops: test_concat_transposed gains ne3 and a column-offset
+  (strided) src0 view like the qwen4exp window concat; add n_tokens == 2,
+  ne3 > 1, strided, and combined cases
+- models.h: move the conv-history comment back above build_conv_state_at
+- ggml-vulkan: drop the unused src0 name in ggml_vk_concat_use_tiled (-Wunused-parameter)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  6 ++++--
+ src/models/models.h                  |  2 +-
+ tests/test-backend-ops.cpp           | 23 ++++++++++++++++++-----
+ 3 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index de0c9b34f..cc09f8699 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -315,7 +315,7 @@ uint32_t ggml_vk_concat_unit_size(ggml_type type) {
+ }
+ // dim 0 concat of a transposed (contiguous along dim 1) src1: the generic shader reads it with a large stride
+ // along the fastest dst axis, so route it to the shared-memory tile shader.
+-static bool ggml_vk_concat_use_tiled(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++static bool ggml_vk_concat_use_tiled(const ggml_tensor * /*src0*/, const ggml_tensor * src1, const ggml_tensor * dst) {
+     if (ggml_is_quantized(dst->type) || ggml_get_op_params_i32(dst, 0) != 0) {
+         return false;
+     }
+@@ -16196,7 +16196,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         case GGML_OP_SSM_CONV:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_SSM_CONV_SPLIT:
+-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
++            // src[2] is the conv kernel; ne[0] = d_conv taps, gathered into float v[16] in ssm_conv_split.comp
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->src[2]->ne[0] <= 16;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+         case GGML_OP_COL2IM_1D:
+diff --git a/src/models/models.h b/src/models/models.h
+index cad4645d3..48646fa80 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2691,7 +2691,6 @@ struct llama_model_qwen4exp : public llama_model_base {
+         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
+         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
+ 
+-        // one conv history per cache tensor: delta-net and PLE each have their own
+         // same history/tails as build_conv_state_at, but returns {state, new_tokens} for
+         // ggml_ssm_conv_split instead of materializing concat(state, transpose(x))
+         std::pair<ggml_tensor *, ggml_tensor *> build_conv_state_split(
+@@ -2702,6 +2701,7 @@ struct llama_model_qwen4exp : public llama_model_base {
+                         int64_t   channels,
+                             int   il);
+ 
++        // one conv history per cache tensor: delta-net and PLE each have their own
+         ggml_tensor * build_conv_state_at(
+              llm_graph_input_rs * inp,
+                     ggml_tensor * conv_states_all,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e4fd66d95..65f50db7c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7127,19 +7127,28 @@ struct test_concat_transposed : public test_case {
+     const int64_t channels;
+     const int64_t n_tokens;
+     const int64_t n_seqs;
++    const int64_t ne3;
++    const int64_t a_skip; // > 0: a is a column-offset view into a wider tensor (qwen4exp window concat)
+ 
+     std::string vars() override {
+-        return VARS_TO_STR5(type, d_conv_m1, channels, n_tokens, n_seqs);
++        return VARS_TO_STR7(type, d_conv_m1, channels, n_tokens, n_seqs, ne3, a_skip);
+     }
+ 
+     test_concat_transposed(ggml_type type = GGML_TYPE_F32, int64_t d_conv_m1 = 3,
+-            int64_t channels = 10240, int64_t n_tokens = 2048, int64_t n_seqs = 1)
+-        : type(type), d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
++            int64_t channels = 10240, int64_t n_tokens = 2048, int64_t n_seqs = 1,
++            int64_t ne3 = 1, int64_t a_skip = 0)
++        : type(type), d_conv_m1(d_conv_m1), channels(channels), n_tokens(n_tokens), n_seqs(n_seqs),
++          ne3(ne3), a_skip(a_skip) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+-        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, d_conv_m1, channels, n_seqs);
++        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, d_conv_m1 + a_skip, channels, n_seqs, ne3);
+         ggml_set_name(a, "a");
+-        ggml_tensor * x = ggml_new_tensor_3d(ctx, type, channels, n_tokens, n_seqs);
++        if (a_skip > 0) {
++            a = ggml_view_4d(ctx, a, d_conv_m1, channels, n_seqs, ne3, a->nb[1], a->nb[2], a->nb[3],
++                    a_skip * a->nb[0]);
++            ggml_set_name(a, "a_view");
++        }
++        ggml_tensor * x = ggml_new_tensor_4d(ctx, type, channels, n_tokens, n_seqs, ne3);
+         ggml_set_name(x, "x");
+         ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, x), 0);
+         ggml_set_name(out, "out");
+@@ -11560,6 +11569,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2));
+         test_cases.emplace_back(new test_concat_transposed(type, 40, 33, 31, 3));
+         test_cases.emplace_back(new test_concat_transposed(type, 3, 64, 1, 1));
++        test_cases.emplace_back(new test_concat_transposed(type, 3, 64, 2, 1));        // smallest tiled n_tokens
++        test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2, 3));   // ne3 > 1
++        test_cases.emplace_back(new test_concat_transposed(type, 2, 100, 37, 2, 1, 1)); // strided src0 view
++        test_cases.emplace_back(new test_concat_transposed(type, 1, 33, 2, 3, 2, 2));  // all three
+     }
+ 
+     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+-- 
+2.43.0
+

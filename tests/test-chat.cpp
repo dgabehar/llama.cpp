@@ -16,6 +16,7 @@
 #include "log.h"
 
 #include <random>
+#include <cmath>
 #include <algorithm>
 #include <exception>
 #include <fstream>
@@ -1111,6 +1112,9 @@ struct make_peg_parser {
 // Global template filter for --template flag
 static std::string g_template_filter;
 
+// templates whose tool call openers are not tags: under tool_choice none they keep the content-only parser
+static std::set<std::string> g_none_keeps_content;
+
 // When true, run reconstruction test on every non-partial test and report results
 static bool g_force_reconstruction_test = false;
 
@@ -1623,6 +1627,94 @@ class peg_test_builder {
         }
         LOG_INF("\n\x1b[38;5;126m[%s]\x1b[0m\n%s\n\n", tester_.template_path().c_str(), tc_.input.c_str());
         test_peg_parser(tester_.tmpls_.get(), [this](peg_test_case & t) { t = tc_; }, tester_.detailed_debug_);
+        check_tool_choice_none();
+    }
+
+    // tool_choice none sweep over every test case. A complete tool_choice auto call case runs again under none
+    // (streamed byte by byte, through test_peg_parser) and must give the same reasoning and content and no call (the raw
+    // call used to come back as content). A reply with no call, with tools offered and tool_choice none, must give
+    // exactly what the template's own none parser gives. Templates whose call openers are not tags keep the
+    // content-only parser and are collected (main checks the set).
+    void check_tool_choice_none() {
+        if (tc_.is_partial || !tc_.params.json_schema.empty() || tc_.params.tool_choice != COMMON_CHAT_TOOL_CHOICE_AUTO ||
+            tc_.params.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {
+            return;
+        }
+        peg_test_case none = tc_;
+        none.params.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        none.expect_rules.clear();
+        none.expect_reconstruction = false;
+        if (none.params.messages.empty()) {
+            none.params.messages = { message_user };
+        }
+        if (none.expect.role.empty()) {
+            none.expect.role = "assistant";
+        }
+
+        if (!tc_.expect.tool_calls.empty()) {
+            if (tc_.params.tools.empty()) {
+                return;
+            }
+            common_chat_session session(tester_.tmpls_.get(), nullptr, none.params);
+            if (!session.drops_tool_calls()) {
+                g_none_keeps_content.insert(tester_.template_path());
+                return;
+            }
+            // the raw call is gone from content and reasoning; how the rest splits is the none parser's (an unclosed
+            // reasoning block stays reasoning), and streaming must agree with the final message
+            // (a closed reasoning may mention an opener, Ministral 3; an unclosed one is cut like the content)
+            const auto final_msg = session.finish(common_chat_input(tc_.input));
+            assert_equals((size_t) 0, final_msg.tool_calls.size());
+            const auto & ends    = session.thinking_end_tags();
+            const auto & openers = session.call_openers_for_test();
+            const bool closed = std::any_of(ends.begin(), ends.end(), [&](const std::string & e) {
+                const bool is_opener = std::any_of(openers.begin(), openers.end(), [&](const common_grammar_trigger & o) {
+                    return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && string_strip(o.value) == string_strip(e);
+                });
+                return !e.empty() && !is_opener && tc_.input.find(e) != std::string::npos;
+            });
+            // the content is what auto gives before the call; an unclosed reasoning block keeps it as reasoning
+            const bool same_content = string_strip(final_msg.content) == string_strip(tc_.expect.content);
+            const bool kept_in_reasoning = !closed && final_msg.content.empty() &&
+                string_strip(final_msg.reasoning_content) == string_strip(tc_.expect.reasoning_content + tc_.expect.content);
+            if (!same_content && !kept_in_reasoning) {
+                throw std::runtime_error(tester_.template_path() + ": tool_choice none content [" + final_msg.content +
+                                         "] is not the auto content [" + tc_.expect.content + "]");
+            }
+            for (const auto & opener : session.call_openers_for_test()) {
+                const std::string word = string_strip(opener.value);
+                if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
+                    (final_msg.content.find(word) != std::string::npos ||
+                     (!closed && final_msg.reasoning_content.find(word) != std::string::npos))) {
+                    throw std::runtime_error(tester_.template_path() + ": tool_choice none leaked the call opener " + opener.value);
+                }
+            }
+            none.expect = final_msg;
+            none.expect.role = "assistant";
+            test_peg_parser(tester_.tmpls_.get(), [&](peg_test_case & t) { t = none; }, false);
+            return;
+        }
+
+        if (none.params.tools.empty()) {
+            none.params.tools = { special_function_tool };
+        }
+        common_chat_msg old;
+        try {
+            const auto applied = common_chat_templates_apply(tester_.tmpls_.get(), none.params);
+            common_chat_parser_params pp(applied);
+            pp.parser = applied.parser;
+            old = common_chat_parse(common_chat_input(tc_.input), false, pp);
+        } catch (const std::exception &) {
+            return; // the none parser does not take this reply either
+        }
+        common_chat_session session(tester_.tmpls_.get(), nullptr, none.params);
+        const auto & msg = session.finish(common_chat_input(tc_.input));
+        assert_equals(old.reasoning_content, msg.reasoning_content);
+        assert_equals(old.content, msg.content);
+        assert_equals((size_t) 0, msg.tool_calls.size());
+        none.expect = old;
+        none.expect.role = "assistant";
+        test_peg_parser(tester_.tmpls_.get(), [&](peg_test_case & t) { t = none; }, false);
     }
 };
 
@@ -2172,6 +2264,40 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     })";
 
     {
+        // Qwen3 (autoparser): tool_choice none with tools offered, a call the model emits anyway is neither a call
+        // nor content
+        auto tst = peg_tester("models/templates/Qwen-Qwen3-0.6B.jinja", detailed_debug);
+        const std::string call = "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>";
+        tst.test("Hello, world!\nWhat's up?\n\n" + call)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .tools({ special_function_tool })
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+        tst.test("<think>\nI'm\nthinking\n</think>\n\n" + call)
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .tools({ special_function_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("")
+            .run();
+        tst.test("Hello, world!\nWhat's up?\n\n" + call)
+            .tools({ special_function_tool })
+            .expect_content("Hello, world!\nWhat's up?")
+            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+            .run();
+        // a call the auto parser rejects (unknown tool, text after the call) is cut off at the opener
+        for (const std::string & tail : { std::string("<tool_call>\n{\"name\": \"no_such_tool\", \"arguments\": {}}\n</tool_call>"),
+                                          call + "\nAnd more text." }) {
+            tst.test("Hello, world!\nWhat's up?\n\n" + tail)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_content("Hello, world!\nWhat's up?")
+                .run();
+        }
+    }
+
+    {
         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
 
@@ -2199,6 +2325,30 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call)
             .expect_rules({ "tool-0", "tool-0-arg-0" })
             .run();
+
+        // tool_choice none with tools offered: a call the model emits anyway (Qwen3.8 QA) is neither a call nor content,
+        // the raw <tool_call> block used to be returned as the message content
+        for (bool thinking : { false, true }) {
+            const std::string call =
+                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+            const std::string prefix = thinking ? "I'm\nthinking\n</think>\n\n" : "";
+            tst.test(prefix + "Hello, world!\nWhat's up?\n\n" + call)
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(thinking ? "I'm\nthinking" : "")
+                .expect_content("Hello, world!\nWhat's up?")
+                .run();
+            tst.test(prefix + call)
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(thinking ? "I'm\nthinking" : "")
+                .expect_content("")
+                .run();
+        }
 
         tst.test(
                "I'm\nthinking\n</think>\n\n"
@@ -3029,6 +3179,16 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect(message_assist_thoughts)
             .run();
+
+        // a reply that starts with whitespace (indented code) keeps it; the tool_choice none sweep checks the same
+        // reply with a tool offered against the none parser
+        for (bool thinking : { false, true }) {
+            tst.test("    def f():\n        return 1\n")
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_content("    def f():\n        return 1\n")
+                .run();
+        }
 
         // Empty reasoning (budget=0: sampler forces end tag before newline)
         tst.test(
@@ -4012,6 +4172,25 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
     {
+        // tool_choice none: a call the auto parser rejects (unknown tool, text after the call) is cut off at the
+        // opener instead of being returned as content
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V3.1.jinja", detailed_debug);
+        const std::string call =
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_time<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        const std::string unknown =
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>no_such_tool<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        for (const std::string & tail : { unknown, call + "\nAnd more text." }) {
+            tst.test("REASONING</think>CONTENT" + tail)
+                .tools({ get_time_tool })
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .enable_thinking(true)
+                .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+                .expect(simple_assist_msg("CONTENT", "REASONING"))
+                .run();
+        }
+    }
+
+    {
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V3.1.jinja", detailed_debug);
         tst.test("REASONING</think>\nCONTENT")
             .enable_thinking(true)
@@ -4042,6 +4221,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .enable_thinking(false)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
             .expect(message_assist)
+            .run();
+
+        // a reply that starts with whitespace (indented code) keeps it, with and without reasoning; the tool_choice
+        // none sweep checks the same reply with a tool offered against the none parser
+        tst.test("    def f():\n        return 1\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect_content("    def f():\n        return 1\n")
+            .run();
+        tst.test("I'm\nthinking</think>\n\n    def f():\n        return 1\n")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("    def f():\n        return 1\n")
             .run();
 
         // Thinking + content
@@ -4263,6 +4456,22 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     // instead of an empty <think></think> pair.
     {
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.jinja", detailed_debug);
+        // tool_choice none: thinking, then a call with no </think> (V4 ends the reasoning at the call), the call is cut
+        // out of the reasoning
+        tst.test(
+               "Let me check the time\n\n"
+               "<｜DSML｜tool_calls>\n"
+               "<｜DSML｜invoke name=\"get_time\">\n"
+               "<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n"
+               "</｜DSML｜invoke>\n"
+               "</｜DSML｜tool_calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .expect_reasoning("Let me check the time")
+            .expect_content("")
+            .run();
 
         // Pure content (non-thinking mode; generation prompt ends with </think>)
         tst.test("Hello, world!\nWhat's up?")
@@ -6007,6 +6216,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Kimi-K2-Instruct
         auto tst2 = peg_tester("models/templates/Kimi-K2-Instruct.jinja", detailed_debug);
         tst2.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+        // tool_choice none: the call goes, and so does the section tag around it
+        tst2.test(
+               "Sure.<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
+               "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .expect_content("Sure.")
+            .run();
         tst2.test(
                "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>"
                "{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>")
@@ -7414,6 +7631,17 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
 
         // Unsolicited tool calls. There is no good way to handle these, so we return empty content.
 
+        // A preamble ("to" in prose), then a builtin call. The tool_choice none sweep checks it with a tool offered:
+        // the harmony pattern `^\s+to$` must not cut the preamble at " to"
+        tst.test(
+               "<|channel|>analysis<|message|>Think<|end|>"
+               "<|start|>assistant<|channel|>commentary<|message|>I need to check the weather.<|end|>"
+               "<|start|>assistant to=container.exec<|channel|>commentary<|message|>ls")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Think")
+            .expect_content("I need to check the weather.")
+            .run();
+
         // Builtin function - recipient in role
         tst.test(
                "<|channel|>analysis<|message|>I will execute python to say hello<|end|>"
@@ -8342,6 +8570,74 @@ static void test_k2_empty_parse_is_not_raw_text() {
     LOG_ERR("%s passed\n", __func__);
 }
 
+// tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
+// the raw <tool_call> block came back as content). The session bans an opener that is one special token, and only
+// under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
+// repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
+// TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
+static void test_tool_choice_none_suppresses_call_opener() {
+    LOG_DBG("%s\n", __func__);
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the weather in Paris?";
+
+    struct check {
+        const char * vocab;
+        const char * opener;
+        bool         banned; // under none
+        std::vector<const char *> templates;
+    };
+    std::vector<check> checks = {
+        { "models/ggml-vocab-gemma-4.gguf", "<|tool_call>", true,  { "models/templates/google-gemma-4-31B-it.jinja" } },
+        { "models/ggml-vocab-qwen35.gguf",  "<tool_call>",  false, { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" } },
+    };
+    const char * real = getenv("TEST_CHAT_QWEN_GGUF");
+    if (real && *real) {
+        checks.push_back({ real, "<tool_call>", true, { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" } });
+    }
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only         = true;
+    for (const auto & c : checks) {
+        llama_model * model = llama_model_load_from_file(c.vocab, mparams);
+        if (model == nullptr) {
+            throw std::runtime_error(std::string("failed to load ") + c.vocab);
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const auto          ids   = common_tokenize(vocab, c.opener, false, true);
+        if (c.banned != (ids.size() == 1)) {
+            throw std::runtime_error(std::string(c.vocab) + ": unexpected tokenization of " + c.opener);
+        }
+        for (const char * path : c.templates) {
+            auto tmpls = read_templates(path);
+            for (auto choice : { COMMON_CHAT_TOOL_CHOICE_NONE, COMMON_CHAT_TOOL_CHOICE_AUTO }) {
+                common_chat_templates_inputs inputs;
+                inputs.messages              = { user };
+                inputs.add_generation_prompt = true;
+                inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+                inputs.tools                 = { special_function_tool };
+                inputs.tool_choice           = choice;
+                common_chat_session session(tmpls.get(), vocab, inputs);
+
+                const bool none = choice == COMMON_CHAT_TOOL_CHOICE_NONE;
+                if (session.drops_tool_calls() != none) {
+                    throw std::runtime_error(std::string(path) + ": drops_tool_calls() should be " + (none ? "true" : "false"));
+                }
+                common_params_sampling sampling;
+                session.apply_sampling(sampling);
+                const bool banned = std::any_of(sampling.logit_bias.begin(), sampling.logit_bias.end(), [&](const llama_logit_bias & lb) {
+                    return ids.size() == 1 && lb.token == ids[0] && std::isinf(lb.bias) && lb.bias < 0;
+                });
+                if (banned != (none && c.banned)) {
+                    throw std::runtime_error(std::string(path) + " / " + c.vocab + ": " + c.opener + " ban " + (banned ? "present" : "missing"));
+                }
+            }
+        }
+        llama_model_free(model);
+    }
+    LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
+}
+
 // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
 // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
 // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
@@ -8958,6 +9254,7 @@ int main(int argc, char ** argv) {
         test_k2_history_reasoning();
         test_k2_guard_fields();
         test_k2_empty_parse_is_not_raw_text();
+        test_tool_choice_none_suppresses_call_opener();
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
@@ -8968,6 +9265,19 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
+        // the templates whose call openers are ordinary text (`Action:`, `functools`, `>>>`): anything else that falls
+        // out of the tool_choice none call drop is a regression
+        const std::set<std::string> expected_content_only = {
+            "models/templates/CohereForAI-c4ai-command-r-plus-tool_use.jinja",
+            "models/templates/fireworks-ai-llama-3-firefunction-v2.jinja",
+            "models/templates/meetkai-functionary-medium-v3.2.jinja",
+        };
+        if (g_none_keeps_content != expected_content_only) {
+            for (const auto & path : g_none_keeps_content) {
+                LOG_ERR("tool_choice none keeps the content-only parser: %s\n", path.c_str());
+            }
+            throw std::runtime_error("unexpected set of templates without the tool_choice none call drop");
+        }
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
     return 0;

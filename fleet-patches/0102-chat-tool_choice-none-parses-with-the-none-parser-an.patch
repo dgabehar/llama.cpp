@@ -1,0 +1,244 @@
+From de3105f80abe7509731dac66d4164b9bc85f40ac Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 22 Oct 2026 14:16:53 -0500
+Subject: [PATCH] chat: tool_choice none parses with the none parser and cuts
+ at the call opener
+
+Third review follow-up to 8120c3ced, 64a4084b3 and 727dd3ead.
+
+- 727dd3ead left-trimmed the content after extracted reasoning to match the
+  autoparser's none parser, but the dedicated thinking parsers (Gemma 4,
+  DeepSeek V3.2/V4, Kimi-K2, LFM2, MiniMax, ...) keep that whitespace even
+  with thinking off, so indented-code replies lost their leading spaces; the
+  non-thinking autoparser templates (Qwen2.5, Hermes, Mistral-Nemo/Small,
+  MiMo-VL) differed the other way.
+- The fallback cut stripped the anchors from harmony's `^\s+to$`, so " to" in
+  prose cut "I need to check the weather." to "I need" (gpt-oss, llm-jp,
+  muse), and the content shrank at finish().
+
+The session now parses under tool_choice none with the template's own none
+parser, so a reply with no call is exactly what none gave before, and cuts the
+content at the first call opener (word openers, and patterns that contain a
+special token `<\|`, anchors kept). The reasoning is cut too only when the
+reasoning block is never closed (DeepSeek V4 puts the call there; a closed
+Ministral 3 reasoning that mentions `[TOOL_CALLS]` is kept). While streaming a
+partial word opener at the end is held back, so content only grows. The
+tool_choice auto parser is used only when the none parser fails on the call
+(muse, cohere2moe, ...), with its calls cleared. The left-trim is gone.
+
+Tests (tests/test-chat.cpp): Gemma 4 and DeepSeek V3.2 replies that start
+with indented code, with and without reasoning, and a gpt-oss preamble ("to"
+in prose) followed by a builtin call; the Gemma 4 case fails on 727dd3ead.
+The tool_choice none sweep's call cases now require no call and no opener in
+the content (or in an unclosed reasoning), streamed byte by byte against the
+final message; its no-call cases still must equal the none parser exactly.
+
+Verified CPU-only with Qwen3.5-0.8B-Q8_0 through llama-server: tool_choice
+none returns plain text in stream on/off x thinking on/off; auto still returns
+the call.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp     | 48 ++++++++++++++++++++++-----------------
+ common/chat.h       |  3 ++-
+ tests/test-chat.cpp | 55 ++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 84 insertions(+), 22 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index e1e83df91..d7b675486 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1902,9 +1902,6 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+                 parser_params.format      = as_auto->format;
+                 parser_params.parser      = std::move(as_auto->parser);
+                 call_openers              = as_auto->grammar_triggers;
+-                // the none parsers drop the whitespace between the reasoning end tag and the content, the auto ones
+-                // keep it (it is the separator before a call)
+-                ltrim_content = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && applied.supports_thinking;
+             }
+         }
+     }
+@@ -1919,29 +1916,36 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
+     if (!drop_calls) {
+         return common_chat_parse(input, is_partial, parser_params);
+     }
++    // tool_choice none: the none parser's message (a reply with no call is exactly what none gave before), its content
++    // cut at the first call opener. Only a word opener (all of them are tags, see the constructor) or a pattern on a
++    // special token (`<\|`) cuts, anchors kept, so a pattern like harmony's `^\s+to$` never matches prose. While
++    // streaming, a partial word opener at the end is held back, so the content only grows.
+     common_chat_msg msg;
+     try {
+-        msg = common_chat_parse(input, is_partial, parser_params);
+-    } catch (const std::exception &) {
+-        // the auto parser rejects a call it cannot take (unknown tool, text after the call): the none parser's content,
+-        // cut at the first call opener (all of them are tags, see the constructor)
+         msg = common_chat_parse(input, is_partial, none_parser_params);
++    } catch (const std::exception &) {
++        // the none parser fails on the call (muse, cohere2moe, ...): the auto parser's message without its calls
++        msg = common_chat_parse(input, is_partial, parser_params);
++        msg.tool_calls.clear();
++        return msg;
++    }
++    // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
++    // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
++    const auto cut_at_openers = [&](std::string & text) {
+         size_t cut = std::string::npos;
+         for (const auto & opener : call_openers) {
+             size_t pos = std::string::npos;
+             if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+-                pos = msg.content.find(trim_whitespace(opener.value));
+-            } else if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) {
+-                std::string pattern = opener.value;
+-                if (!pattern.empty() && pattern.front() == '^') {
+-                    pattern.erase(0, 1);
+-                }
+-                if (!pattern.empty() && pattern.back() == '$') {
+-                    pattern.pop_back();
++                const std::string word = trim_whitespace(opener.value);
++                pos = text.find(word);
++                if (pos == std::string::npos && is_partial) {
++                    pos = string_find_partial_stop(text, word);
+                 }
++            } else if ((opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) &&
++                       opener.value.find("<\\|") != std::string::npos) {
+                 std::smatch m;
+                 try {
+-                    if (std::regex_search(msg.content, m, std::regex(pattern))) {
++                    if (std::regex_search(text, m, std::regex(opener.value))) {
+                         pos = m.position(0);
+                     }
+                 } catch (const std::regex_error &) {
+@@ -1950,13 +1954,17 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
+             cut = std::min(cut, pos);
+         }
+         if (cut != std::string::npos) {
+-            msg.content.resize(cut);
++            text.resize(cut);
+         }
++    };
++    cut_at_openers(msg.content);
++    const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
++        return !end.empty() && input.text.find(end) != std::string::npos;
++    });
++    if (msg.content.empty() && !reasoning_closed) {
++        cut_at_openers(msg.reasoning_content);
+     }
+     msg.tool_calls.clear();
+-    if (ltrim_content) {
+-        msg.content.erase(0, std::min(msg.content.size(), msg.content.find_first_not_of(" \t\r\n")));
+-    }
+     return msg;
+ }
+ 
+diff --git a/common/chat.h b/common/chat.h
+index 73093ca20..d24fd2ab9 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -452,6 +452,8 @@ class common_chat_session {
+     bool drops_tool_calls() const { return drop_calls; }
+     // call openers that are one special token: never sampled under tool_choice none (needs a vocab)
+     const std::vector<llama_token> & suppressed_tokens() const { return suppressed; }
++    // drop_calls: the openers the content and reasoning are cut at (exposed for tests)
++    const std::vector<common_grammar_trigger> & call_openers_for_test() const { return call_openers; }
+ 
+     const common_chat_msg & feed(const common_chat_input & chunk);
+ 
+@@ -478,7 +480,6 @@ class common_chat_session {
+     common_chat_parser_params  parser_params;
+     common_chat_parser_params  none_parser_params; // drop_calls: the tool_choice none parser, used if the auto one fails
+     bool                       drop_calls = false;
+-    bool                       ltrim_content = false;             // drop_calls: as the none parser after the reasoning
+     std::vector<common_grammar_trigger> call_openers;             // drop_calls: cut the none parser's content here
+     common_chat_msg_delimiters delimiters;
+     common_chat_input          input;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 77f77c854..99ba2fab0 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -1660,7 +1660,25 @@ class peg_test_builder {
+                 g_none_keeps_content.insert(tester_.template_path());
+                 return;
+             }
+-            none.expect.tool_calls.clear();
++            // the raw call is gone from content and reasoning; how the rest splits is the none parser's (an unclosed
++            // reasoning block stays reasoning), and streaming must agree with the final message
++            // (a closed reasoning may mention an opener, Ministral 3; an unclosed one is cut like the content)
++            const auto final_msg = session.finish(common_chat_input(tc_.input));
++            assert_equals((size_t) 0, final_msg.tool_calls.size());
++            const auto & ends = session.thinking_end_tags();
++            const bool closed = std::any_of(ends.begin(), ends.end(), [&](const std::string & e) {
++                return !e.empty() && tc_.input.find(e) != std::string::npos;
++            });
++            for (const auto & opener : session.call_openers_for_test()) {
++                const std::string word = string_strip(opener.value);
++                if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
++                    (final_msg.content.find(word) != std::string::npos ||
++                     (!closed && final_msg.reasoning_content.find(word) != std::string::npos))) {
++                    throw std::runtime_error(tester_.template_path() + ": tool_choice none leaked the call opener " + opener.value);
++                }
++            }
++            none.expect = final_msg;
++            none.expect.role = "assistant";
+             test_peg_parser(tester_.tmpls_.get(), [&](peg_test_case & t) { t = none; }, false);
+             return;
+         }
+@@ -3150,6 +3168,16 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect(message_assist_thoughts)
+             .run();
+ 
++        // a reply that starts with whitespace (indented code) keeps it; the tool_choice none sweep checks the same
++        // reply with a tool offered against the none parser
++        for (bool thinking : { false, true }) {
++            tst.test("    def f():\n        return 1\n")
++                .enable_thinking(thinking)
++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                .expect_content("    def f():\n        return 1\n")
++                .run();
++        }
++
+         // Empty reasoning (budget=0: sampler forces end tag before newline)
+         tst.test(
+                 "<|channel>thought<channel|>Hello, world!\nWhat's up?")
+@@ -4183,6 +4211,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect(message_assist)
+             .run();
+ 
++        // a reply that starts with whitespace (indented code) keeps it, with and without reasoning; the tool_choice
++        // none sweep checks the same reply with a tool offered against the none parser
++        tst.test("    def f():\n        return 1\n")
++            .enable_thinking(false)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .expect_content("    def f():\n        return 1\n")
++            .run();
++        tst.test("I'm\nthinking</think>\n\n    def f():\n        return 1\n")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .expect_reasoning("I'm\nthinking")
++            .expect_content("    def f():\n        return 1\n")
++            .run();
++
+         // Thinking + content
+         tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+             .enable_thinking(true)
+@@ -7553,6 +7595,17 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+ 
+         // Unsolicited tool calls. There is no good way to handle these, so we return empty content.
+ 
++        // A preamble ("to" in prose), then a builtin call. The tool_choice none sweep checks it with a tool offered:
++        // the harmony pattern `^\s+to$` must not cut the preamble at " to"
++        tst.test(
++               "<|channel|>analysis<|message|>Think<|end|>"
++               "<|start|>assistant<|channel|>commentary<|message|>I need to check the weather.<|end|>"
++               "<|start|>assistant to=container.exec<|channel|>commentary<|message|>ls")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("Think")
++            .expect_content("I need to check the weather.")
++            .run();
++
+         // Builtin function - recipient in role
+         tst.test(
+                "<|channel|>analysis<|message|>I will execute python to say hello<|end|>"
+-- 
+2.43.0
+

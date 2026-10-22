@@ -96,8 +96,9 @@ common_chat_params common_chat_params_init_ling3(const common_chat_template &   
                                     p.optional(p.literal(THINK_END)));
 
         // content between the think block and the first tool call, plus any
-        // trailing text after the last tool call, are plain content
-        auto content = p.optional(p.content(p.until_one_of({ CALL_START })));
+        // trailing text after the last tool call, are plain content (a reply with no call ends at the
+        // end-of-turn token, consumed by `tail`, as without tools)
+        auto content = p.optional(p.content(p.until_one_of({ CALL_START, ROLE_END })));
 
         // a trailing end-of-turn token is consumed instead of leaking into content
         auto tail = p.optional(p.content(p.until(ROLE_END))) + p.optional(p.literal(ROLE_END));
