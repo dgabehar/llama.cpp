@@ -134,6 +134,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0100 | `64a4084b3` | chat: tool_choice none drops a call for every tag-delimited template, in one place |
 | 0101 | `727dd3ead` | chat: tool_choice none keeps the none parser's plain replies and cuts rejected calls |
 | 0102 | `de3105f80` | chat: tool_choice none parses with the none parser and cuts at the call opener |
+| 0103 | `da19f59e8` | chat: tool_choice none cuts DeepSeek V4 reasoning calls and Kimi-K2 section tags |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
@@ -141,7 +142,7 @@ fixes"). Fork-only, not submitted upstream.
 
 This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync and extended on 2026-10-08
 with the K2 fixes (0088, 0089) and the sync-workflow removal (0090), then on 2026-10-22 with the merged test/vulkan patches (0091-0098)
-and the tool_choice none fix (0099-0102): 102 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
+and the tool_choice none fix (0099-0103): 103 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.
 
