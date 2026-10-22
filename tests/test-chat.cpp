@@ -19,6 +19,7 @@
 #include <cmath>
 #include <algorithm>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -8575,6 +8576,88 @@ static void test_k2_empty_parse_is_not_raw_text() {
 // under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
 // repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
 // TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
+// tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
+// saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
+// definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
+// drops calls itself) keeps the tools. A history with a tool call and its result still renders (Qwen3.5).
+static void test_tool_choice_none_omits_tools() {
+    LOG_DBG("%s\n", __func__);
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the weather in Paris?";
+
+    size_t checked = 0;
+    for (const auto & entry : std::filesystem::directory_iterator("models/templates")) {
+        const std::string path = entry.path().string();
+        if (entry.path().extension() != ".jinja") {
+            continue;
+        }
+        common_chat_templates_ptr tmpls;
+        try {
+            tmpls = read_templates(path);
+        } catch (const std::exception &) {
+            continue;
+        }
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user };
+        inputs.add_generation_prompt = true;
+        std::string plain;
+        try {
+            plain = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        } catch (const std::exception &) {
+            continue; // not a template this check can render
+        }
+        inputs.tools = { special_function_tool };
+        std::string with_tools;
+        try {
+            with_tools = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        } catch (const std::exception &) {
+            continue;
+        }
+        if (with_tools.find("I'm special") == std::string::npos) {
+            continue; // the template does not describe tools
+        }
+        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        std::string none;
+        try {
+            none = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        } catch (const std::exception & e) {
+            throw std::runtime_error(path + ": tool_choice none fails to render: " + e.what());
+        }
+        const bool k2 = with_tools.find("<|ifm|im_start|>") != std::string::npos;
+        if (k2 ? none != with_tools : none.find("I'm special") != std::string::npos) {
+            throw std::runtime_error(path + (k2 ? ": K2-Horizon prompt changed under tool_choice none" :
+                                                  ": tool_choice none still renders the tools"));
+        }
+        checked++;
+    }
+    if (checked < 20) {
+        throw std::runtime_error("tool_choice none prompt check covered only " + std::to_string(checked) + " templates");
+    }
+
+    // history: an earlier call and its result still render under none
+    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    common_chat_msg call;
+    call.role       = "assistant";
+    call.tool_calls = { { "special_function", R"({"arg1": 1})", "call_1" } };
+    common_chat_msg result;
+    result.role         = "tool";
+    result.tool_call_id = "call_1";
+    result.content      = "The answer is 42.";
+    common_chat_templates_inputs inputs;
+    inputs.messages              = { user, call, result };
+    inputs.add_generation_prompt = true;
+    inputs.tools                 = { special_function_tool };
+    inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
+    const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+    assert_contains(prompt, "<function=special_function>");
+    assert_contains(prompt, "<tool_response>\nThe answer is 42.");
+    if (prompt.find("I'm special") != std::string::npos) {
+        throw std::runtime_error("Qwen3.5: tool_choice none still renders the tools with a tool history");
+    }
+    LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
+}
+
 static void test_tool_choice_none_suppresses_call_opener() {
     LOG_DBG("%s\n", __func__);
     common_chat_msg user;
@@ -9255,6 +9338,7 @@ int main(int argc, char ** argv) {
         test_k2_guard_fields();
         test_k2_empty_parse_is_not_raw_text();
         test_tool_choice_none_suppresses_call_opener();
+        test_tool_choice_none_omits_tools();
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
