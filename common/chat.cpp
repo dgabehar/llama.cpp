@@ -1902,9 +1902,6 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                 parser_params.format      = as_auto->format;
                 parser_params.parser      = std::move(as_auto->parser);
                 call_openers              = as_auto->grammar_triggers;
-                // the none parsers drop the whitespace between the reasoning end tag and the content, the auto ones
-                // keep it (it is the separator before a call)
-                ltrim_content = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && applied.supports_thinking;
             }
         }
     }
@@ -1919,29 +1916,36 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
     if (!drop_calls) {
         return common_chat_parse(input, is_partial, parser_params);
     }
+    // tool_choice none: the none parser's message (a reply with no call is exactly what none gave before), its content
+    // cut at the first call opener. Only a word opener (all of them are tags, see the constructor) or a pattern on a
+    // special token (`<\|`) cuts, anchors kept, so a pattern like harmony's `^\s+to$` never matches prose. While
+    // streaming, a partial word opener at the end is held back, so the content only grows.
     common_chat_msg msg;
     try {
-        msg = common_chat_parse(input, is_partial, parser_params);
-    } catch (const std::exception &) {
-        // the auto parser rejects a call it cannot take (unknown tool, text after the call): the none parser's content,
-        // cut at the first call opener (all of them are tags, see the constructor)
         msg = common_chat_parse(input, is_partial, none_parser_params);
+    } catch (const std::exception &) {
+        // the none parser fails on the call (muse, cohere2moe, ...): the auto parser's message without its calls
+        msg = common_chat_parse(input, is_partial, parser_params);
+        msg.tool_calls.clear();
+        return msg;
+    }
+    // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
+    // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
+    const auto cut_at_openers = [&](std::string & text) {
         size_t cut = std::string::npos;
         for (const auto & opener : call_openers) {
             size_t pos = std::string::npos;
             if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
-                pos = msg.content.find(trim_whitespace(opener.value));
-            } else if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) {
-                std::string pattern = opener.value;
-                if (!pattern.empty() && pattern.front() == '^') {
-                    pattern.erase(0, 1);
+                const std::string word = trim_whitespace(opener.value);
+                pos = text.find(word);
+                if (pos == std::string::npos && is_partial) {
+                    pos = string_find_partial_stop(text, word);
                 }
-                if (!pattern.empty() && pattern.back() == '$') {
-                    pattern.pop_back();
-                }
+            } else if ((opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN || opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL) &&
+                       opener.value.find("<\\|") != std::string::npos) {
                 std::smatch m;
                 try {
-                    if (std::regex_search(msg.content, m, std::regex(pattern))) {
+                    if (std::regex_search(text, m, std::regex(opener.value))) {
                         pos = m.position(0);
                     }
                 } catch (const std::regex_error &) {
@@ -1950,13 +1954,17 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
             cut = std::min(cut, pos);
         }
         if (cut != std::string::npos) {
-            msg.content.resize(cut);
+            text.resize(cut);
         }
+    };
+    cut_at_openers(msg.content);
+    const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
+        return !end.empty() && input.text.find(end) != std::string::npos;
+    });
+    if (msg.content.empty() && !reasoning_closed) {
+        cut_at_openers(msg.reasoning_content);
     }
     msg.tool_calls.clear();
-    if (ltrim_content) {
-        msg.content.erase(0, std::min(msg.content.size(), msg.content.find_first_not_of(" \t\r\n")));
-    }
     return msg;
 }
 

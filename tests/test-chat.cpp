@@ -1660,7 +1660,25 @@ class peg_test_builder {
                 g_none_keeps_content.insert(tester_.template_path());
                 return;
             }
-            none.expect.tool_calls.clear();
+            // the raw call is gone from content and reasoning; how the rest splits is the none parser's (an unclosed
+            // reasoning block stays reasoning), and streaming must agree with the final message
+            // (a closed reasoning may mention an opener, Ministral 3; an unclosed one is cut like the content)
+            const auto final_msg = session.finish(common_chat_input(tc_.input));
+            assert_equals((size_t) 0, final_msg.tool_calls.size());
+            const auto & ends = session.thinking_end_tags();
+            const bool closed = std::any_of(ends.begin(), ends.end(), [&](const std::string & e) {
+                return !e.empty() && tc_.input.find(e) != std::string::npos;
+            });
+            for (const auto & opener : session.call_openers_for_test()) {
+                const std::string word = string_strip(opener.value);
+                if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
+                    (final_msg.content.find(word) != std::string::npos ||
+                     (!closed && final_msg.reasoning_content.find(word) != std::string::npos))) {
+                    throw std::runtime_error(tester_.template_path() + ": tool_choice none leaked the call opener " + opener.value);
+                }
+            }
+            none.expect = final_msg;
+            none.expect.role = "assistant";
             test_peg_parser(tester_.tmpls_.get(), [&](peg_test_case & t) { t = none; }, false);
             return;
         }
@@ -3150,6 +3168,16 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_thoughts)
             .run();
 
+        // a reply that starts with whitespace (indented code) keeps it; the tool_choice none sweep checks the same
+        // reply with a tool offered against the none parser
+        for (bool thinking : { false, true }) {
+            tst.test("    def f():\n        return 1\n")
+                .enable_thinking(thinking)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .expect_content("    def f():\n        return 1\n")
+                .run();
+        }
+
         // Empty reasoning (budget=0: sampler forces end tag before newline)
         tst.test(
                 "<|channel>thought<channel|>Hello, world!\nWhat's up?")
@@ -4181,6 +4209,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .enable_thinking(false)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
             .expect(message_assist)
+            .run();
+
+        // a reply that starts with whitespace (indented code) keeps it, with and without reasoning; the tool_choice
+        // none sweep checks the same reply with a tool offered against the none parser
+        tst.test("    def f():\n        return 1\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect_content("    def f():\n        return 1\n")
+            .run();
+        tst.test("I'm\nthinking</think>\n\n    def f():\n        return 1\n")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect_reasoning("I'm\nthinking")
+            .expect_content("    def f():\n        return 1\n")
             .run();
 
         // Thinking + content
@@ -7552,6 +7594,17 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
 
 
         // Unsolicited tool calls. There is no good way to handle these, so we return empty content.
+
+        // A preamble ("to" in prose), then a builtin call. The tool_choice none sweep checks it with a tool offered:
+        // the harmony pattern `^\s+to$` must not cut the preamble at " to"
+        tst.test(
+               "<|channel|>analysis<|message|>Think<|end|>"
+               "<|start|>assistant<|channel|>commentary<|message|>I need to check the weather.<|end|>"
+               "<|start|>assistant to=container.exec<|channel|>commentary<|message|>ls")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Think")
+            .expect_content("I need to check the weather.")
+            .run();
 
         // Builtin function - recipient in role
         tst.test(
