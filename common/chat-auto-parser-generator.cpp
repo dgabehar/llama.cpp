@@ -74,11 +74,6 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             ((inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !trigger_marker.empty()) ||
               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
 
-    if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !trigger_marker.empty()) {
-        // the tools stay in the prompt, so the model may still open a call: keep it from sampling the opener
-        data.suppressed_tokens.push_back(trim_whitespace(trigger_marker));
-    }
-
     if (include_grammar) {
         data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
@@ -132,10 +127,6 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
             parser = tools.build_parser(ctx);
             pure_content = false;
         } else {
-            if (has_tools && tools.format.mode != tool_format::NONE) {
-                ctx.dropped_call_marker = !tools.format.section_start.empty() ? tools.format.section_start :
-                                                                                tools.format.per_call_start;
-            }
             parser = content.build_parser(ctx);
         }
         const std::string reasoning_start = trim_whitespace(reasoning.start);
@@ -176,17 +167,12 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
         }
         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
     }
-    auto body = p.content(p.rest());
-    const std::string marker = trim_whitespace(ctx.dropped_call_marker);
-    if (!marker.empty()) {
-        body = p.content(p.until(marker)) + p.optional(p.literal(marker) + p.rest());
-    }
     if (ctx.extracting_reasoning) {
         // Drop whitespace between the reasoning end tag and the content, only when reasoning was
         // actually parsed out, so a model with no reasoning tags keeps any leading whitespace it emits.
-        return ctx.reasoning_parser + p.space() + body + p.end();
+        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
     }
-    return ctx.reasoning_parser + body + p.end();
+    return ctx.reasoning_parser + p.content(p.rest()) + p.end();
 }
 
 common_peg_parser analyze_content::build_optional_wrapped(parser_build_context & ctx) const {

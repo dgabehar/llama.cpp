@@ -1798,6 +1798,23 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     return msg;
 }
 
+// a tool call opener that cannot be ordinary text: a word that starts with or contains a tag (`<tool_call>`,
+// `[TOOL_CALLS]`, `]<]minimax[>[<tool_call>`), or a pattern of a set anchored on special tokens (harmony:
+// `<\|start\|>assistant(\s+to)` and its continuation `^\s+to$`). Plain words (`functools`, `Action:`) and `>>>` are not.
+static bool is_tag_like_call_opener(const common_grammar_trigger & trigger, bool patterns_anchored) {
+    static const std::regex tag(R"(<[A-Za-z_/|][^<>\s]*>)");
+    const std::string opener = trim_whitespace(trigger.value);
+    switch (trigger.type) {
+        case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+            return !opener.empty() && (opener[0] == '<' || opener[0] == '[' || std::regex_search(opener, tag));
+        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+            return patterns_anchored;
+        default:
+            return false;
+    }
+}
+
 common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
                                          const llama_vocab *                  vocab,
                                          const common_chat_templates_inputs & inputs,
@@ -1835,23 +1852,77 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
         preserved_tokens = std::move(resolved.preserved_tokens);
         grammar_triggers = std::move(resolved.grammar_triggers);
 
-        for (const auto & text : applied.suppressed_tokens) {
-            const auto ids = common_tokenize(vocab, text, false, true);
-            // a plain-text marker is left alone: banning one of its pieces would ban ordinary words
-            if (ids.size() == 1 && llama_vocab_get_attr(vocab, ids[0]) != LLAMA_TOKEN_ATTR_NORMAL) {
-                suppressed_tokens.push_back(ids[0]);
-            }
-        }
-
         delimiters.tokenize(vocab);
     } else {
         grammar_triggers = std::move(applied.grammar_triggers);
     }
 
+    // tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call, and the
+    // template's content-only parser would return it verbatim as content (Qwen3.8 QA, K2 fork PR #16). Every template
+    // has a parser for its calls: parse as under auto, drop the calls, and ban an opener that is one special token so
+    // the call is not generated at all. Only when every opener is tag-like or one special token: a plain-word opener
+    // (`functools`, `Action:`) can be ordinary text, so it keeps the content-only parser.
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && applied.drops_calls_under_none) {
+        drop_calls         = true;
+        none_parser_params = parser_params;
+    } else if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
+        auto auto_inputs        = inputs;
+        auto_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        std::optional<common_chat_params> as_auto;
+        try {
+            as_auto = common_chat_templates_apply(tmpls, auto_inputs);
+        } catch (const std::exception & e) {
+            LOG_DBG("%s: no tool_choice auto parser to drop calls with: %s\n", __func__, e.what());
+        }
+        if (as_auto && as_auto->generation_prompt == applied.generation_prompt && !as_auto->grammar_triggers.empty()) {
+            bool tag_like          = true;
+            bool patterns_anchored = false;
+            for (const auto & trigger : as_auto->grammar_triggers) {
+                patterns_anchored = patterns_anchored || (trigger.type != COMMON_GRAMMAR_TRIGGER_TYPE_WORD &&
+                                                          trigger.value.find("<\\|") != std::string::npos);
+            }
+            std::vector<llama_token> banned;
+            for (const auto & trigger : as_auto->grammar_triggers) {
+                const std::string opener = trim_whitespace(trigger.value);
+                bool special = false;
+                if (vocab && trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                    const auto ids = common_tokenize(vocab, opener, false, true);
+                    special = ids.size() == 1 &&
+                              (llama_vocab_get_attr(vocab, ids[0]) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED));
+                    if (special) {
+                        banned.push_back(ids[0]);
+                    }
+                }
+                tag_like = tag_like && (special || is_tag_like_call_opener(trigger, patterns_anchored));
+            }
+            suppressed = std::move(banned);
+            if (tag_like) {
+                drop_calls                = true;
+                none_parser_params        = parser_params;
+                parser_params.format      = as_auto->format;
+                parser_params.parser      = std::move(as_auto->parser);
+            }
+        }
+    }
+
     if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !params.echo) {
         // start from the prefill so it is not emitted as part of the first delta
-        result = common_chat_parse(input, true, parser_params);
+        result = parse(true);
     }
+}
+
+common_chat_msg common_chat_session::parse(bool is_partial) const {
+    if (!drop_calls) {
+        return common_chat_parse(input, is_partial, parser_params);
+    }
+    common_chat_msg msg;
+    try {
+        msg = common_chat_parse(input, is_partial, parser_params);
+    } catch (const std::exception &) {
+        return common_chat_parse(input, is_partial, none_parser_params);
+    }
+    msg.tool_calls.clear();
+    return msg;
 }
 
 void common_chat_session::apply_sampling(common_params_sampling & sampling) const {
@@ -1865,7 +1936,7 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
     sampling.generation_prompt = generation_prompt_text;
     sampling.preserved_tokens.insert(preserved_tokens.begin(), preserved_tokens.end());
     sampling.grammar_triggers.insert(sampling.grammar_triggers.end(), grammar_triggers.begin(), grammar_triggers.end());
-    for (const auto token : suppressed_tokens) {
+    for (const auto token : suppressed) {
         sampling.logit_bias.push_back({ token, -INFINITY });
     }
 }
@@ -1873,7 +1944,7 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
 const common_chat_msg & common_chat_session::feed(const common_chat_input & chunk) {
     GGML_ASSERT(!finished && "feed() after finish()");
     input.append(chunk);
-    auto msg = common_chat_parse(input, true, parser_params);
+    auto msg = parse(true);
     if (!msg.empty()) {
         result = std::move(msg);
     }
@@ -1884,7 +1955,7 @@ const common_chat_msg & common_chat_session::finish(const common_chat_input & ch
     GGML_ASSERT(!finished && "finish() called twice");
     finished = true;
     input.append(chunk);
-    auto msg = common_chat_parse(input, false, parser_params);
+    auto msg = parse(false);
     if (!msg.empty()) {
         result = std::move(msg);
     }

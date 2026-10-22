@@ -1112,6 +1112,9 @@ struct make_peg_parser {
 // Global template filter for --template flag
 static std::string g_template_filter;
 
+// templates whose tool call openers are not tags: under tool_choice none they keep the content-only parser
+static std::set<std::string> g_none_keeps_content;
+
 // When true, run reconstruction test on every non-partial test and report results
 static bool g_force_reconstruction_test = false;
 
@@ -1624,6 +1627,31 @@ class peg_test_builder {
         }
         LOG_INF("\n\x1b[38;5;126m[%s]\x1b[0m\n%s\n\n", tester_.template_path().c_str(), tc_.input.c_str());
         test_peg_parser(tester_.tmpls_.get(), [this](peg_test_case & t) { t = tc_; }, tester_.detailed_debug_);
+        check_tool_choice_none();
+    }
+
+    // every complete tool call test also runs under tool_choice none: the same text must give the same reasoning and
+    // content and no call (the raw call used to come back as content). Templates whose call openers are not tags
+    // (`functools`, `Action:`, `>>>`) keep the content-only parser and are listed at the end.
+    void check_tool_choice_none() {
+        if (tc_.params.tools.empty() || tc_.params.tool_choice != COMMON_CHAT_TOOL_CHOICE_AUTO || tc_.expect.tool_calls.empty() ||
+            tc_.is_partial || !tc_.params.json_schema.empty()) {
+            return;
+        }
+        auto inputs        = tc_.params;
+        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        if (inputs.messages.empty()) {
+            inputs.messages = { message_user };
+        }
+        common_chat_session session(tester_.tmpls_.get(), nullptr, inputs);
+        if (!session.drops_tool_calls()) {
+            g_none_keeps_content.insert(tester_.template_path());
+            return;
+        }
+        auto expected = tc_.expect;
+        expected.role = "assistant";
+        expected.tool_calls.clear();
+        assert_msg_equals(expected, session.finish(common_chat_input(tc_.input)), true);
     }
 };
 
@@ -8393,35 +8421,44 @@ static void test_k2_empty_parse_is_not_raw_text() {
 }
 
 // tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
-// the raw <tool_call> block came back as content). The chat params name the opener and the session bans it when it is
-// one special token; a plain-text opener (several tokens) is left alone. Both routes: the Qwen3-Coder/Qwen3.5 parser
-// and the autoparser (Qwen3). The repo's vocab files have no <tool_call> token, so the ban itself is checked against
-// a real Qwen GGUF when TEST_CHAT_QWEN_GGUF names one (loaded vocab-only).
+// the raw <tool_call> block came back as content). The session bans an opener that is one special token, and only
+// under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
+// repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
+// TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
 static void test_tool_choice_none_suppresses_call_opener() {
     LOG_DBG("%s\n", __func__);
     common_chat_msg user;
     user.role    = "user";
     user.content = "What is the weather in Paris?";
 
-    const char *       real = getenv("TEST_CHAT_QWEN_GGUF");
+    struct check {
+        const char * vocab;
+        const char * opener;
+        bool         banned; // under none
+        std::vector<const char *> templates;
+    };
+    std::vector<check> checks = {
+        { "models/ggml-vocab-gemma-4.gguf", "<|tool_call>", true,  { "models/templates/google-gemma-4-31B-it.jinja" } },
+        { "models/ggml-vocab-qwen35.gguf",  "<tool_call>",  false, { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" } },
+    };
+    const char * real = getenv("TEST_CHAT_QWEN_GGUF");
+    if (real && *real) {
+        checks.push_back({ real, "<tool_call>", true, { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" } });
+    }
+
     llama_model_params mparams = llama_model_default_params();
     mparams.vocab_only         = true;
-    for (const char * vocab_path : { "models/ggml-vocab-qwen35.gguf", real }) {
-        if (vocab_path == nullptr || *vocab_path == 0) {
-            continue;
-        }
-        llama_model * model = llama_model_load_from_file(vocab_path, mparams);
+    for (const auto & c : checks) {
+        llama_model * model = llama_model_load_from_file(c.vocab, mparams);
         if (model == nullptr) {
-            throw std::runtime_error(std::string("failed to load ") + vocab_path);
+            throw std::runtime_error(std::string("failed to load ") + c.vocab);
         }
-        const llama_vocab * vocab  = llama_model_get_vocab(model);
-        const auto          opener = common_tokenize(vocab, "<tool_call>", false, true);
-        const bool          single = opener.size() == 1 && llama_vocab_get_attr(vocab, opener[0]) != LLAMA_TOKEN_ATTR_NORMAL;
-        if (vocab_path == real && !single) {
-            throw std::runtime_error(std::string(vocab_path) + ": <tool_call> is not one special token");
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const auto          ids   = common_tokenize(vocab, c.opener, false, true);
+        if (c.banned != (ids.size() == 1)) {
+            throw std::runtime_error(std::string(c.vocab) + ": unexpected tokenization of " + c.opener);
         }
-
-        for (const char * path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" }) {
+        for (const char * path : c.templates) {
             auto tmpls = read_templates(path);
             for (auto choice : { COMMON_CHAT_TOOL_CHOICE_NONE, COMMON_CHAT_TOOL_CHOICE_AUTO }) {
                 common_chat_templates_inputs inputs;
@@ -8430,21 +8467,19 @@ static void test_tool_choice_none_suppresses_call_opener() {
                 inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
                 inputs.tools                 = { special_function_tool };
                 inputs.tool_choice           = choice;
+                common_chat_session session(tmpls.get(), vocab, inputs);
 
                 const bool none = choice == COMMON_CHAT_TOOL_CHOICE_NONE;
-                if (common_chat_templates_apply(tmpls.get(), inputs).suppressed_tokens !=
-                    (none ? std::vector<std::string>{ "<tool_call>" } : std::vector<std::string>{})) {
-                    throw std::runtime_error(std::string(path) + ": unexpected suppressed_tokens");
+                if (session.drops_tool_calls() != none) {
+                    throw std::runtime_error(std::string(path) + ": drops_tool_calls() should be " + (none ? "true" : "false"));
                 }
-
-                common_chat_session    session(tmpls.get(), vocab, inputs);
                 common_params_sampling sampling;
                 session.apply_sampling(sampling);
-                const bool banned = std::any_of(sampling.logit_bias.begin(), sampling.logit_bias.end(), [](const llama_logit_bias & lb) {
-                    return std::isinf(lb.bias) && lb.bias < 0;
+                const bool banned = std::any_of(sampling.logit_bias.begin(), sampling.logit_bias.end(), [&](const llama_logit_bias & lb) {
+                    return ids.size() == 1 && lb.token == ids[0] && std::isinf(lb.bias) && lb.bias < 0;
                 });
-                if (banned != (none && single)) {
-                    throw std::runtime_error(std::string(path) + " / " + vocab_path + ": unexpected <tool_call> ban " + (banned ? "present" : "missing"));
+                if (banned != (none && c.banned)) {
+                    throw std::runtime_error(std::string(path) + " / " + c.vocab + ": " + c.opener + " ban " + (banned ? "present" : "missing"));
                 }
             }
         }
@@ -9080,6 +9115,9 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
+        for (const auto & path : g_none_keeps_content) {
+            LOG_ERR("tool_choice none keeps the content-only parser (call opener is not a tag): %s\n", path.c_str());
+        }
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
     return 0;

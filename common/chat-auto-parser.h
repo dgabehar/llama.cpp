@@ -230,9 +230,6 @@ struct parser_build_context {
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
-    // tool_choice none with tools offered: the template's tool call marker. The content ends there and a call the
-    // model emits anyway is dropped, it is neither a tool call nor content
-    std::string                       dropped_call_marker;
 
     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
 };
