@@ -37,6 +37,17 @@ Fork PR #17 (patch 0089): `-Werror=missing-field-initializers` in the empty-repl
 failed the gcc arm64 CI build. Fork PR #18 (patch 0090) removed the disabled sync workflow. A 482-char hex tool
 argument that never completes is model repetition (offline grammar check accepts it), not a parser bug.
 
+## Qwen3.x tool_choice none (added 2026-10-22)
+
+Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B, same class as the K2 leak above: with tools offered and
+`tool_choice:"none"` the raw `<tool_call>...</tool_call>` block came back as `content`. The tools stay in the prompt, so
+the model still opens a call, and the content-only parser used under none (`common/parsers/qwen3-coder.cpp` for
+Qwen3.5/3.8, the autoparser for Qwen3 and other marker templates) returned it verbatim. Now `common_chat_params::
+suppressed_tokens` names the opener and `common_chat_session` bans it (-inf logit bias, only when it is one special
+token), and the content parser drops a call the model spells out anyway. Check: `TEST_CHAT_QWEN_GGUF=<any Qwen3.5/3.8
+gguf> build/bin/test-chat` (vocab-only load) also covers the ban against a real vocab. Other specialized parsers (gemma4,
+deepseek, minimax, ...) were not audited for this; gpt-oss already returns empty content for a call under none.
+
 ## Fleet patch maintenance (added 2026-09-15)
 
 Every fork-exclusive commit on `fleet-patches` is also mirrored to a

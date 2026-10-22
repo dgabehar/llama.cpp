@@ -122,13 +122,23 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0088 | `5d9445b34` | sampling: value-initialize the empty-reply guard (fixes -Werror=missing-field-initializers on gcc arm64 CI) |
 | 0089 | `ef002595f` | ci: remove the disabled sync-fleet-patches workflow |
 | 0090 | `c291b7775` | tests: slot-action timeout test runs a 6000-token busy request (12000 outran its 90 s HTTP timeout on the arm64 runner) |
+| 0091 | `3d8731b2d` | tests: test-state-capture tolerates by-design re-reserve under GGML_SCHED_NO_REALLOC |
+| 0092 | `8b22e1515` | tests: Windows-portable env set in test-state-capture; retry noisy split-balance ratio on busy runners |
+| 0093 | `c351de77a` | tests: skip split-balance op-count ratio check when calibration is throttled (hosted macOS runners) |
+| 0094 | `dc4d6d84d` | tests: render the K2 parser's chat template once per make_peg_parser, not once per parse |
+| 0095 | `4c17b1108` | qwen4exp: use ggml_ssm_conv_split for the GDN conv, dropping its concat |
+| 0096 | `ec0884436` | vulkan: ssm_conv_split nc==4 uses the same dot() reduction as ssm_conv, for bit-identical output |
+| 0097 | `a6193d8f4` | vulkan: shared-memory tile path for concat of a transposed src1 along dim 0 |
+| 0098 | `b9e449fdc` | vulkan/tests: guard ssm_conv_split d_conv <= 16, widen concat_transposed coverage |
+| 0099 | `8120c3ced` | chat: tool_choice none no longer returns a raw tool call as content (Qwen3.x) |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
 This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync and extended on 2026-10-08
-with the K2 fixes (0088, 0089) and the sync-workflow removal (0090): 90 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
+with the K2 fixes (0088, 0089) and the sync-workflow removal (0090), then on 2026-10-22 with the merged test/vulkan patches (0091-0098)
+and the Qwen3.x tool_choice none fix (0099): 99 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.
 

@@ -1,0 +1,353 @@
+From 8120c3cedc689e5a145f04c841bb248703043b4b Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 22 Oct 2026 13:28:12 -0500
+Subject: [PATCH] chat: tool_choice none no longer returns a raw tool call as
+ content (Qwen3.x)
+
+Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B: with tools offered and
+tool_choice "none", the reply's content was the raw
+`<tool_call>\n<function=...>...</tool_call>` block.
+
+Root cause: tool_choice none keeps the tools in the rendered prompt (as it
+should), so the model still opens a call, but the Qwen3-Coder parser
+(common/parsers/qwen3-coder.cpp, the route for Qwen3.5/Qwen3.8, Nemotron Nano 3
+and StepFun-3.5-Flash) and the differential autoparser (Qwen3 and other
+marker-based templates) fall back to a content-only parser, `content(rest())`,
+under tool_choice none. Nothing stopped the opener from being sampled, and the
+whole call was returned as message content.
+
+Reproduction (CPU, Qwen3.5-0.8B-Q8_0, which shares the Qwen3.8 template route
+and vocab): "What is the weather in Paris right now? Use the tool." with a
+get_weather tool and tool_choice none returned
+content="<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n..."
+in all four of stream on/off x thinking on/off.
+
+Fix, the same two halves as the K2-Horizon fix (fork PR #16):
+- generation: common_chat_params gains `suppressed_tokens`. Under tool_choice
+  none with tools offered, both parsers name the call opener (`<tool_call>`;
+  the autoparser uses its grammar trigger marker), and common_chat_session bans
+  it with a -inf logit bias when it is one non-normal token. A plain-text marker
+  is left alone so no ordinary word piece is ever banned. The model then writes
+  a text answer instead of a call it cannot make.
+- parsing: the content-only parser used under tool_choice none ends the content
+  at the opener and drops the rest, so a call the model still spells out (or a
+  marker that could not be banned) is neither a tool call nor content.
+
+After: tool_choice none returns plain text, no <tool_call>, finish_reason stop,
+in all four modes; tool_choice auto still returns the get_weather call.
+
+Tests (tests/test-chat.cpp): Qwen3.5 and Qwen3 parse cases with and without
+reasoning, and test_tool_choice_none_suppresses_call_opener, which checks the
+chat params and the session's logit bias (none vs auto, both routes), plus the
+ban itself against a real Qwen GGUF when TEST_CHAT_QWEN_GGUF names one (the
+repo's vocab files have no <tool_call> token).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat-auto-parser-generator.cpp |  18 ++++-
+ common/chat-auto-parser.h             |   3 +
+ common/chat.cpp                       |  12 +++
+ common/chat.h                         |   3 +
+ common/parsers/qwen3-coder.cpp        |  10 +++
+ tests/test-chat.cpp                   | 112 ++++++++++++++++++++++++++
+ 6 files changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index c6e37d818f..65a3b6f574 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -74,6 +74,11 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+             ((inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !trigger_marker.empty()) ||
+               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+ 
++    if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !trigger_marker.empty()) {
++        // the tools stay in the prompt, so the model may still open a call: keep it from sampling the opener
++        data.suppressed_tokens.push_back(trim_whitespace(trigger_marker));
++    }
++
+     if (include_grammar) {
+         data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+@@ -127,6 +132,10 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
+             parser = tools.build_parser(ctx);
+             pure_content = false;
+         } else {
++            if (has_tools && tools.format.mode != tool_format::NONE) {
++                ctx.dropped_call_marker = !tools.format.section_start.empty() ? tools.format.section_start :
++                                                                                tools.format.per_call_start;
++            }
+             parser = content.build_parser(ctx);
+         }
+         const std::string reasoning_start = trim_whitespace(reasoning.start);
+@@ -167,12 +176,17 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
++    auto body = p.content(p.rest());
++    const std::string marker = trim_whitespace(ctx.dropped_call_marker);
++    if (!marker.empty()) {
++        body = p.content(p.until(marker)) + p.optional(p.literal(marker) + p.rest());
++    }
+     if (ctx.extracting_reasoning) {
+         // Drop whitespace between the reasoning end tag and the content, only when reasoning was
+         // actually parsed out, so a model with no reasoning tags keeps any leading whitespace it emits.
+-        return ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end();
++        return ctx.reasoning_parser + p.space() + body + p.end();
+     }
+-    return ctx.reasoning_parser + p.content(p.rest()) + p.end();
++    return ctx.reasoning_parser + body + p.end();
+ }
+ 
+ common_peg_parser analyze_content::build_optional_wrapped(parser_build_context & ctx) const {
+diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
+index 8ae15c91e1..f05e929a84 100644
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -230,6 +230,9 @@ struct parser_build_context {
+     bool                              extracting_reasoning = false;
+     const analyze_reasoning *         reasoning            = nullptr;
+     const analyze_content *           content              = nullptr;
++    // tool_choice none with tools offered: the template's tool call marker. The content ends there and a call the
++    // model emits anyway is dropped, it is neither a tool call nor content
++    std::string                       dropped_call_marker;
+ 
+     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
+ };
+diff --git a/common/chat.cpp b/common/chat.cpp
+index e02ba28ae8..5a1c189010 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -17,6 +17,7 @@
+ #include "peg-parser.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <ctime>
+@@ -1834,6 +1835,14 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+         preserved_tokens = std::move(resolved.preserved_tokens);
+         grammar_triggers = std::move(resolved.grammar_triggers);
+ 
++        for (const auto & text : applied.suppressed_tokens) {
++            const auto ids = common_tokenize(vocab, text, false, true);
++            // a plain-text marker is left alone: banning one of its pieces would ban ordinary words
++            if (ids.size() == 1 && llama_vocab_get_attr(vocab, ids[0]) != LLAMA_TOKEN_ATTR_NORMAL) {
++                suppressed_tokens.push_back(ids[0]);
++            }
++        }
++
+         delimiters.tokenize(vocab);
+     } else {
+         grammar_triggers = std::move(applied.grammar_triggers);
+@@ -1856,6 +1865,9 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
+     sampling.generation_prompt = generation_prompt_text;
+     sampling.preserved_tokens.insert(preserved_tokens.begin(), preserved_tokens.end());
+     sampling.grammar_triggers.insert(sampling.grammar_triggers.end(), grammar_triggers.begin(), grammar_triggers.end());
++    for (const auto token : suppressed_tokens) {
++        sampling.logit_bias.push_back({ token, -INFINITY });
++    }
+ }
+ 
+ const common_chat_msg & common_chat_session::feed(const common_chat_input & chunk) {
+diff --git a/common/chat.h b/common/chat.h
+index cdc2bdc515..b7d5307b71 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -318,6 +318,8 @@ struct common_chat_params {
+     std::vector<common_grammar_trigger> grammar_triggers;
+     std::vector<std::string>            preserved_tokens;
+     std::vector<std::string>            additional_stops;
++    // never sampled, e.g. the tool call opener under tool_choice none; applied only to a text that is one special token
++    std::vector<std::string>            suppressed_tokens;
+     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
+     // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
+     std::vector<std::string>            no_empty_reply_inert;
+@@ -455,6 +457,7 @@ class common_chat_session {
+     bool                                grammar_lazy = false;
+     std::vector<common_grammar_trigger> grammar_triggers;
+     std::set<llama_token>               preserved_tokens;
++    std::vector<llama_token>            suppressed_tokens;
+     std::vector<std::string>            stops;
+     std::vector<std::string>            stops_after_reasoning_;
+     std::vector<std::string>            no_empty_reply_inert_;
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index 625b2621c5..8061ee837e 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -183,10 +183,20 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+                    (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
+         }
+ 
++        // tool_choice none with tools offered: a call the model emits anyway is neither a call nor content
++        if (has_tools) {
++            return generation_prompt + (reasoning << p.content(p.until_one_of(tool_call_starts)) << p.rest());
++        }
++
+         // Content only parser
+         return generation_prompt + (reasoning << p.content(p.rest()));
+     });
+ 
++    if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
++        // the tools stay in the prompt, so the model may still open a call: keep it from sampling the opener
++        data.suppressed_tokens = { "<tool_call>" };
++    }
++
+     if (include_grammar) {
+         data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+ 
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 4caff52319..14660125ba 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -16,6 +16,7 @@
+ #include "log.h"
+ 
+ #include <random>
++#include <cmath>
+ #include <algorithm>
+ #include <exception>
+ #include <fstream>
+@@ -2171,6 +2172,31 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+         "const": "42"
+     })";
+ 
++    {
++        // Qwen3 (autoparser): tool_choice none with tools offered, a call the model emits anyway is neither a call
++        // nor content
++        auto tst = peg_tester("models/templates/Qwen-Qwen3-0.6B.jinja", detailed_debug);
++        const std::string call = "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>";
++        tst.test("Hello, world!\nWhat's up?\n\n" + call)
++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++            .tools({ special_function_tool })
++            .expect_content("Hello, world!\nWhat's up?")
++            .run();
++        tst.test("<think>\nI'm\nthinking\n</think>\n\n" + call)
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++            .tools({ special_function_tool })
++            .expect_reasoning("I'm\nthinking")
++            .expect_content("")
++            .run();
++        tst.test("Hello, world!\nWhat's up?\n\n" + call)
++            .tools({ special_function_tool })
++            .expect_content("Hello, world!\nWhat's up?")
++            .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
++            .run();
++    }
++
+     {
+         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
+         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
+@@ -2200,6 +2226,30 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect_rules({ "tool-0", "tool-0-arg-0" })
+             .run();
+ 
++        // tool_choice none with tools offered: a call the model emits anyway (Qwen3.8 QA) is neither a call nor content,
++        // the raw <tool_call> block used to be returned as the message content
++        for (bool thinking : { false, true }) {
++            const std::string call =
++                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
++            const std::string prefix = thinking ? "I'm\nthinking\n</think>\n\n" : "";
++            tst.test(prefix + "Hello, world!\nWhat's up?\n\n" + call)
++                .enable_thinking(thinking)
++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++                .tools({ special_function_tool })
++                .expect_reasoning(thinking ? "I'm\nthinking" : "")
++                .expect_content("Hello, world!\nWhat's up?")
++                .run();
++            tst.test(prefix + call)
++                .enable_thinking(thinking)
++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
++                .tools({ special_function_tool })
++                .expect_reasoning(thinking ? "I'm\nthinking" : "")
++                .expect_content("")
++                .run();
++        }
++
+         tst.test(
+                "I'm\nthinking\n</think>\n\n"
+                "<tool_call>\n"
+@@ -8342,6 +8392,67 @@ static void test_k2_empty_parse_is_not_raw_text() {
+     LOG_ERR("%s passed\n", __func__);
+ }
+ 
++// tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
++// the raw <tool_call> block came back as content). The chat params name the opener and the session bans it when it is
++// one special token; a plain-text opener (several tokens) is left alone. Both routes: the Qwen3-Coder/Qwen3.5 parser
++// and the autoparser (Qwen3). The repo's vocab files have no <tool_call> token, so the ban itself is checked against
++// a real Qwen GGUF when TEST_CHAT_QWEN_GGUF names one (loaded vocab-only).
++static void test_tool_choice_none_suppresses_call_opener() {
++    LOG_DBG("%s\n", __func__);
++    common_chat_msg user;
++    user.role    = "user";
++    user.content = "What is the weather in Paris?";
++
++    const char *       real = getenv("TEST_CHAT_QWEN_GGUF");
++    llama_model_params mparams = llama_model_default_params();
++    mparams.vocab_only         = true;
++    for (const char * vocab_path : { "models/ggml-vocab-qwen35.gguf", real }) {
++        if (vocab_path == nullptr || *vocab_path == 0) {
++            continue;
++        }
++        llama_model * model = llama_model_load_from_file(vocab_path, mparams);
++        if (model == nullptr) {
++            throw std::runtime_error(std::string("failed to load ") + vocab_path);
++        }
++        const llama_vocab * vocab  = llama_model_get_vocab(model);
++        const auto          opener = common_tokenize(vocab, "<tool_call>", false, true);
++        const bool          single = opener.size() == 1 && llama_vocab_get_attr(vocab, opener[0]) != LLAMA_TOKEN_ATTR_NORMAL;
++        if (vocab_path == real && !single) {
++            throw std::runtime_error(std::string(vocab_path) + ": <tool_call> is not one special token");
++        }
++
++        for (const char * path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen-Qwen3-0.6B.jinja" }) {
++            auto tmpls = read_templates(path);
++            for (auto choice : { COMMON_CHAT_TOOL_CHOICE_NONE, COMMON_CHAT_TOOL_CHOICE_AUTO }) {
++                common_chat_templates_inputs inputs;
++                inputs.messages              = { user };
++                inputs.add_generation_prompt = true;
++                inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
++                inputs.tools                 = { special_function_tool };
++                inputs.tool_choice           = choice;
++
++                const bool none = choice == COMMON_CHAT_TOOL_CHOICE_NONE;
++                if (common_chat_templates_apply(tmpls.get(), inputs).suppressed_tokens !=
++                    (none ? std::vector<std::string>{ "<tool_call>" } : std::vector<std::string>{})) {
++                    throw std::runtime_error(std::string(path) + ": unexpected suppressed_tokens");
++                }
++
++                common_chat_session    session(tmpls.get(), vocab, inputs);
++                common_params_sampling sampling;
++                session.apply_sampling(sampling);
++                const bool banned = std::any_of(sampling.logit_bias.begin(), sampling.logit_bias.end(), [](const llama_logit_bias & lb) {
++                    return std::isinf(lb.bias) && lb.bias < 0;
++                });
++                if (banned != (none && single)) {
++                    throw std::runtime_error(std::string(path) + " / " + vocab_path + ": unexpected <tool_call> ban " + (banned ? "present" : "missing"));
++                }
++            }
++        }
++        llama_model_free(model);
++    }
++    LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
++}
++
+ // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
+ // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
+ // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
+@@ -8958,6 +9069,7 @@ int main(int argc, char ** argv) {
+         test_k2_history_reasoning();
+         test_k2_guard_fields();
+         test_k2_empty_parse_is_not_raw_text();
++        test_tool_choice_none_suppresses_call_opener();
+         test_translate_gemma();
+         test_deepseek_v4_thinking_retention();
+         test_deepseek_v4_tool_result_ordering();
+-- 
+2.43.0
+

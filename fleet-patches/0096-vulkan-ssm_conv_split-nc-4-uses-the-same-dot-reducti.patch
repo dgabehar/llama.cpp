@@ -1,0 +1,189 @@
+From ec08844363567f97d57e2e4033c38b2aa49435e0 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 21 Oct 2026 16:24:23 -0500
+Subject: [PATCH] vulkan: ssm_conv_split nc==4 uses the same dot() reduction as
+ ssm_conv, for bit-identical output
+
+The sequential sum differed from ssm_conv.comp's dot(vec4,vec4) by ~1e-7 relative; the
+Flash-Next MoE model amplifies that (router flips) into KLD 0.0145 vs the concat graph.
+Also adds model-shaped SSM_CONV_SPLIT (+silu) and a gather/matmul/write-back graph test.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ .../vulkan-shaders/ssm_conv_split.comp        | 32 ++++----
+ tests/test-backend-ops.cpp                    | 77 ++++++++++++++++++-
+ 2 files changed, 93 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
+index 1a693d902..5c76c1825 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv_split.comp
+@@ -16,8 +16,7 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+ // nt_nb0 is therefore a real, possibly non-4-byte stride, unlike every other
+ // stride here. This op is never fused with bias/silu (ggml_vk_can_fuse_ssm_conv
+ // only matches the plain GGML_OP_SSM_CONV enum), so there is no APPLY_BIAS/
+-// APPLY_SILU path and no vec4 fast path for nc == 4 -- the strided NewTokens
+-// read can't use it.
++// APPLY_SILU path; nc == 4 uses the same dot() reduction as ssm_conv.comp for identical rounding.
+ layout(binding = 0) readonly buffer Prefix    { float prefix[]; };
+ layout(binding = 1) readonly buffer NewTokens { float new_tokens[]; };
+ layout(binding = 2) readonly buffer ConvW     { float conv_w[]; };
+@@ -44,22 +43,29 @@ void main() {
+     const uint nt_base = i3 * (nt_nb2 / 4) + i1 * (nt_nb1 / 4);
+     const uint c_base  = i1 * c_nb1 / 4;
+ 
+-    float sum = 0.0;
+-
+-    // d_conv taps: tap i0 reads logical position (i2 + i0) of
+-    // concat(prefix, new_tokens) without materializing it.
+-    [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
++    // Gather the d_conv taps of this window: tap i0 is logical position (i2 + i0) of
++    // concat(prefix, new_tokens), read without materializing it.
++    float v[16];
++    [[unroll]] for (uint i0 = 0; i0 < nc && i0 < 16; i0++) {
+         const uint pos = i2 + i0;
+-
+-        float v;
+         if (pos < dm1) {
+-            v = prefix[p_base + pos];
++            v[i0] = prefix[p_base + pos];
+         } else {
+-            const uint nt_pos = pos - dm1;
+-            v = new_tokens[nt_base + nt_pos * (nt_nb0 / 4)];
++            v[i0] = new_tokens[nt_base + (pos - dm1) * (nt_nb0 / 4)];
+         }
++    }
+ 
+-        sum += v * conv_w[c_base + i0];
++    float sum = 0.0;
++    if (nc == 4) {
++        // same reduction as ssm_conv.comp's nc == 4 path, so the result is bit-identical to
++        // the concat + ssm_conv graph (the model is sensitive enough that a different
++        // summation order flips MoE routing and shows up as KL divergence)
++        sum = dot(vec4(v[0], v[1], v[2], v[3]),
++                  vec4(conv_w[c_base], conv_w[c_base + 1], conv_w[c_base + 2], conv_w[c_base + 3]));
++    } else {
++        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
++            sum += v[i0] * conv_w[c_base + i0];
++        }
+     }
+ 
+     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 35121eb8c..17027daed 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4565,17 +4565,19 @@ struct test_ssm_conv_split : public test_case {
+     const std::array<int64_t, 3> ne_new_tokens; // [n_t, d_inner, n_s], logical shape
+     const std::array<int64_t, 2> ne_c;          // [d_conv, d_inner]
+     const bool transpose_new;
++    const bool silu; // apply ggml_silu to the result, as the qwen35/qwen4exp callers do
+ 
+     std::string vars() override {
+-        return VARS_TO_STR5(type, ne_prefix, ne_new_tokens, ne_c, transpose_new);
++        return VARS_TO_STR6(type, ne_prefix, ne_new_tokens, ne_c, transpose_new, silu);
+     }
+ 
+     test_ssm_conv_split(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 3> ne_prefix     = {3, 10, 1},
+             std::array<int64_t, 3> ne_new_tokens = {10, 10, 1},
+             std::array<int64_t, 2> ne_c          = {4, 10},
+-            bool transpose_new = false)
+-        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new) {}
++            bool transpose_new = false,
++            bool silu = false)
++        : type(type), ne_prefix(ne_prefix), ne_new_tokens(ne_new_tokens), ne_c(ne_c), transpose_new(transpose_new), silu(silu) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * prefix = ggml_new_tensor_3d(ctx, type, ne_prefix[0], ne_prefix[1], ne_prefix[2]);
+@@ -4593,10 +4595,66 @@ struct test_ssm_conv_split : public test_case {
+         }
+ 
+         ggml_tensor * out = ggml_ssm_conv_split(ctx, prefix, new_tokens, c);
++        if (silu) {
++            out = ggml_silu(ctx, out);
++        }
+         return out;
+     }
+ };
+ 
++// Graph-level mimic of qwen4exp's GDN conv: gather the conv state rows, qkv = mul_mat(w, x),
++// split conv on transpose(qkv), silu, and write the new tail back into the SAME state row that
++// was gathered. The write-back depends only on qkv, not on the gather, so this checks that the
++// backend orders the gather before the write.
++struct test_ssm_conv_split_graph : public test_case {
++    const int64_t channels, n_t, n_embd;
++
++    std::string vars() override { return VARS_TO_STR3(channels, n_t, n_embd); }
++
++    test_ssm_conv_split_graph(int64_t channels = 10240, int64_t n_t = 2048, int64_t n_embd = 128)
++        : channels(channels), n_t(n_t), n_embd(n_embd) {}
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int32_t> v(ggml_nelements(t), 0);
++                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t dm1 = 3;
++        ggml_tensor * state_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dm1 * channels, 4);
++        ggml_tensor * ids       = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++        ggml_tensor * w         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, channels);
++        ggml_tensor * x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t);
++        ggml_tensor * kern      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
++
++        ggml_tensor * rows  = ggml_get_rows(ctx, state_all, ids);
++        ggml_tensor * state = ggml_reshape_3d(ctx, rows, dm1, channels, 1);
++
++        ggml_tensor * qkv = ggml_mul_mat(ctx, w, x);
++        qkv = ggml_reshape_3d(ctx, qkv, channels, n_t, 1);
++        ggml_tensor * nt = ggml_transpose(ctx, qkv);
++
++        // tail = last dm1 tokens of nt, made contiguous (n_t >= dm1)
++        ggml_tensor * tv = ggml_view_3d(ctx, nt, dm1, channels, 1, nt->nb[1], nt->nb[2], (n_t - dm1) * nt->nb[0]);
++        tv->nb[0] = nt->nb[0];
++        ggml_tensor * dst = ggml_view_2d(ctx, state_all, dm1 * channels, 1, state_all->nb[1], 0);
++        ggml_tensor * cp  = ggml_cpy(ctx, ggml_cont(ctx, tv), dst);
++
++        ggml_tensor * conv = ggml_ssm_conv_split(ctx, state, nt, kern);
++        conv = ggml_silu(ctx, conv);
++
++        // make the output depend on the write-back so both are in the graph
++        ggml_tensor * cp_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, cp), dm1 * channels);
++        return ggml_concat(ctx, ggml_reshape_1d(ctx, conv, channels * n_t), cp_flat, 0);
++    }
++};
++
+ // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
+ struct test_ssm_conv_bias_silu : public test_case {
+     const ggml_type type;
+@@ -10622,6 +10680,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // model-shaped (qwen4exp GDN: d_conv 4, 10240 channels), transposed x, then silu
++    for (int64_t n_t : {1, 2, 3, 7, 33, 100, 512, 2048}) {
++        for (int64_t n_s : {1, 2}) {
++            for (bool silu : {false, true}) {
++                test_cases.emplace_back(new test_ssm_conv_split(GGML_TYPE_F32, {3, 10240, n_s}, {n_t, 10240, n_s}, {4, 10240}, true, silu));
++            }
++        }
++    }
++
++    for (int64_t n_t : {64, 512, 2048}) {
++        test_cases.emplace_back(new test_ssm_conv_split_graph(10240, n_t));
++    }
++
+     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
+     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
+     for (int64_t d_conv : {3, 4, 9}) {
+-- 
+2.43.0
+
