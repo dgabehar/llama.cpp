@@ -21,7 +21,7 @@ below). The old `.github/workflows/sync-with-upstream.yml` (weekly rebase + forc
 `sync-fleet-patches.yml` was removed on 2026-10-08 (mirror patch 0090) -- a rebase + force-push would
 clobber the merge history. `fleet-patches/regenerate.sh` needs `BASE=<last merged upstream sha>
 TIP=origin/fleet-patches EXCLUDE=<old pre-landing tip>` on this branch (see the script header):
-`BASE=4625240437c6821ee5c2da99e12d4817c6a8f07f EXCLUDE=38773736370e66abffbdb1af4805612055e87953`.
+`BASE=36e36e63a54fc8f85b95e9c499a022b597e478dd EXCLUDE=38773736370e66abffbdb1af4805612055e87953` (BASE = the upstream commit last merged; 2026-10-23 sync).
 
 ## K2 fixes after the adoption (added 2026-10-08)
 
@@ -100,6 +100,35 @@ rule for this repo. Regenerate the mirror afterward.
 applies to this fork too, not just upstream contributions (`AGENTS.md`'s
 push/PR restriction is written for upstream, but this fork follows the same
 discipline by standing convention).
+
+## Upstream sync 2026-10-23 (merged upstream `36e36e63a`, added 2026-10-23)
+
+Branch `upstream-sync-2026-10-23` (worktree `.worktrees/2026-10-23-upstream-sync`): `git merge upstream/master` into
+`fleet-patches` @ `96cde51a3` (merge commit, no rebase, no force-push; 135 upstream commits since the 2026-10-17 merge
+`ea0c4c2c8`). Rollback anchor: tag `pre-merge-2026-10-23` (`96cde51a3`, pushed). Mirror = 106 patches (one new: 0106).
+
+**Conflicts (3, all textual):**
+- `tests/CMakeLists.txt`: upstream added `LABEL` args to every test; took upstream's lines and re-added the fork tests
+  (`test-empty-reply-guard`, `test-split-balance`, `test-fit-clamp`, `test-cpu-device-split`) with `LABEL behavior`.
+- `tools/server/server-context.cpp`: fork `mark_captures_decoded`/`create_captured_checkpoints` and upstream's new
+  `process_tts_slots` sat at the same spot; kept both.
+- `tools/server/tests/utils.py`: fork `cpu_split`/`cpu_locality_sysfs_root` plus upstream `llama_cache`; kept both.
+
+**Semantic fix (patch 0106):** upstream added `GGML_OP_TOP_K_MASK` (QSA mask, d454a204e) and the fork has
+`GGML_OP_SSM_CONV_SPLIT`; `GGML_OP_COUNT` is 103, so the two `static_assert`s in `ggml/src/ggml.c` and the one in
+`ggml/include/ggml-rpc.h` were bumped, and `RPC_PROTO_PATCH_VERSION` 1 -> 2 (op enum changed; `RPC_PROTO_MAJOR_VERSION` stays 8).
+Both ops stay at the enum end; the fork's op is last.
+
+**Checks:** `LLAMA_STATE_SEQ_VERSION` 4 (unchanged, deployed 4), `LLAMA_SESSION_VERSION` 11. Every flag in
+`deployments/llamacpp-rpc/values-*.yaml` args is still in `llama-server --help`. K2: `test-chat` K2 blocks and
+`test_k2_guard_fields` pass, startup log `K2-Horizon parser: guard inert=6 hold=10` (no specialized parser pre-empts the fork K2
+handling). qwen4exp: upstream d9ee007a0 (DFlash layer inputs, `hc_stream_mean`) and d454a204e (fused QSA mask) auto-merged
+with the fork's `ggml_ssm_conv_split` use intact.
+
+**Verified (CPU-only build `GGML_RPC=ON`, no GPU):** `test-chat`, `test-chat-auto-parser`, `test-chat-peg-parser`,
+`test-chat-template`, `test-grammar-integration`, `test-json-schema-to-grammar`, `test-empty-reply-guard` pass;
+`test-backend-ops -b CPU -o CONCAT` 225/225 and `-o SSM_CONV_SPLIT` 136/136. Not yet: Vulkan compile of this tree, GPU parity/perf
+on the 8060S (concat/ssm_conv_split A+B), MTP/DFlash smoke, slot save/restore, image CI, canary.
 
 ## Upstream sync 2026-10-17 (merged upstream `ea0c4c2c8`, added 2026-10-17)
 

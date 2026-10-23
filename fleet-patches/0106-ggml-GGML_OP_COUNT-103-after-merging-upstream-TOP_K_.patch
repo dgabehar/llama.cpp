@@ -1,0 +1,57 @@
+From d4fa7afd860e1941ba4b4e95b185c5c29bfd349c Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 23 Oct 2026 10:30:17 -0500
+Subject: [PATCH] ggml: GGML_OP_COUNT 103 after merging upstream TOP_K_MASK
+ with the fork's SSM_CONV_SPLIT
+
+Both added an op; bump the two ggml.c static_asserts and the RPC guard, and RPC_PROTO_PATCH_VERSION 1 -> 2 (op enum changed).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ ggml/include/ggml-rpc.h | 4 ++--
+ ggml/src/ggml.c         | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 055a15c81..e6ef9a14b 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    1
++#define RPC_PROTO_PATCH_VERSION    2
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 922cf1701..cf0547fee 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1112,7 +1112,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "SSM_CONV_SPLIT",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1230,7 +1230,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "ssm_conv_split(prefix, new_tokens, c)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+-- 
+2.43.0
+

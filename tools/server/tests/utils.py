@@ -130,6 +130,7 @@ class ServerProcess:
     cors_origins: str | None = None
     cpu_split: Literal['auto', 'off'] | None = None
     cpu_locality_sysfs_root: str | None = None
+    llama_cache: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -148,7 +149,9 @@ class ServerProcess:
             **os.environ,
             "LLAMA_SERVER_DEBUG_FAKE_TIMING": "1",
         }
-        if "LLAMA_CACHE" not in os.environ:
+        if self.llama_cache is not None:
+            env["LLAMA_CACHE"] = self.llama_cache
+        elif "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
