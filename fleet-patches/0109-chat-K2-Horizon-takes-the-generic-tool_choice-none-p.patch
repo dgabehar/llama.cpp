@@ -1,0 +1,182 @@
+From c5a8d3485bf6b6d804d142123addf2a96e41ffc9 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 23 Oct 2026 13:14:56 -0500
+Subject: [PATCH] chat: K2-Horizon takes the generic tool_choice none path
+
+With K2 rendered without tools under none, its think block no longer ends at a
+call, and the drops_calls_under_none opt-out skipped the opener cut, so
+"Thinking then call directly <ifm|tool_calls>..." leaked the raw call markup
+into reasoning_content (found in review of the previous commit).
+
+Remove the opt-out (flag, session branch, chat.h field; K2 was its only user)
+so K2 gets the normal none handling: opener cut and ban of single-special-token
+openers. K2 also writes Kimi-form calls, which are not grammar triggers (a
+trigger would constrain that form under auto), so common_chat_params gets
+extra_call_openers, cut under none only.
+
+Test (tests/test-chat.cpp, failing first on both K2 templates):
+test_k2_tool_choice_none_cuts_calls covers a call while thinking, after a
+closed think block, a Kimi-form call after a closed block and while thinking,
+and a plain reply.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ FLEET.md                      |  4 +--
+ common/chat.cpp               |  8 +++---
+ common/chat.h                 |  4 +--
+ common/parsers/k2-horizon.cpp |  6 ++---
+ tests/test-chat.cpp           | 50 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 61 insertions(+), 11 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index 51f5bcebd..1e2992a7e 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -64,8 +64,8 @@ partial opener or tool tag is held back while streaming. If the none parser fail
+ parser's message is used without its calls. Every call opener that is one special token is banned (-inf logit bias),
+ so the call is not generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony
+ pattern set anchored on `<|...|>`) or one special token; only word openers and `<|`-anchored patterns cut (anchors
+-kept, so harmony's `^\s+to$` never cuts prose). A parser that drops calls itself opts out (`drops_calls_under_none`,
+-K2-Horizon).
++kept, so harmony's `^\s+to$` never cuts prose). K2-Horizon has no opt-out any more (patch 0109 removed `drops_calls_under_none`): it takes this path, and also
++cuts its Kimi-form openers (`common_chat_params::extra_call_openers`, no grammar trigger).
+ 
+ Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
+ (`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 0c014a6d2..514cbce14 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1869,10 +1869,7 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+     // has a parser for its calls: parse as under auto, drop the calls, and ban an opener that is one special token so
+     // the call is not generated at all. Only when every opener is tag-like or one special token: a plain-word opener
+     // (`functools`, `Action:`) can be ordinary text, so it keeps the content-only parser.
+-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && applied.drops_calls_under_none) {
+-        drop_calls         = true;
+-        none_parser_params = parser_params;
+-    } else if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
++    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
+         auto auto_inputs        = inputs;
+         auto_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+         std::optional<common_chat_params> as_auto;
+@@ -1909,6 +1906,9 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+                 parser_params.format      = as_auto->format;
+                 parser_params.parser      = std::move(as_auto->parser);
+                 call_openers              = as_auto->grammar_triggers;
++                for (const auto & opener : as_auto->extra_call_openers) {
++                    call_openers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, opener });
++                }
+                 // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
+                 for (const auto & tag : as_auto->preserved_tokens) {
+                     if (tag.find("tool") != std::string::npos) {
+diff --git a/common/chat.h b/common/chat.h
+index 9a2a94cb8..aac61f701 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -318,8 +318,8 @@ struct common_chat_params {
+     std::vector<common_grammar_trigger> grammar_triggers;
+     std::vector<std::string>            preserved_tokens;
+     std::vector<std::string>            additional_stops;
+-    // the parser itself drops a call the model emits under tool_choice none, see common_chat_session
+-    bool                                drops_calls_under_none = false;
++    // call openers beyond grammar_triggers (no grammar trigger: a trigger would constrain that form), cut under tool_choice none
++    std::vector<std::string>            extra_call_openers;
+     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
+     // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
+     std::vector<std::string>            no_empty_reply_inert;
+diff --git a/common/parsers/k2-horizon.cpp b/common/parsers/k2-horizon.cpp
+index 873b9678e..3dfa0c17f 100644
+--- a/common/parsers/k2-horizon.cpp
++++ b/common/parsers/k2-horizon.cpp
+@@ -76,6 +76,9 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
+     // Kimi-form call (`<|tool_call_begin|>name<|sep|>{json}<|tool_call_end|>`), also emitted by the model
+     const std::vector<std::string> kimi_openers = { "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
+ 
++    // the model also writes Kimi-form calls: cut them too under tool_choice none
++    data.extra_call_openers = kimi_openers;
++
+     data.thinking_start_tag = THINK_START;
+     data.thinking_end_tags  = close_tags;
+ 
+@@ -86,9 +89,6 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
+         ARG_KEY, ARG_KEY_END, ARG_TYPE, ARG_TYPE_END, ARG_VAL, ARG_VAL_END,
+     });
+ 
+-    // tool_choice none: the lenient shapes below drop a call and its stray tags themselves (fork PR #16)
+-    data.drops_calls_under_none = true;
+-
+     data.message_delimiters = {
+         { COMMON_CHAT_ROLE_ASSISTANT, "<|ifm|im_start|>assistant" },
+         { COMMON_CHAT_ROLE_USER,      "<|ifm|im_start|>user"      },
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index bde80e039..1bf7647a7 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -8730,6 +8730,55 @@ static void test_tool_choice_none_suppresses_call_opener() {
+     LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
+ }
+ 
++// K2-Horizon under tool_choice none with tools offered (no opt-out: K2 takes the generic none path, the tools are not in
++// the prompt). A call the model still writes is cut from reasoning and content, whether it comes while "thinking", after
++// a closed think block, or in the Kimi form; a plain reply is untouched.
++static void test_k2_tool_choice_none_cuts_calls() {
++    LOG_DBG("%s\n", __func__);
++    common_chat_msg user;
++    user.role    = "user";
++    user.content = "What is the weather in Paris?";
++    const std::string call = "<ifm|tool_calls>\n<ifm|tool_call>special_function\n<ifm|arg_key>arg1</ifm|arg_key>\n"
++                             "<ifm|arg_value>1</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
++    const std::string kimi = "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|sep|>{\"arg1\": 1}"
++                             "<|tool_call_end|><|tool_calls_section_end|>";
++    struct sample {
++        std::string text, reasoning, content;
++    };
++    const std::vector<sample> samples = {
++        { "Thinking then call directly " + call, "Thinking then call directly", "" },
++        { "Thinking.</ifm|think>" + call, "Thinking.", "" },
++        { "Thinking.</ifm|think>" + kimi, "Thinking.", "" },
++        { "Thinking then kimi " + kimi, "Thinking then kimi", "" },
++        { "Thinking.</ifm|think>Paris is in France.", "Thinking.", "Paris is in France." },
++    };
++    for (const char * path : { "models/templates/k2-horizon.jinja", "models/templates/IFM-K2-Horizon.jinja" }) {
++        auto tmpls = read_templates(path);
++        common_chat_templates_inputs inputs;
++        inputs.messages              = { user };
++        inputs.add_generation_prompt = true;
++        inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
++        inputs.tools                 = { special_function_tool };
++        inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
++        for (const auto & sm : samples) {
++            common_chat_session session(tmpls.get(), nullptr, inputs);
++            const auto msg = session.finish(common_chat_input(sm.text));
++            const std::string what = std::string(path) + " / " + sm.text.substr(0, 40);
++            if (!msg.tool_calls.empty()) {
++                throw std::runtime_error(what + ": a tool call under none");
++            }
++            for (const std::string & field : { msg.reasoning_content, msg.content }) {
++                if (field.find("<ifm|") != std::string::npos || field.find("<|tool_call") != std::string::npos) {
++                    throw std::runtime_error(what + ": call markup leaked: " + field);
++                }
++            }
++            assert_equals(sm.reasoning, string_strip(msg.reasoning_content));
++            assert_equals(sm.content, string_strip(msg.content));
++        }
++    }
++    LOG_ERR("%s passed\n", __func__);
++}
++
+ // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
+ // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
+ // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
+@@ -9348,6 +9397,7 @@ int main(int argc, char ** argv) {
+         test_k2_empty_parse_is_not_raw_text();
+         test_tool_choice_none_suppresses_call_opener();
+         test_tool_choice_none_omits_tools();
++        test_k2_tool_choice_none_cuts_calls();
+         test_translate_gemma();
+         test_deepseek_v4_thinking_retention();
+         test_deepseek_v4_tool_result_ordering();
+-- 
+2.43.0
+

@@ -76,6 +76,9 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
     // Kimi-form call (`<|tool_call_begin|>name<|sep|>{json}<|tool_call_end|>`), also emitted by the model
     const std::vector<std::string> kimi_openers = { "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
 
+    // the model also writes Kimi-form calls: cut them too under tool_choice none
+    data.extra_call_openers = kimi_openers;
+
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tags  = close_tags;
 
@@ -85,9 +88,6 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
         SECTION_START, SECTION_END, CALL_START, CALL_END,
         ARG_KEY, ARG_KEY_END, ARG_TYPE, ARG_TYPE_END, ARG_VAL, ARG_VAL_END,
     });
-
-    // tool_choice none: the lenient shapes below drop a call and its stray tags themselves (fork PR #16)
-    data.drops_calls_under_none = true;
 
     data.message_delimiters = {
         { COMMON_CHAT_ROLE_ASSISTANT, "<|ifm|im_start|>assistant" },

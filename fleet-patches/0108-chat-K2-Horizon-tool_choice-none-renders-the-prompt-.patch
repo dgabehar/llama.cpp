@@ -1,0 +1,100 @@
+From 597e8cc3141d4ea41296ff33703e2c8dc58a0218 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 23 Oct 2026 13:00:33 -0500
+Subject: [PATCH] chat: K2-Horizon tool_choice none renders the prompt without
+ the tools too
+
+Live QA of the 2026-10-23 widen sync (home-infrastructure
+docs/qa/widen-sync-post-roll-qa-2026-10-23.md item 10): K2-Horizon-7B with
+tools offered and tool_choice none returned content "" (finish stop,
+reasoning only). Cause: the PR #23 carve-out kept the tools in the K2 prompt.
+The model answers a tool-worthy question with a call (raw /completion: 43
+tokens, reasoning then <ifm|tool_calls>...), the K2 parser's
+stops_after_reasoning ends generation at the call opener and the call is
+dropped, so nothing is left as content. Not max_tokens (same 26 tokens at
+3000) and not the empty-reply guard (it only masks EOG; the stop is the
+parser's). Same request with tool_choice none and no tools, auto/no tools,
+and no tool_choice all give non-empty answers at temperature 0.
+
+Drop the carve-out: under none the K2 prompt has no tool list, as for every
+other template. The K2 parser's own call dropping stays as the safety net.
+
+Test (tests/test-chat.cpp, failing first: IFM-K2-Horizon.jinja still
+rendered the tools): test_tool_choice_none_omits_tools now requires no tool
+definition for K2-Horizon too, and a K2 history with a call and its result
+still renders under none.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp     |  5 +++--
+ tests/test-chat.cpp | 21 +++++++++++++++------
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 823c99870..0c014a6d2 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1371,10 +1371,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
+     const auto & tmpl =
+         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
+-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && tmpl.params_init != common_chat_params_init_k2_horizon) {
++    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+         // tool_choice none: the tools are not rendered, so the model has nothing to call (small models wrote the call
+         // in other markup when they stayed in the prompt). The tool-use template is still picked, so a history with
+-        // tool calls and results renders as before. K2-Horizon keeps them: its parser drops a call itself.
++        // tool calls and results renders as before. K2-Horizon too: with the tools kept it answered a tool-worthy question
++        // with a call, its parser dropped the call and the client got an empty reply.
+         params.tools = json();
+     }
+     const auto & src             = tmpl.source();
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index eafb123ae..bde80e039 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -8573,8 +8573,7 @@ static void test_k2_empty_parse_is_not_raw_text() {
+ 
+ // tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
+ // saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
+-// definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
+-// drops calls itself) keeps the tools. A history with a tool call and its result still renders (Qwen3.5).
++// definition is gone under none (K2-Horizon included), and rendering never fails where the no-tools prompt renders. A history with a tool call and its result still renders (Qwen3.5).
+ static void test_tool_choice_none_omits_tools() {
+     LOG_DBG("%s\n", __func__);
+     common_chat_msg user;
+@@ -8619,10 +8618,10 @@ static void test_tool_choice_none_omits_tools() {
+         } catch (const std::exception & e) {
+             throw std::runtime_error(path + ": tool_choice none fails to render: " + e.what());
+         }
+-        const bool k2 = with_tools.find("<|ifm|im_start|>") != std::string::npos;
+-        if (k2 ? none != with_tools : none.find("I'm special") != std::string::npos) {
+-            throw std::runtime_error(path + (k2 ? ": K2-Horizon prompt changed under tool_choice none" :
+-                                                  ": tool_choice none still renders the tools"));
++        // K2-Horizon too: with the tools in the prompt it answers a tool-worthy question with a call, the parser drops
++        // the call and the client gets an empty reply (live QA, 2026-10-23)
++        if (none.find("I'm special") != std::string::npos) {
++            throw std::runtime_error(path + ": tool_choice none still renders the tools");
+         }
+         checked++;
+     }
+@@ -8650,6 +8649,16 @@ static void test_tool_choice_none_omits_tools() {
+     if (prompt.find("I'm special") != std::string::npos) {
+         throw std::runtime_error("Qwen3.5: tool_choice none still renders the tools with a tool history");
+     }
++    // K2-Horizon: the same history renders under none, with the call and its result and without the tool list
++    {
++        auto k2 = read_templates("models/templates/IFM-K2-Horizon.jinja");
++        const auto k2_prompt = common_chat_templates_apply(k2.get(), inputs).prompt.str();
++        assert_contains(k2_prompt, "special_function");
++        assert_contains(k2_prompt, "The answer is 42.");
++        if (k2_prompt.find("I'm special") != std::string::npos) {
++            throw std::runtime_error("K2-Horizon: tool_choice none still renders the tools with a tool history");
++        }
++    }
+     LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
+ }
+ 
+-- 
+2.43.0
+

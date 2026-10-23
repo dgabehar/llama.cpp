@@ -8573,8 +8573,7 @@ static void test_k2_empty_parse_is_not_raw_text() {
 
 // tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
 // saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
-// definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
-// drops calls itself) keeps the tools. A history with a tool call and its result still renders (Qwen3.5).
+// definition is gone under none (K2-Horizon included), and rendering never fails where the no-tools prompt renders. A history with a tool call and its result still renders (Qwen3.5).
 static void test_tool_choice_none_omits_tools() {
     LOG_DBG("%s\n", __func__);
     common_chat_msg user;
@@ -8619,10 +8618,10 @@ static void test_tool_choice_none_omits_tools() {
         } catch (const std::exception & e) {
             throw std::runtime_error(path + ": tool_choice none fails to render: " + e.what());
         }
-        const bool k2 = with_tools.find("<|ifm|im_start|>") != std::string::npos;
-        if (k2 ? none != with_tools : none.find("I'm special") != std::string::npos) {
-            throw std::runtime_error(path + (k2 ? ": K2-Horizon prompt changed under tool_choice none" :
-                                                  ": tool_choice none still renders the tools"));
+        // K2-Horizon too: with the tools in the prompt it answers a tool-worthy question with a call, the parser drops
+        // the call and the client gets an empty reply (live QA, 2026-10-23)
+        if (none.find("I'm special") != std::string::npos) {
+            throw std::runtime_error(path + ": tool_choice none still renders the tools");
         }
         checked++;
     }
@@ -8649,6 +8648,16 @@ static void test_tool_choice_none_omits_tools() {
     assert_contains(prompt, "<tool_response>\nThe answer is 42.");
     if (prompt.find("I'm special") != std::string::npos) {
         throw std::runtime_error("Qwen3.5: tool_choice none still renders the tools with a tool history");
+    }
+    // K2-Horizon: the same history renders under none, with the call and its result and without the tool list
+    {
+        auto k2 = read_templates("models/templates/IFM-K2-Horizon.jinja");
+        const auto k2_prompt = common_chat_templates_apply(k2.get(), inputs).prompt.str();
+        assert_contains(k2_prompt, "special_function");
+        assert_contains(k2_prompt, "The answer is 42.");
+        if (k2_prompt.find("I'm special") != std::string::npos) {
+            throw std::runtime_error("K2-Horizon: tool_choice none still renders the tools with a tool history");
+        }
     }
     LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
 }
@@ -8719,6 +8728,55 @@ static void test_tool_choice_none_suppresses_call_opener() {
         llama_model_free(model);
     }
     LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
+}
+
+// K2-Horizon under tool_choice none with tools offered (no opt-out: K2 takes the generic none path, the tools are not in
+// the prompt). A call the model still writes is cut from reasoning and content, whether it comes while "thinking", after
+// a closed think block, or in the Kimi form; a plain reply is untouched.
+static void test_k2_tool_choice_none_cuts_calls() {
+    LOG_DBG("%s\n", __func__);
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the weather in Paris?";
+    const std::string call = "<ifm|tool_calls>\n<ifm|tool_call>special_function\n<ifm|arg_key>arg1</ifm|arg_key>\n"
+                             "<ifm|arg_value>1</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
+    const std::string kimi = "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|sep|>{\"arg1\": 1}"
+                             "<|tool_call_end|><|tool_calls_section_end|>";
+    struct sample {
+        std::string text, reasoning, content;
+    };
+    const std::vector<sample> samples = {
+        { "Thinking then call directly " + call, "Thinking then call directly", "" },
+        { "Thinking.</ifm|think>" + call, "Thinking.", "" },
+        { "Thinking.</ifm|think>" + kimi, "Thinking.", "" },
+        { "Thinking then kimi " + kimi, "Thinking then kimi", "" },
+        { "Thinking.</ifm|think>Paris is in France.", "Thinking.", "Paris is in France." },
+    };
+    for (const char * path : { "models/templates/k2-horizon.jinja", "models/templates/IFM-K2-Horizon.jinja" }) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user };
+        inputs.add_generation_prompt = true;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+        inputs.tools                 = { special_function_tool };
+        inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
+        for (const auto & sm : samples) {
+            common_chat_session session(tmpls.get(), nullptr, inputs);
+            const auto msg = session.finish(common_chat_input(sm.text));
+            const std::string what = std::string(path) + " / " + sm.text.substr(0, 40);
+            if (!msg.tool_calls.empty()) {
+                throw std::runtime_error(what + ": a tool call under none");
+            }
+            for (const std::string & field : { msg.reasoning_content, msg.content }) {
+                if (field.find("<ifm|") != std::string::npos || field.find("<|tool_call") != std::string::npos) {
+                    throw std::runtime_error(what + ": call markup leaked: " + field);
+                }
+            }
+            assert_equals(sm.reasoning, string_strip(msg.reasoning_content));
+            assert_equals(sm.content, string_strip(msg.content));
+        }
+    }
+    LOG_ERR("%s passed\n", __func__);
 }
 
 // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
@@ -9339,6 +9397,7 @@ int main(int argc, char ** argv) {
         test_k2_empty_parse_is_not_raw_text();
         test_tool_choice_none_suppresses_call_opener();
         test_tool_choice_none_omits_tools();
+        test_k2_tool_choice_none_cuts_calls();
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();

@@ -44,9 +44,14 @@ argument that never completes is model repetition (offline grammar check accepts
 0.8B/4B) wrote the call in other markup (`<tool_code>`, `<function_call>`, `<function=call>`, `<tool_response>`) that
 no opener cut catches. `common_chat_templates_apply_jinja` now renders without the tools list under none, like other
 servers; the tool-use template is still picked, so a history with tool calls and results renders as before. K2-Horizon
-keeps the tools (its parser drops a call itself). `test_tool_choice_none_omits_tools` checks every template in
-`models/templates` (the tool definition is gone, none renders wherever the no-tools prompt renders, K2 unchanged) and a
-Qwen3.5 history with a call and its result. The session's drop/cut/ban below stays as the safety net for a model that
+first kept the tools (its parser drops a call itself), but that gave an empty reply: live QA 2026-10-23 saw
+`content: ""` for a tool-worthy question, because the model opened a call, the K2 parser stopped generation at the
+opener and dropped it. K2 now omits the tools like every template (patch 0108) and its `drops_calls_under_none` opt-out
+is removed (patch 0109), so it takes the generic none path (opener cut and ban); a call written while "thinking" would
+otherwise leak into `reasoning_content`. `test_tool_choice_none_omits_tools` checks every template in `models/templates`
+(the tool definition is gone, none renders wherever the no-tools prompt renders) and a Qwen3.5 and a K2-Horizon history
+with a call and its result; `test_k2_tool_choice_none_cuts_calls` covers K2 calls under none.
+The session's drop/cut/ban below stays as the safety net for a model that
 imitates a call from the history.
 
 Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B, same class as the K2 leak above: with tools offered and
@@ -64,8 +69,8 @@ partial opener or tool tag is held back while streaming. If the none parser fail
 parser's message is used without its calls. Every call opener that is one special token is banned (-inf logit bias),
 so the call is not generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony
 pattern set anchored on `<|...|>`) or one special token; only word openers and `<|`-anchored patterns cut (anchors
-kept, so harmony's `^\s+to$` never cuts prose). A parser that drops calls itself opts out (`drops_calls_under_none`,
-K2-Horizon).
+kept, so harmony's `^\s+to$` never cuts prose). K2-Horizon has no opt-out any more (patch 0109 removed `drops_calls_under_none`): it takes this path, and also
+cuts its Kimi-form openers (`common_chat_params::extra_call_openers`, no grammar trigger).
 
 Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
 (`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.

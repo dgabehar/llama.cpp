@@ -1371,10 +1371,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
     const auto & tmpl =
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && tmpl.params_init != common_chat_params_init_k2_horizon) {
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
         // tool_choice none: the tools are not rendered, so the model has nothing to call (small models wrote the call
         // in other markup when they stayed in the prompt). The tool-use template is still picked, so a history with
-        // tool calls and results renders as before. K2-Horizon keeps them: its parser drops a call itself.
+        // tool calls and results renders as before. K2-Horizon too: with the tools kept it answered a tool-worthy question
+        // with a call, its parser dropped the call and the client got an empty reply.
         params.tools = json();
     }
     const auto & src             = tmpl.source();
@@ -1868,10 +1869,7 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
     // has a parser for its calls: parse as under auto, drop the calls, and ban an opener that is one special token so
     // the call is not generated at all. Only when every opener is tag-like or one special token: a plain-word opener
     // (`functools`, `Action:`) can be ordinary text, so it keeps the content-only parser.
-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && applied.drops_calls_under_none) {
-        drop_calls         = true;
-        none_parser_params = parser_params;
-    } else if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
         auto auto_inputs        = inputs;
         auto_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
         std::optional<common_chat_params> as_auto;
@@ -1908,6 +1906,9 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                 parser_params.format      = as_auto->format;
                 parser_params.parser      = std::move(as_auto->parser);
                 call_openers              = as_auto->grammar_triggers;
+                for (const auto & opener : as_auto->extra_call_openers) {
+                    call_openers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, opener });
+                }
                 // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
                 for (const auto & tag : as_auto->preserved_tokens) {
                     if (tag.find("tool") != std::string::npos) {
