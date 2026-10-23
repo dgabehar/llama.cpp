@@ -8571,11 +8571,6 @@ static void test_k2_empty_parse_is_not_raw_text() {
     LOG_ERR("%s passed\n", __func__);
 }
 
-// tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
-// the raw <tool_call> block came back as content). The session bans an opener that is one special token, and only
-// under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
-// repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
-// TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
 // tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
 // saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
 // definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
@@ -8658,6 +8653,11 @@ static void test_tool_choice_none_omits_tools() {
     LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
 }
 
+// tool_choice none with tools offered: the tools stay in the prompt, so the model may still open a call (Qwen3.8 QA:
+// the raw <tool_call> block came back as content). The session bans an opener that is one special token, and only
+// under none: Gemma 4's `<|tool_call>` is one in the repo's gemma-4 vocab; Qwen's `<tool_call>` is plain text in the
+// repo's qwen35 vocab (it has no added tokens), so nothing is banned there. A real Qwen GGUF named by
+// TEST_CHAT_QWEN_GGUF (loaded vocab-only) checks the Qwen3.5 and Qwen3 routes with the real token.
 static void test_tool_choice_none_suppresses_call_opener() {
     LOG_DBG("%s\n", __func__);
     common_chat_msg user;
