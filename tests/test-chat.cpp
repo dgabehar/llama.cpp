@@ -8573,8 +8573,7 @@ static void test_k2_empty_parse_is_not_raw_text() {
 
 // tool_choice none renders the prompt without the tools (the model has nothing to call; real-model QA on Qwen3.5 0.8B/4B
 // saw small models write the call in other markup when the tools stayed in the prompt). Every template: the tool
-// definition is gone under none, rendering never fails where the no-tools prompt renders, and K2-Horizon (its parser
-// drops calls itself) keeps the tools. A history with a tool call and its result still renders (Qwen3.5).
+// definition is gone under none (K2-Horizon included), and rendering never fails where the no-tools prompt renders. A history with a tool call and its result still renders (Qwen3.5).
 static void test_tool_choice_none_omits_tools() {
     LOG_DBG("%s\n", __func__);
     common_chat_msg user;
@@ -8619,10 +8618,10 @@ static void test_tool_choice_none_omits_tools() {
         } catch (const std::exception & e) {
             throw std::runtime_error(path + ": tool_choice none fails to render: " + e.what());
         }
-        const bool k2 = with_tools.find("<|ifm|im_start|>") != std::string::npos;
-        if (k2 ? none != with_tools : none.find("I'm special") != std::string::npos) {
-            throw std::runtime_error(path + (k2 ? ": K2-Horizon prompt changed under tool_choice none" :
-                                                  ": tool_choice none still renders the tools"));
+        // K2-Horizon too: with the tools in the prompt it answers a tool-worthy question with a call, the parser drops
+        // the call and the client gets an empty reply (live QA, 2026-10-23)
+        if (none.find("I'm special") != std::string::npos) {
+            throw std::runtime_error(path + ": tool_choice none still renders the tools");
         }
         checked++;
     }
@@ -8649,6 +8648,16 @@ static void test_tool_choice_none_omits_tools() {
     assert_contains(prompt, "<tool_response>\nThe answer is 42.");
     if (prompt.find("I'm special") != std::string::npos) {
         throw std::runtime_error("Qwen3.5: tool_choice none still renders the tools with a tool history");
+    }
+    // K2-Horizon: the same history renders under none, with the call and its result and without the tool list
+    {
+        auto k2 = read_templates("models/templates/IFM-K2-Horizon.jinja");
+        const auto k2_prompt = common_chat_templates_apply(k2.get(), inputs).prompt.str();
+        assert_contains(k2_prompt, "special_function");
+        assert_contains(k2_prompt, "The answer is 42.");
+        if (k2_prompt.find("I'm special") != std::string::npos) {
+            throw std::runtime_error("K2-Horizon: tool_choice none still renders the tools with a tool history");
+        }
     }
     LOG_ERR("%s passed (%zu templates)\n", __func__, checked);
 }

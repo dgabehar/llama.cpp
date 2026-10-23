@@ -1371,10 +1371,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
     const auto & tmpl =
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && tmpl.params_init != common_chat_params_init_k2_horizon) {
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
         // tool_choice none: the tools are not rendered, so the model has nothing to call (small models wrote the call
         // in other markup when they stayed in the prompt). The tool-use template is still picked, so a history with
-        // tool calls and results renders as before. K2-Horizon keeps them: its parser drops a call itself.
+        // tool calls and results renders as before. K2-Horizon too: with the tools kept it answered a tool-worthy question
+        // with a call, its parser dropped the call and the client got an empty reply.
         params.tools = json();
     }
     const auto & src             = tmpl.source();
