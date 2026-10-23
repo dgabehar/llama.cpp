@@ -39,6 +39,16 @@ argument that never completes is model repetition (offline grammar check accepts
 
 ## tool_choice none, all templates (added 2026-10-22)
 
+**Tools are not rendered under none (later 2026-10-22, decided by Doug).** Real-model QA (home-infrastructure PR #469,
+`docs/qa/toolchoice-none-real-model-2026-10-22.md`) found that with the tools still in the prompt small models (Qwen3.5
+0.8B/4B) wrote the call in other markup (`<tool_code>`, `<function_call>`, `<function=call>`, `<tool_response>`) that
+no opener cut catches. `common_chat_templates_apply_jinja` now renders without the tools list under none, like other
+servers; the tool-use template is still picked, so a history with tool calls and results renders as before. K2-Horizon
+keeps the tools (its parser drops a call itself). `test_tool_choice_none_omits_tools` checks every template in
+`models/templates` (the tool definition is gone, none renders wherever the no-tools prompt renders, K2 unchanged) and a
+Qwen3.5 history with a call and its result. The session's drop/cut/ban below stays as the safety net for a model that
+imitates a call from the history.
+
 Found by QA on Qwen3.8-Flash-Next and Qwen3.8-27B, same class as the K2 leak above: with tools offered and
 `tool_choice:"none"` the raw `<tool_call>...</tool_call>` block came back as `content`. The tools stay in the prompt, so
 the model still opens a call, and every template's content-only parser under none returned it verbatim (an audit of
