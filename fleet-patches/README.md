@@ -138,6 +138,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0104 | `516485132` | chat: tool_choice none renders the prompt without the tools |
 | 0105 | `4eecf8d28` | tests: keep each tool_choice none test under its own doc comment |
 | 0106 | `d4fa7afd8` | ggml: GGML_OP_COUNT 103 after merging upstream TOP_K_MASK with the fork's SSM_CONV_SPLIT |
+| 0107 | `609f33718` | tests/cpu: cover tiled concat with transposed i64 src1 |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
@@ -145,7 +146,7 @@ fixes"). Fork-only, not submitted upstream.
 
 This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync and extended on 2026-10-08
 with the K2 fixes (0088, 0089) and the sync-workflow removal (0090), then on 2026-10-22 with the merged test/vulkan patches (0091-0098)
-and the tool_choice none fix (0099-0105), then on 2026-10-23 with the op-count fix (0106): 106 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
+and the tool_choice none fix (0099-0105), then on 2026-10-23 with the op-count fix (0106) and the i64 tiled-concat test (0107): 107 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.
 

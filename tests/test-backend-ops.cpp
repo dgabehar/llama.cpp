@@ -11903,8 +11903,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // transposed src1 (tiled Vulkan path), incl. sizes that are not multiples of the 32x32 tile
-    // (the CPU reference concat has no transposed-src1 path for 8-byte types)
-    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I8 }) {
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I8, GGML_TYPE_I64 }) {
         test_cases.emplace_back(new test_concat_transposed(type, 3, 10240, 2048, 1));
         test_cases.emplace_back(new test_concat_transposed(type, 3, 100, 37, 2));
         test_cases.emplace_back(new test_concat_transposed(type, 40, 33, 31, 3));

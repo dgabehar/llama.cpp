@@ -1924,8 +1924,10 @@ static void ggml_compute_forward_concat_any(
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
 
     GGML_ASSERT(dim >= 0 && dim < 4);
-    GGML_ASSERT(ggml_is_contiguous_rows(src0));
-    GGML_ASSERT(ggml_is_contiguous_rows(src1));
+    // strided rows (e.g. a transposed src1) are copied element by element; quantized types need contiguous rows
+    const bool rows0 = ggml_is_contiguous_rows(src0);
+    const bool rows1 = ggml_is_contiguous_rows(src1);
+    GGML_ASSERT((rows0 && rows1) || !ggml_is_quantized(src0->type));
 
     int64_t o[4] = {0, 0, 0, 0};
 
@@ -1944,7 +1946,13 @@ static void ggml_compute_forward_concat_any(
             for (int i1 = 0; i1 < ne01; i1++) {
                 const char * x = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
                       char * y = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
-                memcpy(y, x, ggml_row_size(src0->type, ne00));
+                if (rows0) {
+                    memcpy(y, x, ggml_row_size(src0->type, ne00));
+                } else {
+                    for (int64_t i0 = 0; i0 < ne00; i0++) {
+                        memcpy(y + i0*nb0, x + i0*nb00, ggml_type_size(src0->type));
+                    }
+                }
             }
         }
     }
@@ -1955,7 +1963,13 @@ static void ggml_compute_forward_concat_any(
             for (int i1 = 0; i1 < ne11; i1++) {
                 const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
                       char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
-                memcpy(y, x, ggml_row_size(src1->type, ne10));
+                if (rows1) {
+                    memcpy(y, x, ggml_row_size(src1->type, ne10));
+                } else {
+                    for (int64_t i0 = 0; i0 < ne10; i0++) {
+                        memcpy(y + i0*nb0, x + i0*nb10, ggml_type_size(src1->type));
+                    }
+                }
             }
         }
     }
