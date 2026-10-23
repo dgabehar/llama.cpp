@@ -64,8 +64,8 @@ partial opener or tool tag is held back while streaming. If the none parser fail
 parser's message is used without its calls. Every call opener that is one special token is banned (-inf logit bias),
 so the call is not generated at all. Only when every opener is tag-like (`<...`, `[...`, contains a tag, or a harmony
 pattern set anchored on `<|...|>`) or one special token; only word openers and `<|`-anchored patterns cut (anchors
-kept, so harmony's `^\s+to$` never cuts prose). A parser that drops calls itself opts out (`drops_calls_under_none`,
-K2-Horizon).
+kept, so harmony's `^\s+to$` never cuts prose). K2-Horizon has no opt-out any more (patch 0109 removed `drops_calls_under_none`): it takes this path, and also
+cuts its Kimi-form openers (`common_chat_params::extra_call_openers`, no grammar trigger).
 
 Still content-only under none (opener is ordinary text, so a call is returned as content, as before): command-r-plus
 (`Action:`), firefunction-v2 (`functools`), functionary v3.2 (`>>>`). None is in the fleet.

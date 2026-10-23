@@ -318,8 +318,8 @@ struct common_chat_params {
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
     std::vector<std::string>            additional_stops;
-    // the parser itself drops a call the model emits under tool_choice none, see common_chat_session
-    bool                                drops_calls_under_none = false;
+    // call openers beyond grammar_triggers (no grammar trigger: a trigger would constrain that form), cut under tool_choice none
+    std::vector<std::string>            extra_call_openers;
     std::vector<std::string>            stops_after_reasoning; // stop strings that count only after one of them closed the reasoning
     // non-empty: the reply must not end (EOG) before something besides whitespace and these tags was generated
     std::vector<std::string>            no_empty_reply_inert;

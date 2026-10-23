@@ -8730,6 +8730,55 @@ static void test_tool_choice_none_suppresses_call_opener() {
     LOG_ERR("%s passed%s\n", __func__, real ? " (with the real vocab)" : "");
 }
 
+// K2-Horizon under tool_choice none with tools offered (no opt-out: K2 takes the generic none path, the tools are not in
+// the prompt). A call the model still writes is cut from reasoning and content, whether it comes while "thinking", after
+// a closed think block, or in the Kimi form; a plain reply is untouched.
+static void test_k2_tool_choice_none_cuts_calls() {
+    LOG_DBG("%s\n", __func__);
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "What is the weather in Paris?";
+    const std::string call = "<ifm|tool_calls>\n<ifm|tool_call>special_function\n<ifm|arg_key>arg1</ifm|arg_key>\n"
+                             "<ifm|arg_value>1</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
+    const std::string kimi = "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|sep|>{\"arg1\": 1}"
+                             "<|tool_call_end|><|tool_calls_section_end|>";
+    struct sample {
+        std::string text, reasoning, content;
+    };
+    const std::vector<sample> samples = {
+        { "Thinking then call directly " + call, "Thinking then call directly", "" },
+        { "Thinking.</ifm|think>" + call, "Thinking.", "" },
+        { "Thinking.</ifm|think>" + kimi, "Thinking.", "" },
+        { "Thinking then kimi " + kimi, "Thinking then kimi", "" },
+        { "Thinking.</ifm|think>Paris is in France.", "Thinking.", "Paris is in France." },
+    };
+    for (const char * path : { "models/templates/k2-horizon.jinja", "models/templates/IFM-K2-Horizon.jinja" }) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user };
+        inputs.add_generation_prompt = true;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+        inputs.tools                 = { special_function_tool };
+        inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_NONE;
+        for (const auto & sm : samples) {
+            common_chat_session session(tmpls.get(), nullptr, inputs);
+            const auto msg = session.finish(common_chat_input(sm.text));
+            const std::string what = std::string(path) + " / " + sm.text.substr(0, 40);
+            if (!msg.tool_calls.empty()) {
+                throw std::runtime_error(what + ": a tool call under none");
+            }
+            for (const std::string & field : { msg.reasoning_content, msg.content }) {
+                if (field.find("<ifm|") != std::string::npos || field.find("<|tool_call") != std::string::npos) {
+                    throw std::runtime_error(what + ": call markup leaked: " + field);
+                }
+            }
+            assert_equals(sm.reasoning, string_strip(msg.reasoning_content));
+            assert_equals(sm.content, string_strip(msg.content));
+        }
+    }
+    LOG_ERR("%s passed\n", __func__);
+}
+
 // K2-Horizon: the sampler's empty-reply guard is fed by the chat params. A parser change that stops filling them
 // compiles and passes the parse tests but silently disarms the guard (seen when upstream's k2-horizon parser
 // pre-empted the fork's autoparser workarounds), so pin them: fields set, per effort, with and without tools.
@@ -9348,6 +9397,7 @@ int main(int argc, char ** argv) {
         test_k2_empty_parse_is_not_raw_text();
         test_tool_choice_none_suppresses_call_opener();
         test_tool_choice_none_omits_tools();
+        test_k2_tool_choice_none_cuts_calls();
         test_translate_gemma();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();

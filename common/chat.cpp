@@ -1869,10 +1869,7 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
     // has a parser for its calls: parse as under auto, drop the calls, and ban an opener that is one special token so
     // the call is not generated at all. Only when every opener is tag-like or one special token: a plain-word opener
     // (`functools`, `Action:`) can be ordinary text, so it keeps the content-only parser.
-    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && applied.drops_calls_under_none) {
-        drop_calls         = true;
-        none_parser_params = parser_params;
-    } else if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE && !inputs.tools.empty() && inputs.json_schema.empty()) {
         auto auto_inputs        = inputs;
         auto_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
         std::optional<common_chat_params> as_auto;
@@ -1909,6 +1906,9 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                 parser_params.format      = as_auto->format;
                 parser_params.parser      = std::move(as_auto->parser);
                 call_openers              = as_auto->grammar_triggers;
+                for (const auto & opener : as_auto->extra_call_openers) {
+                    call_openers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, opener });
+                }
                 // the template's tool tags (`<|tool_calls_section_begin|>`): a tag right before the call goes with it
                 for (const auto & tag : as_auto->preserved_tokens) {
                     if (tag.find("tool") != std::string::npos) {
