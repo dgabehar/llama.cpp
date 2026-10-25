@@ -224,6 +224,49 @@ def test_slot_restore_truncated_file(n_cut):
     assert res.status_code == 200
 
 
+def test_slot_save_failure_keeps_previous_file():
+    # a save is written to the dot-file <dir>/.<file>.tmp and renamed over <file> only when complete:
+    # a failed save must leave the previous good file untouched and restorable
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "slot_atomic.bin"})
+    assert res.status_code == 200
+    path = os.path.join(server.slot_save_path, "slot_atomic.bin")
+    tmp = os.path.join(server.slot_save_path, ".slot_atomic.bin.tmp")
+    assert sorted(os.listdir(server.slot_save_path)) == ["slot_atomic.bin"]  # no temp left behind
+    with open(path, "rb") as f:
+        good = f.read()
+    assert res.body["n_written"] == len(good)
+
+    # change the slot so a second save would write different content
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany? Answer in one word.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # block the temp file with a non-empty directory: the save cannot open it and must fail
+    os.makedirs(os.path.join(tmp, "blocker"))
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "slot_atomic.bin"})
+    assert res.status_code == 500
+    assert "Unable to save slot" in res.body["error"]["message"]
+    with open(path, "rb") as f:
+        assert f.read() == good
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "slot_atomic.bin"})
+    assert res.status_code == 200
+    assert res.body["n_read"] == len(good)
+
+
 def test_slot_erase():
     global server
     server.start()

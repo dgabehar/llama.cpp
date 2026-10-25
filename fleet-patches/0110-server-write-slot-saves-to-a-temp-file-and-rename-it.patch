@@ -1,0 +1,171 @@
+From aac1d90d9312290cb51945090582b9190dd695b2 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Sun, 25 Oct 2026 11:20:41 -0500
+Subject: [PATCH] server: write slot saves to a temp file and rename it into
+ place
+
+The save wrote the state to <file> in place, then appended the SCKP checkpoints and the
+SDFT draft state, so a failed or interrupted save replaced a good file with a cut-off one.
+Write all of it to the dot-file <dir>/.<file>.tmp (so slot-dir listings and syncs skip it),
+fsync, rename over <file> only on success, then fsync the directory; remove the temp on
+failure. Same bytes on disk as before.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ tools/server/server-context.cpp           | 62 ++++++++++++++++++++---
+ tools/server/tests/unit/test_slot_save.py | 43 ++++++++++++++++
+ 2 files changed, 99 insertions(+), 6 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index de0569927..e9e3b371b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -40,7 +40,26 @@
+ #   define NOMINMAX
+ #endif
+ #include <windows.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++// flush a written file (or a directory, after a rename in it) to disk
++static bool fsync_path(const std::string & path) {
++#if defined(_WIN32)
++    GGML_UNUSED(path);
++    return true; // ponytail: no fsync on Windows; the rename alone still keeps the old file on a failed save
++#else
++    const int fd = ::open(path.c_str(), O_RDONLY);
++    if (fd < 0) {
++        return false;
++    }
++    const bool ok = ::fsync(fd) == 0;
++    ::close(fd);
++    return ok;
+ #endif
++}
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
+@@ -3302,26 +3321,57 @@ private:
+                         break;
+                     }
+ 
++                    // write the state, the checkpoints and the draft state to a temp file and rename it over
++                    // filepath only once all of it is on disk, so a failed or interrupted save keeps the old file
++                    // the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
++                    const std::filesystem::path fspath = std::filesystem::u8path(filepath);
++                    const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
++                    const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
++                    const auto fail = [&](const char * msg) {
++                        std::error_code ec;
++                        std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
++                        send_error(task, msg, ERROR_TYPE_SERVER);
++                    };
++
+                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                     const size_t nwrite = llama_state_seq_save_file(
+-                        ctx_tgt, filepath.c_str(), slot->id,
++                        ctx_tgt, tmppath.c_str(), slot->id,
+                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                     if (nwrite == 0) {
+-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
++                        fail("Unable to save slot");
+                         break;
+                     }
+ 
+                     size_t nwrite_ckpt = 0;
+-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
++                    if (!save_slot_checkpoints(tmppath, *slot, nwrite_ckpt)) {
++                        fail("Unable to save slot: incomplete context checkpoints");
+                         break;
+                     }
+ 
+                     size_t nwrite_dft = 0;
+-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
++                    if (!save_slot_draft(tmppath, *slot, nwrite_dft)) {
++                        fail("Unable to save slot: incomplete draft state");
++                        break;
++                    }
++
++                    if (!fsync_path(tmppath)) {
++                        SLT_WRN(*slot, "failed to sync '%s'\n", tmppath.c_str());
++                        fail("Unable to save slot: sync failed");
+                         break;
+                     }
++                    {
++                        std::error_code ec;
++                        std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
++                        if (ec) {
++                            SLT_WRN(*slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
++                            fail("Unable to save slot: rename failed");
++                            break;
++                        }
++                    }
++                    // persist the rename itself; the new file is already in place, so a failure is only logged
++                    if (!fsync_path(dirpath)) {
++                        SLT_WRN(*slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
++                    }
+ 
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 0cc449445..4830887fd 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -224,6 +224,49 @@ def test_slot_restore_truncated_file(n_cut):
+     assert res.status_code == 200
+ 
+ 
++def test_slot_save_failure_keeps_previous_file():
++    # a save is written to the dot-file <dir>/.<file>.tmp and renamed over <file> only when complete:
++    # a failed save must leave the previous good file untouched and restorable
++    global server
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of France?",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "slot_atomic.bin"})
++    assert res.status_code == 200
++    path = os.path.join(server.slot_save_path, "slot_atomic.bin")
++    tmp = os.path.join(server.slot_save_path, ".slot_atomic.bin.tmp")
++    assert sorted(os.listdir(server.slot_save_path)) == ["slot_atomic.bin"]  # no temp left behind
++    with open(path, "rb") as f:
++        good = f.read()
++    assert res.body["n_written"] == len(good)
++
++    # change the slot so a second save would write different content
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "What is the capital of Germany? Answer in one word.",
++        "id_slot": 1,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++
++    # block the temp file with a non-empty directory: the save cannot open it and must fail
++    os.makedirs(os.path.join(tmp, "blocker"))
++    res = server.make_request("POST", "/slots/1?action=save", data={"filename": "slot_atomic.bin"})
++    assert res.status_code == 500
++    assert "Unable to save slot" in res.body["error"]["message"]
++    with open(path, "rb") as f:
++        assert f.read() == good
++
++    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "slot_atomic.bin"})
++    assert res.status_code == 200
++    assert res.body["n_read"] == len(good)
++
++
+ def test_slot_erase():
+     global server
+     server.start()
+-- 
+2.43.0
+

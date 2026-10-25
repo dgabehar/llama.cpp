@@ -858,6 +858,20 @@ Upstream check (b11445+11, `51ce9c11a`, 2026-10-06): no fix or open PR for the
 truncated-file assert (related but different: #27530 merged, #29723/#29700
 closed). Would be offered upstream as a PR; not opened.
 
+## Atomic slot save (added 2026-10-25)
+
+`/slots/<id>?action=save` wrote the llama state straight to `<file>`, then appended the SCKP checkpoints and the
+SDFT draft state to it. A save that failed or was killed part-way left a cut-off file in place of the previous good
+one (the D1 loader restores it as main state only, or rejects it). The save now writes all three parts to
+the dot-file `<dir>/.<file>.tmp`, fsyncs it, renames it over `<file>` only when everything was written, then fsyncs
+the directory; on any failure the temp is removed and `<file>` is unchanged. The temp is a dot-file so the chart's
+slot-cache manifest/sync (`"$DIR"/*` globs, `ls -1tr` gc) never publish or pick it up; the age gc (`find -mmin`)
+still removes a stale one left by a crash. The bytes written are the same as before (same writers, other path), so the
+converter (`home-infrastructure` `kvrepl_nstream_convert.py`) and restore need no change. No draft companion file is
+written any more (the draft state lives in the SDFT appendix), so there is no second path to make atomic. Windows:
+no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_keeps_previous_file` (a directory at
+`<dir>/.<file>.tmp` makes the second save fail; the first file must be unchanged and restorable), fails before the fix.
+
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
 - **gpt-oss-20b writes `<|channel|>commentary (analysis)<|message|>`** (2026-09-26):

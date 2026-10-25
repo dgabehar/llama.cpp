@@ -40,7 +40,26 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
+
+// flush a written file (or a directory, after a rename in it) to disk
+static bool fsync_path(const std::string & path) {
+#if defined(_WIN32)
+    GGML_UNUSED(path);
+    return true; // ponytail: no fsync on Windows; the rename alone still keeps the old file on a failed save
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -3302,25 +3321,56 @@ private:
                         break;
                     }
 
+                    // write the state, the checkpoints and the draft state to a temp file and rename it over
+                    // filepath only once all of it is on disk, so a failed or interrupted save keeps the old file
+                    // the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
+                    const std::filesystem::path fspath = std::filesystem::u8path(filepath);
+                    const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
+                    const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
+                    const auto fail = [&](const char * msg) {
+                        std::error_code ec;
+                        std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
+                        send_error(task, msg, ERROR_TYPE_SERVER);
+                    };
+
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
                     const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
+                        ctx_tgt, tmppath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        fail("Unable to save slot");
                         break;
                     }
 
                     size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+                    if (!save_slot_checkpoints(tmppath, *slot, nwrite_ckpt)) {
+                        fail("Unable to save slot: incomplete context checkpoints");
                         break;
                     }
 
                     size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                    if (!save_slot_draft(tmppath, *slot, nwrite_dft)) {
+                        fail("Unable to save slot: incomplete draft state");
                         break;
+                    }
+
+                    if (!fsync_path(tmppath)) {
+                        SLT_WRN(*slot, "failed to sync '%s'\n", tmppath.c_str());
+                        fail("Unable to save slot: sync failed");
+                        break;
+                    }
+                    {
+                        std::error_code ec;
+                        std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
+                        if (ec) {
+                            SLT_WRN(*slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
+                            fail("Unable to save slot: rename failed");
+                            break;
+                        }
+                    }
+                    // persist the rename itself; the new file is already in place, so a failure is only logged
+                    if (!fsync_path(dirpath)) {
+                        SLT_WRN(*slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
                     }
 
                     const int64_t t_end = ggml_time_us();
