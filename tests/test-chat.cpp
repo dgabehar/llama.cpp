@@ -1278,6 +1278,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
 
         // Find the earliest trigger position to determine the constrained portion
         auto earliest_trigger_pos = std::string::npos;
+        size_t trigger_search_from = 0;
 
         if (use_reasoning_budget_path) {
             // Reasoning-budget path: simulate thinking-aware trigger detection.
@@ -1331,6 +1332,14 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
             // blocks (e.g. Kimi). Fall back to the legacy path for this case.
             if (earliest_trigger_pos == std::string::npos && !tc.expect.tool_calls.empty()) {
                 use_reasoning_budget_path = false;
+                // the call starts where the expected reasoning ends: a call tag written as prose inside it
+                // never reaches the grammar
+                if (!tc.expect.reasoning_content.empty()) {
+                    const auto r = full_input.find(tc.expect.reasoning_content);
+                    if (r != std::string::npos) {
+                        trigger_search_from = r + tc.expect.reasoning_content.size();
+                    }
+                }
             }
         }
 
@@ -1343,7 +1352,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
                     case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
                         {
                             const auto & word = trigger.value;
-                            pos               = full_input.find(word);
+                            pos               = full_input.find(word, trigger_search_from);
                             break;
                         }
                     case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
@@ -5632,6 +5641,51 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                     { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40"})", "" },
                 })
                 .run();
+
+            // the bare call tags written as prose in the thinking stay reasoning; only a real call start ends it
+            {
+                const std::string prose = "Wrap it in <ifm|tool_calls> and one <ifm|tool_call> per call.";
+                const std::string call  = "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                                          "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
+                for (const std::string & sep : { std::string("</ifm|think_faster>\n"), std::string("\n") }) {
+                    tst.test(prose + sep + call)
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+                // a bare call (no section opener) straight from the thinking
+                tst.test(prose + "\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ bash_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                    .run();
+                // whitespace between the section opener and the call tag
+                for (const std::string & ws : { std::string(" "), std::string("\n\n") }) {
+                    tst.test(prose + "\n<ifm|tool_calls>" + ws + "<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                             "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+                // JSON-form call straight from the thinking, with or without whitespace before the object
+                for (const std::string & ws : { std::string(""), std::string(" "), std::string("\n") }) {
+                    tst.test(prose + "\n<ifm|tool_call>" + ws + R"({"name": "bash", "arguments": {"command": "ls"}})" + "</ifm|tool_call>")
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" }, { "tool_call_format", R"("json")" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+            }
 
             // ... but real thinking before the tool-call start stays reasoning
             tst.test("The glob matched nothing, retry with find.<ifm|tool_calls>\n<ifm|tool_call>bash\n"
