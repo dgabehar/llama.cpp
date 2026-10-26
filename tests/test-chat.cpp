@@ -1298,6 +1298,15 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
                     for (const auto & think_end : think_ends) {
                         if (full_input.compare(i, think_end.size(), think_end) == 0) {
                             in_thinking = false;
+                            // the sampler replays the matched end tag into the grammar, so a trigger
+                            // inside it (Qwen3.5's `<tool_call>\n<function=`) fires there
+                            for (const auto & trigger : sampling.grammar_triggers) {
+                                const auto off = think_end.find(trigger.value);
+                                if (off != std::string::npos &&
+                                        (earliest_trigger_pos == std::string::npos || i + off < earliest_trigger_pos)) {
+                                    earliest_trigger_pos = i + off;
+                                }
+                            }
                             i += think_end.size() - 1;
                             break;
                         }
@@ -2362,6 +2371,38 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call_thoughts)
             .run();
+
+        // a bare <tool_call> written as prose in the thinking stays reasoning; only a real call opener ends it
+        {
+            const std::string call =
+                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+            const std::string prose = "I'll render them as <tool_call> blocks.";
+            for (auto choice : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+                tst.test(prose + "\n</think>\n\n" + call)
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tool_choice(choice)
+                    .tools({ special_function_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+                    .run();
+                // a call opened straight from the thinking, with no </think>
+                tst.test(prose + "\n" + call)
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tool_choice(choice)
+                    .tools({ special_function_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+                    .run();
+            }
+            // tool_choice none: the call opened from the unclosed thinking is still cut
+            tst.test(prose + "\n" + call)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(prose)
+                .expect_content("")
+                .run();
+        }
 
         tst.test(
                "<tool_call>\n"

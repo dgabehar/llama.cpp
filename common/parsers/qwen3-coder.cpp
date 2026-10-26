@@ -20,12 +20,16 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
     auto is_qwen3_coder  = !supports_reasoning;
 
+    // A call opened straight from the reasoning ends it too, but only a real one: the bare <tool_call> also
+    // shows up as prose inside the thinking ("render them as <tool_call> blocks")
+    const std::string REASONING_CALL_END = "<tool_call>\n<function=";
+
     if (supports_reasoning) {
         data.thinking_start_tag = "<think>";
-        // Support both </think> and <tool_call> as reasoning end sequences.
+        // Support both </think> and a call opener as reasoning end sequences.
         // The newline variant comes first so it is included in the forced message
-        // <function= is omitted, as it is a workaround for Qwen3-Coder which is not a thinking model
-        data.thinking_end_tags = { "\n</think>", "</think>", "<tool_call>" };
+        // A bare <function= is omitted, as it is a workaround for Qwen3-Coder which is not a thinking model
+        data.thinking_end_tags = { "\n</think>", "</think>", REASONING_CALL_END };
         data.preserved_tokens.insert(data.preserved_tokens.end(), { "<think>", "</think>" });
     }
 
@@ -77,8 +81,8 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         auto reasoning = p.eps();
         if (supports_reasoning && extract_reasoning) {
             reasoning = p.optional("<think>" + p.space() +
-                                   p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+                                   p.reasoning(p.until_one_of({ "</think>", REASONING_CALL_END })) +
+                                   (p.literal("</think>") | p.peek(p.literal(REASONING_CALL_END))));
         }
 
         // Response format parser
