@@ -1126,12 +1126,12 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
   checkpoint-restore/grammar-desync bug (ruled out via direct tracing --
   zero restore events fired during a traced corrupted run). Fixed with two
   layered patches:
-  - **Primary fix** (`d4836a23c`, `server: disable speculative decoding for
+  - **Primary fix** (`3e7b73528`, `server: disable speculative decoding for
     grammar-constrained requests`): `get_n_draft_max()` returns 0 whenever
     the request's sampling params carry an active grammar (tool-calling,
     JSON-schema output). Confirmed correctly scoped -- plain chat requests
     still draft normally (`draft_n > 0`).
-  - **Defense-in-depth** (`92a035776`, `qwen3-coder: bound xml-arg-string
+  - **Defense-in-depth** (`2d13e476c`, `qwen3-coder: bound xml-arg-string
     with until_one_of, not a bare until`): hardens the tool-call parser's
     string-argument grammar rule to exclude all structural tags from the
     matched span, not just the single expected terminator. Tested alone and
@@ -1140,6 +1140,39 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
     behind the primary fix, not a replacement for it.
   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
   `fleet-patches`.
+  - **Defense-in-depth reverted, 2026-10-26** (`qwen3-coder: let a string
+    argument hold the format's own tags as text`; not run live on any node:
+    test-chat plus a CPU llama-server check on Qwen3.5-0.8B/4B). The rule is
+    wrapped in `p.ac(.., "\n</parameter>\n")`, which emits the sampling
+    grammar from that delimiter alone, so the tag exclusions never reached
+    the grammar (GBNF byte-identical with and without them). They only made
+    the final parse reject what the grammar allowed: a value that holds
+    `<tool_call>`/`<function=` as text (writing a chat template) returned
+    HTTP 500. The primary fix is the only guard against the runaway;
+    `test_qwen3_coder_arg_tags` (`tests/test-chat.cpp`) pins what the
+    grammar still bounds.
+  - **Reasoning end, same class** (`qwen3-coder: end the reasoning only at a
+    real call opener`, `k2-horizon: end the reasoning only at a real call
+    start`; same test scope, K2 unit-tested only). A bare `<tool_call>` /
+    `<ifm|tool_calls>` / `<ifm|tool_call>` written as prose in the thinking
+    ended the reasoning: a 500 on Qwen3.5, the thinking turned into content
+    on K2 (lenient-fallback). Qwen3.5 now ends at `</think>` or
+    `<tool_call>\n<function=` (parser, peek and `thinking_end_tags`); K2 at
+    a close tag or the section opener + call tag / call tag + `{` or a tool
+    name, whitespace allowed. Known limits: under tool_choice auto, a call
+    opened from inside unclosed thinking in a non-canonical form (JSON form
+    or an extra blank line on Qwen3.5, which its call grammar rejects
+    anyway; an odd tokenization of the end tag) does not end the reasoning
+    budget, so it is not grammar-constrained, and on Qwen3.5 it stays in the
+    reasoning. Quoting the exact call-start string in the thinking (K2's
+    system prompt contains `<ifm|tool_calls>\n<ifm|tool_call>`) still ends
+    the reasoning there.
+  - **Other `p.ac` sites** (swept 2026-10-26): auto-parser, minimax-m3,
+    minicpm5, muse-glimmer, muse-spark use a bare `until` on the ac
+    delimiter, so parser and grammar agree. `harmony-xml.cpp` still differs
+    from its grammar (the value also stops at `\n<rfl:parameter name="` /
+    `\n<|end|>` to tolerate a missing close tag): upstream-identical, no
+    fleet model uses it, left as upstream.
 
 - **CPU locality-domain split ("Track A") caused a real production outage
   on first rollout (2026-09-18) -- crash-looped BOTH gabesrv06 and
