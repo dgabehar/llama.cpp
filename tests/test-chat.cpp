@@ -1278,6 +1278,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
 
         // Find the earliest trigger position to determine the constrained portion
         auto earliest_trigger_pos = std::string::npos;
+        size_t trigger_search_from = 0;
 
         if (use_reasoning_budget_path) {
             // Reasoning-budget path: simulate thinking-aware trigger detection.
@@ -1298,6 +1299,15 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
                     for (const auto & think_end : think_ends) {
                         if (full_input.compare(i, think_end.size(), think_end) == 0) {
                             in_thinking = false;
+                            // the sampler replays the matched end tag into the grammar, so a trigger
+                            // inside it (Qwen3.5's `<tool_call>\n<function=`) fires there
+                            for (const auto & trigger : sampling.grammar_triggers) {
+                                const auto off = think_end.find(trigger.value);
+                                if (off != std::string::npos &&
+                                        (earliest_trigger_pos == std::string::npos || i + off < earliest_trigger_pos)) {
+                                    earliest_trigger_pos = i + off;
+                                }
+                            }
                             i += think_end.size() - 1;
                             break;
                         }
@@ -1322,6 +1332,14 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
             // blocks (e.g. Kimi). Fall back to the legacy path for this case.
             if (earliest_trigger_pos == std::string::npos && !tc.expect.tool_calls.empty()) {
                 use_reasoning_budget_path = false;
+                // the call starts where the expected reasoning ends: a call tag written as prose inside it
+                // never reaches the grammar
+                if (!tc.expect.reasoning_content.empty()) {
+                    const auto r = full_input.find(tc.expect.reasoning_content);
+                    if (r != std::string::npos) {
+                        trigger_search_from = r + tc.expect.reasoning_content.size();
+                    }
+                }
             }
         }
 
@@ -1334,7 +1352,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
                     case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
                         {
                             const auto & word = trigger.value;
-                            pos               = full_input.find(word);
+                            pos               = full_input.find(word, trigger_search_from);
                             break;
                         }
                     case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
@@ -2362,6 +2380,38 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call_thoughts)
             .run();
+
+        // a bare <tool_call> written as prose in the thinking stays reasoning; only a real call opener ends it
+        {
+            const std::string call =
+                "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+            const std::string prose = "I'll render them as <tool_call> blocks.";
+            for (auto choice : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+                tst.test(prose + "\n</think>\n\n" + call)
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tool_choice(choice)
+                    .tools({ special_function_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+                    .run();
+                // a call opened straight from the thinking, with no </think>
+                tst.test(prose + "\n" + call)
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tool_choice(choice)
+                    .tools({ special_function_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "special_function", R"({"arg1": 1})", {} } })
+                    .run();
+            }
+            // tool_choice none: the call opened from the unclosed thinking is still cut
+            tst.test(prose + "\n" + call)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+                .tools({ special_function_tool })
+                .expect_reasoning(prose)
+                .expect_content("")
+                .run();
+        }
 
         tst.test(
                "<tool_call>\n"
@@ -3901,6 +3951,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         })
             .expect_tool_calls({
                 { "html", "{\"markup\": \"<html>\\n <head>\\n  <title>Hello!</title>\\n </head>\\n</html>\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // A string value may carry the format's own tags as literal text (e.g. writing a
+        // chat template); only the real "\n</parameter>\n" closes it
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "{% for c in calls %}\n"
+               "<tool_call>\n"
+               "<function={{ c.name }}>\n"
+               "<parameter=x>\n"
+               "</parameter></function>\n"
+               "</tool_call>\n"
+               "{% endfor %}\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"{% for c in calls %}\\n<tool_call>\\n<function={{ c.name }}>\\n<parameter=x>\\n</parameter></function>\\n</tool_call>\\n{% endfor %}\"}", {} },
             })
             .expect_reconstruction()
             .run();
@@ -5568,6 +5641,51 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                     { "bash", R"({"command":"find /home/dgabehar/src -maxdepth 6 -name \"deployment.yaml\" 2>/dev/null | head -40"})", "" },
                 })
                 .run();
+
+            // the bare call tags written as prose in the thinking stay reasoning; only a real call start ends it
+            {
+                const std::string prose = "Wrap it in <ifm|tool_calls> and one <ifm|tool_call> per call.";
+                const std::string call  = "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                                          "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
+                for (const std::string & sep : { std::string("</ifm|think_faster>\n"), std::string("\n") }) {
+                    tst.test(prose + sep + call)
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+                // a bare call (no section opener) straight from the thinking
+                tst.test(prose + "\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>")
+                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .tools({ bash_tool })
+                    .expect_reasoning(prose)
+                    .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                    .run();
+                // whitespace between the section opener and the call tag
+                for (const std::string & ws : { std::string(" "), std::string("\n\n") }) {
+                    tst.test(prose + "\n<ifm|tool_calls>" + ws + "<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+                             "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+                // JSON-form call straight from the thinking, with or without whitespace before the object
+                for (const std::string & ws : { std::string(""), std::string(" "), std::string("\n") }) {
+                    tst.test(prose + "\n<ifm|tool_call>" + ws + R"({"name": "bash", "arguments": {"command": "ls"}})" + "</ifm|tool_call>")
+                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" }, { "tool_call_format", R"("json")" } })
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ bash_tool })
+                        .expect_reasoning(prose)
+                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
+                        .run();
+                }
+            }
 
             // ... but real thinking before the tool-call start stays reasoning
             tst.test("The glob matched nothing, retry with find.<ifm|tool_calls>\n<ifm|tool_call>bash\n"
@@ -9045,6 +9163,52 @@ static void test_prompt_parts() {
     assert_equals(false, prompt.parts[0].is_input);
 }
 
+// Qwen3-Coder string arguments: the format's own tags are plain text inside a value (the
+// grammar always allowed them, so the parser must too), and a runaway repetition of them
+// stays inside that one value: it cannot end the call without the real closer, nor turn
+// into extra arguments or calls
+static void test_qwen3_coder_arg_tags() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/Qwen3-Coder.jinja");
+
+    common_chat_templates_inputs inputs;
+    inputs.messages    = { message_user };
+    inputs.tools       = { python_tool };
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; // eager grammar: the whole output is constrained
+
+    const common_chat_session session(tmpls.get(), nullptr, inputs);
+    const std::string open  = "<tool_call>\n<function=python>\n<parameter=code>\n";
+    const std::string close = "\n</parameter>\n</function>\n</tool_call>";
+    auto grammar_ok = [&](const std::string & output) {
+        auto grammar = build_grammar(session.grammar());
+        return match_string(session.generation_prompt() + output, grammar.get());
+    };
+    auto parse = [&](const std::string & output) {
+        common_chat_session s = session;
+        return s.finish(common_chat_input(output));
+    };
+
+    std::string runaway;
+    for (int i = 0; i < 8; i++) {
+        runaway += "<parameter=code>\n<tool_call>\n</function>\n";
+    }
+    runaway += "x = 1";
+
+    // closed by the real "\n</parameter>\n": one call, the tags kept verbatim in the string
+    assert_equals(true, grammar_ok(open + runaway + close));
+    const auto msg = parse(open + runaway + close);
+    assert_equals<size_t>(1, msg.tool_calls.size());
+    assert_equals(json{ { "code", runaway } }.dump(), json::parse(msg.tool_calls[0].arguments).dump());
+
+    // without the real closer the grammar never completes, so the runaway ends at max_tokens
+    assert_equals(false, grammar_ok(open + runaway));
+    assert_equals(false, grammar_ok(open + runaway + "\n</function>\n</tool_call>"));
+
+    // after the closer, only declared structure: no undeclared argument, no second call
+    assert_equals(false, grammar_ok(open + "x = 1\n</parameter>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call>"));
+    assert_equals(false, grammar_ok(open + "x = 1" + close + "\n<tool_call>\n<function=python>\n<parameter=code>\nx" + close));
+}
+
 static void test_chat_session() {
     LOG_DBG("%s\n", __func__);
     auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
@@ -9405,6 +9569,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_prompt_parts();
         test_chat_session();
+        test_qwen3_coder_arg_tags();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);

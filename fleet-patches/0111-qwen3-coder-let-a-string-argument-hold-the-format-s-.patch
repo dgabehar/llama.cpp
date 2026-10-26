@@ -1,0 +1,164 @@
+From 051cd3a76bcd8310f7de424d5e3eef8f8251b451 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Mon, 26 Oct 2026 13:57:49 -0500
+Subject: [PATCH] qwen3-coder: let a string argument hold the format's own tags
+ as text
+
+A write_file call whose content is a chat template (literal <tool_call>,
+<function=..>, </function> lines) came back as HTTP 500 "does not match the
+expected peg-native format", speculation on or off: 3/3 on Qwen3.5-4B, CPU,
+tool_choice required; with tool_choice auto the call was silently dropped.
+
+Root cause: 2d13e476c stopped xml-arg-string's parser at any of those tags
+(until_one_of), but the rule is wrapped in p.ac(.., "\n</parameter>\n"), and
+ac() emits the sampling grammar from that one delimiter only. So the grammar
+never excluded the tags (the GBNF is byte-identical before and after that
+commit), the model was free to write them, and only the final parse rejected
+them. The "forces a resample" claim in that commit never held; the runaway
+it targeted is held off by 3e7b73528 (no drafting under a grammar,
+tools/server/server-context.cpp get_n_draft_max).
+
+Fix: stop the value at the real closer only, as upstream does, so the parser
+accepts exactly what the grammar allows. The grammar is unchanged.
+
+Tests: Qwen3-Coder peg case with a template-shaped value; and
+test_qwen3_coder_arg_tags, which checks a repeated-tag runaway stays one
+string argument, cannot finish without the real closer, and cannot become an
+undeclared argument or a second call.
+
+Assisted-by: Claude Opus 5.5
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/parsers/qwen3-coder.cpp | 19 +++------
+ tests/test-chat.cpp            | 70 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 75 insertions(+), 14 deletions(-)
+
+diff --git a/common/parsers/qwen3-coder.cpp b/common/parsers/qwen3-coder.cpp
+index 625b2621c..6774ede5c 100644
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -89,21 +89,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+         // Tool call parser
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+-            // Bound the string value the same defensive way the `reasoning` rule above
+-            // bounds its own span (until_one_of, not a bare until on the expected
+-            // terminator alone) -- a runaway/degenerate generation must never be able to
+-            // smuggle another structural tag (a real llama.cpp/server incident, live-
+-            // traced on gabesrv06 2026-09-15: MTP speculative decoding occasionally flips
+-            // a close greedy call at this exact template boundary, and a bare `until`
+-            // silently absorbed the resulting <parameter=.../<tool_call>/</function>
+-            // repetition as "valid" string content since none of it equalled the single
+-            // terminator). Excluding these from the value's own GBNF rule makes the
+-            // grammar itself reject the bad continuation and force a resample, instead of
+-            // silently corrupting the argument -- regardless of what causes the flip.
++            // Only the real "\n</parameter>\n" ends a value: a value may hold the format's own
++            // tags as text (e.g. a chat template being written to a file). p.ac() emits the
++            // sampling grammar from that one delimiter, so the parser must stop at the same
++            // place, or it rejects output the grammar let through.
+             auto arg_string = p.rule("xml-arg-string",
+-                p.ac(p.tool_arg_string_value(p.until_one_of({
+-                    "\n</parameter>\n", "<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter="
+-                })) + arg_close, "\n</parameter>\n"));
++                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+ 
+             auto tool_choice = p.choice();
+             foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 1bf7647a7..11fe033ab 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -3905,6 +3905,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect_reconstruction()
+             .run();
+ 
++        // A string value may carry the format's own tags as literal text (e.g. writing a
++        // chat template); only the real "\n</parameter>\n" closes it
++        tst.test(
++               "<tool_call>\n"
++               "<function=python>\n"
++               "<parameter=code>\n"
++               "{% for c in calls %}\n"
++               "<tool_call>\n"
++               "<function={{ c.name }}>\n"
++               "<parameter=x>\n"
++               "</parameter></function>\n"
++               "</tool_call>\n"
++               "{% endfor %}\n"
++               "</parameter>\n"
++               "</function>\n"
++               "</tool_call>")
++            .tools({ python_tool })
++            .expect_tool_calls({
++                { "python", "{\"code\": \"{% for c in calls %}\\n<tool_call>\\n<function={{ c.name }}>\\n<parameter=x>\\n</parameter></function>\\n</tool_call>\\n{% endfor %}\"}", {} },
++            })
++            .expect_reconstruction()
++            .run();
++
+         // Test with TODO list (array of objects)
+         tst.test(
+                "<tool_call>\n"
+@@ -9045,6 +9068,52 @@ static void test_prompt_parts() {
+     assert_equals(false, prompt.parts[0].is_input);
+ }
+ 
++// Qwen3-Coder string arguments: the format's own tags are plain text inside a value (the
++// grammar always allowed them, so the parser must too), and a runaway repetition of them
++// stays inside that one value: it cannot end the call without the real closer, nor turn
++// into extra arguments or calls
++static void test_qwen3_coder_arg_tags() {
++    LOG_DBG("%s\n", __func__);
++    auto tmpls = read_templates("models/templates/Qwen3-Coder.jinja");
++
++    common_chat_templates_inputs inputs;
++    inputs.messages    = { message_user };
++    inputs.tools       = { python_tool };
++    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; // eager grammar: the whole output is constrained
++
++    const common_chat_session session(tmpls.get(), nullptr, inputs);
++    const std::string open  = "<tool_call>\n<function=python>\n<parameter=code>\n";
++    const std::string close = "\n</parameter>\n</function>\n</tool_call>";
++    auto grammar_ok = [&](const std::string & output) {
++        auto grammar = build_grammar(session.grammar());
++        return match_string(session.generation_prompt() + output, grammar.get());
++    };
++    auto parse = [&](const std::string & output) {
++        common_chat_session s = session;
++        return s.finish(common_chat_input(output));
++    };
++
++    std::string runaway;
++    for (int i = 0; i < 8; i++) {
++        runaway += "<parameter=code>\n<tool_call>\n</function>\n";
++    }
++    runaway += "x = 1";
++
++    // closed by the real "\n</parameter>\n": one call, the tags kept verbatim in the string
++    assert_equals(true, grammar_ok(open + runaway + close));
++    const auto msg = parse(open + runaway + close);
++    assert_equals<size_t>(1, msg.tool_calls.size());
++    assert_equals(json{ { "code", runaway } }.dump(), json::parse(msg.tool_calls[0].arguments).dump());
++
++    // without the real closer the grammar never completes, so the runaway ends at max_tokens
++    assert_equals(false, grammar_ok(open + runaway));
++    assert_equals(false, grammar_ok(open + runaway + "\n</function>\n</tool_call>"));
++
++    // after the closer, only declared structure: no undeclared argument, no second call
++    assert_equals(false, grammar_ok(open + "x = 1\n</parameter>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call>"));
++    assert_equals(false, grammar_ok(open + "x = 1" + close + "\n<tool_call>\n<function=python>\n<parameter=code>\nx" + close));
++}
++
+ static void test_chat_session() {
+     LOG_DBG("%s\n", __func__);
+     auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+@@ -9405,6 +9474,7 @@ int main(int argc, char ** argv) {
+         test_reasoning_effort_caps();
+         test_prompt_parts();
+         test_chat_session();
++        test_qwen3_coder_arg_tags();
+         test_reasoning_budget_tokens_per_request();
+         test_reasoning_budget_message_per_request();
+         test_template_output_peg_parsers(detailed_debug);
+-- 
+2.43.0
+

@@ -189,19 +189,35 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
 
         // A reasoning block: any effort's open tag (repeats of it are dropped), then the body up to any effort's close
         // tag. With tools offered, the start of a tool call also ends it, zero-width (the model sometimes starts its
-        // call while still "thinking"); a complete Kimi-form call does as well.
+        // call while still "thinking"); a complete Kimi-form call does as well. Only a real call start counts (the
+        // section opener then the call tag, or the call tag then a JSON call or a tool name, whitespace allowed): a
+        // bare call tag also shows up as prose in the thinking, and stays reasoning.
+        auto call_start = p.choice();
+        if (lenient && has_tools) {
+            auto names = p.choice();
+            foreach_function(inputs.tools, [&](size_t, const json & tool) {
+                names |= p.literal(tool.at("function").at("name").get<std::string>());
+            });
+            call_start = p.choice({ p.literal(SECTION_START) + p.space() + p.literal(CALL_START),
+                                    p.literal(CALL_START) + p.space() + p.literal("{"),
+                                    p.literal(CALL_START) + names });
+        }
         auto think_block = [&](bool tagged) {
             auto opening = literals(open_tags) + p.zero_or_more(p.space() + literals(open_tags)) + p.space();
             auto closers = literals(close_tags);
             std::vector<std::string> ends = close_tags;
+            std::vector<std::string> call_tags;
             if (lenient && has_tools) {
-                for (const auto & t : { SECTION_START, CALL_START }) {
-                    ends.push_back(t);
-                    closers |= p.peek(p.literal(t));
-                }
+                call_tags = { SECTION_START, CALL_START };
+                ends.insert(ends.end(), call_tags.begin(), call_tags.end());
+                closers |= p.peek(call_start);
             }
             auto body = [&](const std::vector<std::string> & stops, const common_peg_parser & closer) {
                 auto text = p.until_one_of(stops);
+                if (!call_tags.empty()) {
+                    // a call tag that does not start a call is prose: keep scanning past it
+                    text = text + p.zero_or_more(p.negate(call_start) + literals(call_tags) + p.until_one_of(stops));
+                }
                 return (tagged ? p.reasoning(text) : text) + closer;
             };
             auto plain = body(ends, closers);

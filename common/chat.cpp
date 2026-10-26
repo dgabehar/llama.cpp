@@ -1944,12 +1944,22 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
     }
     // the none parser may put the call in the reasoning when the reasoning block is never closed (DeepSeek V4): the
     // reasoning is cut too, but only then, so a closed reasoning that mentions an opener (Ministral 3) is kept
-    const auto cut_at_openers = [&](std::string & text) -> bool {
+    const auto cut_at_openers = [&](std::string & text, bool reasoning = false) -> bool {
         size_t cut = std::string::npos;
         for (const auto & opener : call_openers) {
             size_t pos = std::string::npos;
             if (opener.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
-                const std::string word = trim_whitespace(opener.value);
+                std::string word = trim_whitespace(opener.value);
+                // in the reasoning, a thinking end tag that extends the opener (Qwen3.5's `<tool_call>\n<function=`)
+                // is the real call: the bare opener there can be prose
+                if (reasoning) {
+                    for (const auto & end : thinking_ends) {
+                        const auto e = trim_whitespace(end);
+                        if (e.size() > word.size() && e.rfind(word, 0) == 0) {
+                            word = e;
+                        }
+                    }
+                }
                 pos = text.find(word);
                 if (pos == std::string::npos && is_partial) {
                     pos = string_find_partial_stop(text, word);
@@ -2015,16 +2025,18 @@ common_chat_msg common_chat_session::parse(bool is_partial) const {
         } catch (const std::exception &) {
         }
     }
-    // a thinking end tag that is also a call opener (DeepSeek V4 ends the reasoning at `<｜DSML｜tool_calls>`) does not
-    // close the reasoning here: the call it starts is what has to be cut
+    // a thinking end tag that is (or starts with) a call opener (DeepSeek V4 ends the reasoning at `<｜DSML｜tool_calls>`,
+    // Qwen3.5 at `<tool_call>\n<function=`) does not close the reasoning here: the call it starts is what has to be cut
     const bool reasoning_closed = std::any_of(thinking_ends.begin(), thinking_ends.end(), [&](const std::string & end) {
         const bool is_opener = std::any_of(call_openers.begin(), call_openers.end(), [&](const common_grammar_trigger & o) {
-            return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && trim_whitespace(o.value) == trim_whitespace(end);
+            const auto opener = trim_whitespace(o.value);
+            return o.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD && !opener.empty() &&
+                   trim_whitespace(end).rfind(opener, 0) == 0;
         });
         return !end.empty() && !is_opener && input.text.find(end) != std::string::npos;
     });
     if (msg.content.empty() && !reasoning_closed) {
-        cut_at_openers(msg.reasoning_content);
+        cut_at_openers(msg.reasoning_content, true);
     }
     msg.tool_calls.clear();
     return msg;

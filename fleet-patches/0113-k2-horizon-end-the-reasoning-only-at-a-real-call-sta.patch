@@ -1,0 +1,168 @@
+From 90f0e772f1c3557875d91ea58e5cb8fe0f4a7e08 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Mon, 26 Oct 2026 14:30:04 -0500
+Subject: [PATCH] k2-horizon: end the reasoning only at a real call start, not
+ a bare call tag
+
+With tools offered, the lenient reasoning stopped at any <ifm|tool_calls> or
+<ifm|tool_call>, so thinking that mentions the tags as prose ("wrap it in
+<ifm|tool_calls> ...") lost its reasoning: the call parse failed and
+lenient-fallback handed the whole thinking back as content.
+
+Fix: the reasoning ends at a close tag or at a real call start, taken from the
+template's call shape (k2-horizon.jinja / IFM-K2-Horizon.jinja): the section
+opener then the call tag, or the call tag then a JSON object or a tool name,
+whitespace allowed between them. A call tag that starts no call is scanned past
+as prose. The content-side openers, lazy triggers, thinking_end_tags and
+lenient-fallback are unchanged.
+
+Tests (both K2 templates): a prose mention followed by a call after the close
+tag, a call straight from the thinking, a bare call, the section opener with
+whitespace before the call tag, and a JSON-form call with and without
+whitespace. test-chat's fallback for calls nested in the thinking now looks for
+the trigger after the expected reasoning, since a prose tag inside the thinking
+never reaches the grammar.
+
+Assisted-by: Claude Opus 5.5
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/parsers/k2-horizon.cpp | 26 ++++++++++++----
+ tests/test-chat.cpp           | 56 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/common/parsers/k2-horizon.cpp b/common/parsers/k2-horizon.cpp
+index 3dfa0c17f..67c3969ba 100644
+--- a/common/parsers/k2-horizon.cpp
++++ b/common/parsers/k2-horizon.cpp
+@@ -189,19 +189,35 @@ common_chat_params common_chat_params_init_k2_horizon(const common_chat_template
+ 
+         // A reasoning block: any effort's open tag (repeats of it are dropped), then the body up to any effort's close
+         // tag. With tools offered, the start of a tool call also ends it, zero-width (the model sometimes starts its
+-        // call while still "thinking"); a complete Kimi-form call does as well.
++        // call while still "thinking"); a complete Kimi-form call does as well. Only a real call start counts (the
++        // section opener then the call tag, or the call tag then a JSON call or a tool name, whitespace allowed): a
++        // bare call tag also shows up as prose in the thinking, and stays reasoning.
++        auto call_start = p.choice();
++        if (lenient && has_tools) {
++            auto names = p.choice();
++            foreach_function(inputs.tools, [&](size_t, const json & tool) {
++                names |= p.literal(tool.at("function").at("name").get<std::string>());
++            });
++            call_start = p.choice({ p.literal(SECTION_START) + p.space() + p.literal(CALL_START),
++                                    p.literal(CALL_START) + p.space() + p.literal("{"),
++                                    p.literal(CALL_START) + names });
++        }
+         auto think_block = [&](bool tagged) {
+             auto opening = literals(open_tags) + p.zero_or_more(p.space() + literals(open_tags)) + p.space();
+             auto closers = literals(close_tags);
+             std::vector<std::string> ends = close_tags;
++            std::vector<std::string> call_tags;
+             if (lenient && has_tools) {
+-                for (const auto & t : { SECTION_START, CALL_START }) {
+-                    ends.push_back(t);
+-                    closers |= p.peek(p.literal(t));
+-                }
++                call_tags = { SECTION_START, CALL_START };
++                ends.insert(ends.end(), call_tags.begin(), call_tags.end());
++                closers |= p.peek(call_start);
+             }
+             auto body = [&](const std::vector<std::string> & stops, const common_peg_parser & closer) {
+                 auto text = p.until_one_of(stops);
++                if (!call_tags.empty()) {
++                    // a call tag that does not start a call is prose: keep scanning past it
++                    text = text + p.zero_or_more(p.negate(call_start) + literals(call_tags) + p.until_one_of(stops));
++                }
+                 return (tagged ? p.reasoning(text) : text) + closer;
+             };
+             auto plain = body(ends, closers);
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index d520c54f4..2da7a047f 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -1278,6 +1278,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
+ 
+         // Find the earliest trigger position to determine the constrained portion
+         auto earliest_trigger_pos = std::string::npos;
++        size_t trigger_search_from = 0;
+ 
+         if (use_reasoning_budget_path) {
+             // Reasoning-budget path: simulate thinking-aware trigger detection.
+@@ -1331,6 +1332,14 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
+             // blocks (e.g. Kimi). Fall back to the legacy path for this case.
+             if (earliest_trigger_pos == std::string::npos && !tc.expect.tool_calls.empty()) {
+                 use_reasoning_budget_path = false;
++                // the call starts where the expected reasoning ends: a call tag written as prose inside it
++                // never reaches the grammar
++                if (!tc.expect.reasoning_content.empty()) {
++                    const auto r = full_input.find(tc.expect.reasoning_content);
++                    if (r != std::string::npos) {
++                        trigger_search_from = r + tc.expect.reasoning_content.size();
++                    }
++                }
+             }
+         }
+ 
+@@ -1343,7 +1352,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
+                     case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                         {
+                             const auto & word = trigger.value;
+-                            pos               = full_input.find(word);
++                            pos               = full_input.find(word, trigger_search_from);
+                             break;
+                         }
+                     case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+@@ -5633,6 +5642,51 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+                 })
+                 .run();
+ 
++            // the bare call tags written as prose in the thinking stay reasoning; only a real call start ends it
++            {
++                const std::string prose = "Wrap it in <ifm|tool_calls> and one <ifm|tool_call> per call.";
++                const std::string call  = "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
++                                          "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
++                for (const std::string & sep : { std::string("</ifm|think_faster>\n"), std::string("\n") }) {
++                    tst.test(prose + sep + call)
++                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
++                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                        .tools({ bash_tool })
++                        .expect_reasoning(prose)
++                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
++                        .run();
++                }
++                // a bare call (no section opener) straight from the thinking
++                tst.test(prose + "\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>")
++                    .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
++                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                    .tools({ bash_tool })
++                    .expect_reasoning(prose)
++                    .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
++                    .run();
++                // whitespace between the section opener and the call tag
++                for (const std::string & ws : { std::string(" "), std::string("\n\n") }) {
++                    tst.test(prose + "\n<ifm|tool_calls>" + ws + "<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
++                             "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
++                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" } })
++                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                        .tools({ bash_tool })
++                        .expect_reasoning(prose)
++                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
++                        .run();
++                }
++                // JSON-form call straight from the thinking, with or without whitespace before the object
++                for (const std::string & ws : { std::string(""), std::string(" "), std::string("\n") }) {
++                    tst.test(prose + "\n<ifm|tool_call>" + ws + R"({"name": "bash", "arguments": {"command": "ls"}})" + "</ifm|tool_call>")
++                        .chat_template_kwargs({ { "reasoning_effort", "\"low\"" }, { "tool_call_format", R"("json")" } })
++                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++                        .tools({ bash_tool })
++                        .expect_reasoning(prose)
++                        .expect_tool_calls({ { "bash", R"({"command":"ls"})", "" } })
++                        .run();
++                }
++            }
++
+             // ... but real thinking before the tool-call start stays reasoning
+             tst.test("The glob matched nothing, retry with find.<ifm|tool_calls>\n<ifm|tool_call>bash\n"
+                      "<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+-- 
+2.43.0
+
