@@ -3905,6 +3905,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // A string value may carry the format's own tags as literal text (e.g. writing a
+        // chat template); only the real "\n</parameter>\n" closes it
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "{% for c in calls %}\n"
+               "<tool_call>\n"
+               "<function={{ c.name }}>\n"
+               "<parameter=x>\n"
+               "</parameter></function>\n"
+               "</tool_call>\n"
+               "{% endfor %}\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"{% for c in calls %}\\n<tool_call>\\n<function={{ c.name }}>\\n<parameter=x>\\n</parameter></function>\\n</tool_call>\\n{% endfor %}\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
         // Test with TODO list (array of objects)
         tst.test(
                "<tool_call>\n"
@@ -9045,6 +9068,52 @@ static void test_prompt_parts() {
     assert_equals(false, prompt.parts[0].is_input);
 }
 
+// Qwen3-Coder string arguments: the format's own tags are plain text inside a value (the
+// grammar always allowed them, so the parser must too), and a runaway repetition of them
+// stays inside that one value: it cannot end the call without the real closer, nor turn
+// into extra arguments or calls
+static void test_qwen3_coder_arg_tags() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/Qwen3-Coder.jinja");
+
+    common_chat_templates_inputs inputs;
+    inputs.messages    = { message_user };
+    inputs.tools       = { python_tool };
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; // eager grammar: the whole output is constrained
+
+    const common_chat_session session(tmpls.get(), nullptr, inputs);
+    const std::string open  = "<tool_call>\n<function=python>\n<parameter=code>\n";
+    const std::string close = "\n</parameter>\n</function>\n</tool_call>";
+    auto grammar_ok = [&](const std::string & output) {
+        auto grammar = build_grammar(session.grammar());
+        return match_string(session.generation_prompt() + output, grammar.get());
+    };
+    auto parse = [&](const std::string & output) {
+        common_chat_session s = session;
+        return s.finish(common_chat_input(output));
+    };
+
+    std::string runaway;
+    for (int i = 0; i < 8; i++) {
+        runaway += "<parameter=code>\n<tool_call>\n</function>\n";
+    }
+    runaway += "x = 1";
+
+    // closed by the real "\n</parameter>\n": one call, the tags kept verbatim in the string
+    assert_equals(true, grammar_ok(open + runaway + close));
+    const auto msg = parse(open + runaway + close);
+    assert_equals<size_t>(1, msg.tool_calls.size());
+    assert_equals(json{ { "code", runaway } }.dump(), json::parse(msg.tool_calls[0].arguments).dump());
+
+    // without the real closer the grammar never completes, so the runaway ends at max_tokens
+    assert_equals(false, grammar_ok(open + runaway));
+    assert_equals(false, grammar_ok(open + runaway + "\n</function>\n</tool_call>"));
+
+    // after the closer, only declared structure: no undeclared argument, no second call
+    assert_equals(false, grammar_ok(open + "x = 1\n</parameter>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call>"));
+    assert_equals(false, grammar_ok(open + "x = 1" + close + "\n<tool_call>\n<function=python>\n<parameter=code>\nx" + close));
+}
+
 static void test_chat_session() {
     LOG_DBG("%s\n", __func__);
     auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
@@ -9405,6 +9474,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_prompt_parts();
         test_chat_session();
+        test_qwen3_coder_arg_tags();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
