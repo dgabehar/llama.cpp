@@ -1110,69 +1110,95 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
   runs in production. Two real bugs found and patched here (`a1e979568`,
   `b74b2e31c`), both around checkpoint-based slot save/restore interacting
-  with the draft model's own KV state. A third symptom, root-caused and
-  FIXED (2026-09-15): MTP speculative decoding, combined with
-  grammar-constrained (tool-call) decoding, corrupted tool-call output by
-  occasionally re-emitting structural template tags (`<parameter=...>`,
-  `</function>`, `<tool_call>`) as literal string content -- matches the
-  broad shape of the still-open upstream tracking issue
-  [ggml-org/llama.cpp#23577](https://github.com/ggml-org/llama.cpp/issues/23577)
-  and the closed, "expected behavior"
-  [ggml-org/llama.cpp#23335](https://github.com/ggml-org/llama.cpp/issues/23335)
-  ("different kernels for different batch sizes"). Live logit-margin tracing
-  on gabesrv06 pinned the mechanism precisely: near-tied greedy picks (margins
-  as low as ~0.03) at the qwen3-coder template's structurally-ambiguous
-  decision points, consistent with batch-size numerical noise, not a
-  checkpoint-restore/grammar-desync bug (ruled out via direct tracing --
-  zero restore events fired during a traced corrupted run). Fixed with two
-  layered patches:
-  - **Primary fix** (`3e7b73528`, `server: disable speculative decoding for
-    grammar-constrained requests`): `get_n_draft_max()` returns 0 whenever
-    the request's sampling params carry an active grammar (tool-calling,
-    JSON-schema output). Confirmed correctly scoped -- plain chat requests
-    still draft normally (`draft_n > 0`).
-  - **Defense-in-depth** (`2d13e476c`, `qwen3-coder: bound xml-arg-string
-    with until_one_of, not a bare until`): hardens the tool-call parser's
-    string-argument grammar rule to exclude all structural tags from the
-    matched span, not just the single expected terminator. Tested alone and
-    found insufficient by itself (converts silent corruption into silent
-    failure -- no tool call produced at all) -- kept as a second layer
-    behind the primary fix, not a replacement for it.
-  Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
-  `fleet-patches`.
-  - **Defense-in-depth reverted, 2026-10-26** (`qwen3-coder: let a string
-    argument hold the format's own tags as text`; not run live on any node:
-    test-chat plus a CPU llama-server check on Qwen3.5-0.8B/4B). The rule is
+  with the draft model's own KV state.
+
+- **Tool-call tag corruption under speculative decoding (2026-09-15) and the
+  grammar guard.** On gabesrv06, MTP speculative decoding on qwen3-coder-format
+  tool calls re-emitted structural tags (`<parameter=...>`, `</function>`,
+  `<tool_call>`) inside string arguments and ran away. Not reproducible with
+  spec off.
+  - **Root cause (established 2026-10-26): the SSM_CONV_SPLIT conv-window
+    bug**, fixed in `0359ec5d4` (2026-09-24). `7f64d1946` (SSM_CONV_SPLIT)
+    reached gabesrv06 on 2026-09-14 (home-infrastructure #38), the day before.
+    Its `build_conv_window` saved a garbage conv state for any window wider
+    than one token. Plain decode only takes 1-token windows; every
+    speculative verify step is a multi-token ubatch, so only spec decode
+    corrupted the state, on grammar and plain requests alike (the 2026-09-24
+    think-tag leak was the plain-request face of it). The 2026-09-15
+    write-up blamed near-tied logits (margins ~0.03) tipped by batch-size
+    numerics (cf. upstream #23335, #23577); such flips are real but happen
+    equally with and without a grammar and do not make output invalid.
+  - **Why drafting under a grammar is safe once the state bug is gone**: the
+    verify path samples each position through the grammar and accepts it
+    before checking the next, a rejected draft token never reaches the
+    grammar, and a hybrid checkpoint restore copies the whole sampler back
+    (grammar including the lazy trigger buffer, reasoning budget):
+    `tests/test-sampler-copy-grammar.cpp`, and
+    `test_speculative.py::test_grammar_spec_checkpoint_restore_hybrid`
+    (opt-in, `LLAMA_TEST_HYBRID_MODEL`). Synthetic acceptance
+    (`--spec-synth-*`, bench only) does skip the grammar.
+  - **The guard** (`3e7b73528`, `server: disable speculative decoding for
+    grammar-constrained requests`) stays the default: `get_n_draft_max()`
+    returns 0 for any request with a grammar (tool calls, JSON schema), so
+    agent traffic decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with
+    drafts). **`--spec-grammar`** (env `LLAMA_ARG_SPEC_GRAMMAR`, default off)
+    lifts it, opt-in; it is ignored with a warning under `--spec-synth-*`.
+    Keep it off in production until a stress run on the real model
+    (Qwen3.8-27B, Vulkan) matches the CPU result below.
+  - **Parser-side hardening, reverted** (`2d13e476c` bounded the
+    xml-arg-string with `until_one_of`; reverted 2026-10-26 by `qwen3-coder:
+    let a string argument hold the format's own tags as text`). The rule is
     wrapped in `p.ac(.., "\n</parameter>\n")`, which emits the sampling
     grammar from that delimiter alone, so the tag exclusions never reached
     the grammar (GBNF byte-identical with and without them). They only made
-    the final parse reject what the grammar allowed: a value that holds
+    the final parse reject what the grammar allowed: a value holding
     `<tool_call>`/`<function=` as text (writing a chat template) returned
-    HTTP 500. The primary fix is the only guard against the runaway;
+    HTTP 500. Nothing in the parser or grammar stops a tag-repetition
+    runaway; with the state bug fixed, the guard is the remaining
+    conservative default and `--spec-grammar` the opt-out.
     `test_qwen3_coder_arg_tags` (`tests/test-chat.cpp`) pins what the
     grammar still bounds.
   - **Reasoning end, same class** (`qwen3-coder: end the reasoning only at a
     real call opener`, `k2-horizon: end the reasoning only at a real call
-    start`; same test scope, K2 unit-tested only). A bare `<tool_call>` /
-    `<ifm|tool_calls>` / `<ifm|tool_call>` written as prose in the thinking
-    ended the reasoning: a 500 on Qwen3.5, the thinking turned into content
-    on K2 (lenient-fallback). Qwen3.5 now ends at `</think>` or
-    `<tool_call>\n<function=` (parser, peek and `thinking_end_tags`); K2 at
-    a close tag or the section opener + call tag / call tag + `{` or a tool
-    name, whitespace allowed. Known limits: under tool_choice auto, a call
-    opened from inside unclosed thinking in a non-canonical form (JSON form
-    or an extra blank line on Qwen3.5, which its call grammar rejects
-    anyway; an odd tokenization of the end tag) does not end the reasoning
-    budget, so it is not grammar-constrained, and on Qwen3.5 it stays in the
-    reasoning. Quoting the exact call-start string in the thinking (K2's
-    system prompt contains `<ifm|tool_calls>\n<ifm|tool_call>`) still ends
-    the reasoning there.
-  - **Other `p.ac` sites** (swept 2026-10-26): auto-parser, minimax-m3,
+    start`; test-chat plus CPU llama-server on Qwen3.5-0.8B/4B, K2
+    unit-tested only). A bare `<tool_call>` / `<ifm|tool_calls>` /
+    `<ifm|tool_call>` written as prose in the thinking ended the reasoning:
+    a 500 on Qwen3.5, the thinking turned into content on K2. Qwen3.5 now
+    ends at `</think>` or `<tool_call>\n<function=` (parser, peek and
+    `thinking_end_tags`); K2 at a close tag or the section opener + call tag
+    / call tag + `{` or a tool name, whitespace allowed.
+  - **Known limits.** Under tool_choice auto, a call opened from inside
+    unclosed thinking in a non-canonical form (JSON form or an extra blank
+    line on Qwen3.5, which its call grammar rejects anyway; an odd
+    tokenization of the end tag) does not end the reasoning budget, so it is
+    not grammar-constrained, and on Qwen3.5 it stays in the reasoning.
+    Quoting the exact call-start string in the thinking (K2's system prompt
+    contains `<ifm|tool_calls>\n<ifm|tool_call>`) still ends the reasoning
+    there. Other `p.ac` sites (swept 2026-10-26): auto-parser, minimax-m3,
     minicpm5, muse-glimmer, muse-spark use a bare `until` on the ac
-    delimiter, so parser and grammar agree. `harmony-xml.cpp` still differs
-    from its grammar (the value also stops at `\n<rfl:parameter name="` /
-    `\n<|end|>` to tolerate a missing close tag): upstream-identical, no
-    fleet model uses it, left as upstream.
+    delimiter, so parser and grammar agree; `harmony-xml.cpp` still differs
+    from its grammar (upstream-identical, no fleet model uses it).
+  - **CPU A/B** (`tools/server/bench/spec_grammar_stress.py`), Qwen3.5-0.8B
+    with MTP head, `--spec-type ngram-mod,draft-mtp --spec-draft-n-max 4`,
+    `tool_choice` auto (lazy grammar), temp 0.6, 40 requests per arm,
+    `--max-tokens 1536`. "Truncated" means the reply hit max-tokens; the
+    tool cannot tell a long valid answer from a runaway, so read it next to
+    the tag/no-call columns.
+
+  | arm | valid | truncated (tpl.jinja) | tag in arg / no call | tok/s | wall s | restores |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | guard (default) | 34 | 6 (1) | 0 / 0 | 29.9 | 757 | 0 |
+  | `--spec-grammar` | 34 | 6 (1) | 0 / 0 | 33.3 | 715 | 73 |
+
+  Sequential arms on a shared workstation are noisy (an earlier run put the
+  guard arm at 19.1 tok/s); 24 requests interleaved between two live servers
+  gave 28.4 tok/s guard vs 40.2 with `--spec-grammar` (1.42x), draft
+  acceptance 0.60. With SSM_CONV_SPLIT's bug put back (pre-`0359ec5d4`
+  graph, same flag), 1 of 40 was valid: 29 runaways to max-tokens, 3 tags in
+  arguments, 7 no call. The remaining tpl.jinja truncation (1 of 5 in each
+  arm, the same seed) is the 0.8B model looping on Jinja text inside the
+  argument (`{% set ... %}` lines), with no template tags, in both arms;
+  the reasoning-end fix holds (the thinking closed normally).
 
 - **CPU locality-domain split ("Track A") caused a real production outage
   on first rollout (2026-09-18) -- crash-looped BOTH gabesrv06 and

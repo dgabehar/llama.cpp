@@ -285,6 +285,7 @@ llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTOR
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build_and_test(test-split-balance.cpp  LABEL behavior)
 llama_build_and_test(test-fit-clamp.cpp  LABEL behavior)
+llama_build_and_test(test-sampler-copy-grammar.cpp  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)

@@ -1,0 +1,692 @@
+From a6a56f6a97c4fd3f1e0b4c6864b500d86af8e3b9 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Mon, 26 Oct 2026 11:45:43 -0500
+Subject: [PATCH] server: add --spec-grammar to draft for grammar-constrained
+ requests
+
+The 2026-09-15 guard (3e7b73528) turns speculative decoding off for any
+request with a grammar, which leaves tool-call traffic on plain decode.
+--spec-grammar (env LLAMA_ARG_SPEC_GRAMMAR) lifts it; the default keeps
+the guard. Synthetic acceptance keeps the guard and warns, since it takes
+draft tokens without the grammar.
+
+The verify path already keeps grammar output exact: each position is
+sampled through the grammar and accepted before the next is checked, and
+a checkpoint restore copies the whole sampler back. The corruption the
+guard was added for came from the SSM_CONV_SPLIT conv-state bug (added
+7f64d1946 the day before, fixed 0359ec5d4 on 2026-09-24), which corrupted
+the state on every multi-token verify ubatch. FLEET.md has the story in
+one entry, with the CPU A/B.
+
+Tests: test-sampler-copy-grammar (common_sampler_copy restores a lazy
+grammar's trigger state and buffer, and the reasoning-budget state), a
+server test that greedy output under a grammar is unchanged with drafting
+on, and an opt-in server test (LLAMA_TEST_HYBRID_MODEL) that counts
+checkpoint restores under a grammar on a qwen35 model. Adds
+tools/server/bench/spec_grammar_stress.py, a tool-call validity and speed
+A/B to run with and without the flag.
+
+Assisted-by: Claude Opus 5.5
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ FLEET.md                                    | 134 +++++++++++-------
+ common/arg.cpp                              |   9 ++
+ common/common.h                             |   3 +
+ tests/CMakeLists.txt                        |   1 +
+ tests/test-sampler-copy-grammar.cpp         | 119 ++++++++++++++++
+ tools/server/bench/spec_grammar_stress.py   | 147 ++++++++++++++++++++
+ tools/server/server-context.cpp             |  21 ++-
+ tools/server/tests/unit/test_speculative.py |  80 +++++++++++
+ tools/server/tests/utils.py                 |   3 +
+ 9 files changed, 462 insertions(+), 55 deletions(-)
+ create mode 100644 tests/test-sampler-copy-grammar.cpp
+ create mode 100644 tools/server/bench/spec_grammar_stress.py
+
+diff --git a/FLEET.md b/FLEET.md
+index 79f4b2725..fdac013eb 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -1110,69 +1110,95 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
+   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
+   runs in production. Two real bugs found and patched here (`a1e979568`,
+   `b74b2e31c`), both around checkpoint-based slot save/restore interacting
+-  with the draft model's own KV state. A third symptom, root-caused and
+-  FIXED (2026-09-15): MTP speculative decoding, combined with
+-  grammar-constrained (tool-call) decoding, corrupted tool-call output by
+-  occasionally re-emitting structural template tags (`<parameter=...>`,
+-  `</function>`, `<tool_call>`) as literal string content -- matches the
+-  broad shape of the still-open upstream tracking issue
+-  [ggml-org/llama.cpp#23577](https://github.com/ggml-org/llama.cpp/issues/23577)
+-  and the closed, "expected behavior"
+-  [ggml-org/llama.cpp#23335](https://github.com/ggml-org/llama.cpp/issues/23335)
+-  ("different kernels for different batch sizes"). Live logit-margin tracing
+-  on gabesrv06 pinned the mechanism precisely: near-tied greedy picks (margins
+-  as low as ~0.03) at the qwen3-coder template's structurally-ambiguous
+-  decision points, consistent with batch-size numerical noise, not a
+-  checkpoint-restore/grammar-desync bug (ruled out via direct tracing --
+-  zero restore events fired during a traced corrupted run). Fixed with two
+-  layered patches:
+-  - **Primary fix** (`3e7b73528`, `server: disable speculative decoding for
+-    grammar-constrained requests`): `get_n_draft_max()` returns 0 whenever
+-    the request's sampling params carry an active grammar (tool-calling,
+-    JSON-schema output). Confirmed correctly scoped -- plain chat requests
+-    still draft normally (`draft_n > 0`).
+-  - **Defense-in-depth** (`2d13e476c`, `qwen3-coder: bound xml-arg-string
+-    with until_one_of, not a bare until`): hardens the tool-call parser's
+-    string-argument grammar rule to exclude all structural tags from the
+-    matched span, not just the single expected terminator. Tested alone and
+-    found insufficient by itself (converts silent corruption into silent
+-    failure -- no tool call produced at all) -- kept as a second layer
+-    behind the primary fix, not a replacement for it.
+-  Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
+-  `fleet-patches`.
+-  - **Defense-in-depth reverted, 2026-10-26** (`qwen3-coder: let a string
+-    argument hold the format's own tags as text`; not run live on any node:
+-    test-chat plus a CPU llama-server check on Qwen3.5-0.8B/4B). The rule is
++  with the draft model's own KV state.
++
++- **Tool-call tag corruption under speculative decoding (2026-09-15) and the
++  grammar guard.** On gabesrv06, MTP speculative decoding on qwen3-coder-format
++  tool calls re-emitted structural tags (`<parameter=...>`, `</function>`,
++  `<tool_call>`) inside string arguments and ran away. Not reproducible with
++  spec off.
++  - **Root cause (established 2026-10-26): the SSM_CONV_SPLIT conv-window
++    bug**, fixed in `0359ec5d4` (2026-09-24). `7f64d1946` (SSM_CONV_SPLIT)
++    reached gabesrv06 on 2026-09-14 (home-infrastructure #38), the day before.
++    Its `build_conv_window` saved a garbage conv state for any window wider
++    than one token. Plain decode only takes 1-token windows; every
++    speculative verify step is a multi-token ubatch, so only spec decode
++    corrupted the state, on grammar and plain requests alike (the 2026-09-24
++    think-tag leak was the plain-request face of it). The 2026-09-15
++    write-up blamed near-tied logits (margins ~0.03) tipped by batch-size
++    numerics (cf. upstream #23335, #23577); such flips are real but happen
++    equally with and without a grammar and do not make output invalid.
++  - **Why drafting under a grammar is safe once the state bug is gone**: the
++    verify path samples each position through the grammar and accepts it
++    before checking the next, a rejected draft token never reaches the
++    grammar, and a hybrid checkpoint restore copies the whole sampler back
++    (grammar including the lazy trigger buffer, reasoning budget):
++    `tests/test-sampler-copy-grammar.cpp`, and
++    `test_speculative.py::test_grammar_spec_checkpoint_restore_hybrid`
++    (opt-in, `LLAMA_TEST_HYBRID_MODEL`). Synthetic acceptance
++    (`--spec-synth-*`, bench only) does skip the grammar.
++  - **The guard** (`3e7b73528`, `server: disable speculative decoding for
++    grammar-constrained requests`) stays the default: `get_n_draft_max()`
++    returns 0 for any request with a grammar (tool calls, JSON schema), so
++    agent traffic decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with
++    drafts). **`--spec-grammar`** (env `LLAMA_ARG_SPEC_GRAMMAR`, default off)
++    lifts it, opt-in; it is ignored with a warning under `--spec-synth-*`.
++    Keep it off in production until a stress run on the real model
++    (Qwen3.8-27B, Vulkan) matches the CPU result below.
++  - **Parser-side hardening, reverted** (`2d13e476c` bounded the
++    xml-arg-string with `until_one_of`; reverted 2026-10-26 by `qwen3-coder:
++    let a string argument hold the format's own tags as text`). The rule is
+     wrapped in `p.ac(.., "\n</parameter>\n")`, which emits the sampling
+     grammar from that delimiter alone, so the tag exclusions never reached
+     the grammar (GBNF byte-identical with and without them). They only made
+-    the final parse reject what the grammar allowed: a value that holds
++    the final parse reject what the grammar allowed: a value holding
+     `<tool_call>`/`<function=` as text (writing a chat template) returned
+-    HTTP 500. The primary fix is the only guard against the runaway;
++    HTTP 500. Nothing in the parser or grammar stops a tag-repetition
++    runaway; with the state bug fixed, the guard is the remaining
++    conservative default and `--spec-grammar` the opt-out.
+     `test_qwen3_coder_arg_tags` (`tests/test-chat.cpp`) pins what the
+     grammar still bounds.
+   - **Reasoning end, same class** (`qwen3-coder: end the reasoning only at a
+     real call opener`, `k2-horizon: end the reasoning only at a real call
+-    start`; same test scope, K2 unit-tested only). A bare `<tool_call>` /
+-    `<ifm|tool_calls>` / `<ifm|tool_call>` written as prose in the thinking
+-    ended the reasoning: a 500 on Qwen3.5, the thinking turned into content
+-    on K2 (lenient-fallback). Qwen3.5 now ends at `</think>` or
+-    `<tool_call>\n<function=` (parser, peek and `thinking_end_tags`); K2 at
+-    a close tag or the section opener + call tag / call tag + `{` or a tool
+-    name, whitespace allowed. Known limits: under tool_choice auto, a call
+-    opened from inside unclosed thinking in a non-canonical form (JSON form
+-    or an extra blank line on Qwen3.5, which its call grammar rejects
+-    anyway; an odd tokenization of the end tag) does not end the reasoning
+-    budget, so it is not grammar-constrained, and on Qwen3.5 it stays in the
+-    reasoning. Quoting the exact call-start string in the thinking (K2's
+-    system prompt contains `<ifm|tool_calls>\n<ifm|tool_call>`) still ends
+-    the reasoning there.
+-  - **Other `p.ac` sites** (swept 2026-10-26): auto-parser, minimax-m3,
++    start`; test-chat plus CPU llama-server on Qwen3.5-0.8B/4B, K2
++    unit-tested only). A bare `<tool_call>` / `<ifm|tool_calls>` /
++    `<ifm|tool_call>` written as prose in the thinking ended the reasoning:
++    a 500 on Qwen3.5, the thinking turned into content on K2. Qwen3.5 now
++    ends at `</think>` or `<tool_call>\n<function=` (parser, peek and
++    `thinking_end_tags`); K2 at a close tag or the section opener + call tag
++    / call tag + `{` or a tool name, whitespace allowed.
++  - **Known limits.** Under tool_choice auto, a call opened from inside
++    unclosed thinking in a non-canonical form (JSON form or an extra blank
++    line on Qwen3.5, which its call grammar rejects anyway; an odd
++    tokenization of the end tag) does not end the reasoning budget, so it is
++    not grammar-constrained, and on Qwen3.5 it stays in the reasoning.
++    Quoting the exact call-start string in the thinking (K2's system prompt
++    contains `<ifm|tool_calls>\n<ifm|tool_call>`) still ends the reasoning
++    there. Other `p.ac` sites (swept 2026-10-26): auto-parser, minimax-m3,
+     minicpm5, muse-glimmer, muse-spark use a bare `until` on the ac
+-    delimiter, so parser and grammar agree. `harmony-xml.cpp` still differs
+-    from its grammar (the value also stops at `\n<rfl:parameter name="` /
+-    `\n<|end|>` to tolerate a missing close tag): upstream-identical, no
+-    fleet model uses it, left as upstream.
++    delimiter, so parser and grammar agree; `harmony-xml.cpp` still differs
++    from its grammar (upstream-identical, no fleet model uses it).
++  - **CPU A/B** (`tools/server/bench/spec_grammar_stress.py`), Qwen3.5-0.8B
++    with MTP head, `--spec-type ngram-mod,draft-mtp --spec-draft-n-max 4`,
++    `tool_choice` auto (lazy grammar), temp 0.6, 40 requests per arm,
++    `--max-tokens 1536`. "Truncated" means the reply hit max-tokens; the
++    tool cannot tell a long valid answer from a runaway, so read it next to
++    the tag/no-call columns.
++
++  | arm | valid | truncated (tpl.jinja) | tag in arg / no call | tok/s | wall s | restores |
++  | --- | --- | --- | --- | --- | --- | --- |
++  | guard (default) | 34 | 6 (1) | 0 / 0 | 29.9 | 757 | 0 |
++  | `--spec-grammar` | 34 | 6 (1) | 0 / 0 | 33.3 | 715 | 73 |
++
++  Sequential arms on a shared workstation are noisy (an earlier run put the
++  guard arm at 19.1 tok/s); 24 requests interleaved between two live servers
++  gave 28.4 tok/s guard vs 40.2 with `--spec-grammar` (1.42x), draft
++  acceptance 0.60. With SSM_CONV_SPLIT's bug put back (pre-`0359ec5d4`
++  graph, same flag), 1 of 40 was valid: 29 runaways to max-tokens, 3 tags in
++  arguments, 7 no call. The remaining tpl.jinja truncation (1 of 5 in each
++  arm, the same seed) is the 0.8B model looping on Jinja text inside the
++  argument (`{% set ... %}` lines), with no template tags, in both arms;
++  the reasoning-end fix holds (the thinking closed normally).
+ 
+ - **CPU locality-domain split ("Track A") caused a real production outage
+   on first rollout (2026-09-18) -- crash-looped BOTH gabesrv06 and
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 0c27d3259..884d29a37 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4300,6 +4300,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+ 
++    add_opt(common_arg(
++        {"--spec-grammar"},
++        {"--no-spec-grammar"},
++        string_format("also draft for grammar-constrained requests (tool calls, json schema); each accepted token is still checked against the grammar (default: %s)",
++            params.speculative.grammar ? "enabled" : "disabled"),
++        [](common_params & params, bool value) {
++            params.speculative.grammar = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_GRAMMAR"));
+     add_opt(common_arg(
+         {"--spec-draft-p-split", "--draft-p-split"}, "P",
+         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
+diff --git a/common/common.h b/common/common.h
+index ac7b12715..73bb405d6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -392,6 +392,9 @@ struct common_params_speculative {
+     double synth_len = -1.0;
+     std::vector<double> synth_rates;
+ 
++    // draft for requests with a grammar too (tool calls, json schema); off keeps them on plain decode
++    bool grammar = false;
++
+     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+     common_params_speculative_draft draft;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7079028ce..48a9ff777 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -285,6 +285,7 @@ llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTOR
+ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
+ llama_build_and_test(test-split-balance.cpp  LABEL behavior)
+ llama_build_and_test(test-fit-clamp.cpp  LABEL behavior)
++llama_build_and_test(test-sampler-copy-grammar.cpp  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+ # debug tool for chat template differential analysis (not registered as a test, run it manually)
+ llama_build(test-chat-analysis.cpp)
+ llama_build_and_test(test-log.cpp  LABEL behavior)
+diff --git a/tests/test-sampler-copy-grammar.cpp b/tests/test-sampler-copy-grammar.cpp
+new file mode 100644
+index 000000000..7250a1869
+--- /dev/null
++++ b/tests/test-sampler-copy-grammar.cpp
+@@ -0,0 +1,119 @@
++// common_sampler_copy must restore a lazy grammar exactly: whether it is still waiting for its
++// trigger, and a partial trigger held in its buffer. The server's speculative verify path relies on
++// this when it restores a checkpoint after a partial draft acceptance (--spec-grammar).
++//
++// usage: test-sampler-copy-grammar <vocab.gguf>
++
++#include "common.h"
++#include "sampling.h"
++#include "llama.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
++
++static const llama_vocab * g_vocab;
++
++// accept the tokens of `text` as generated tokens; false if the grammar rejected one
++static bool accept(common_sampler * s, const std::string & text) {
++    try {
++        for (llama_token t : common_tokenize(g_vocab, text, false, false)) {
++            common_sampler_accept(s, t, true);
++        }
++    } catch (const std::exception &) {
++        return false;
++    }
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <vocab.gguf>\n", argv[0]);
++        return 1;
++    }
++
++    llama_backend_init();
++
++    auto mparams = llama_model_default_params();
++    mparams.vocab_only = true;
++    llama_model * model = llama_model_load_from_file(argv[1], mparams);
++    CHECK(model);
++    g_vocab = llama_model_get_vocab(model);
++
++    common_params_sampling params;
++    params.grammar          = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, "root ::= \"<tool_call>\" [a-z]+");
++    params.grammar_lazy     = true;
++    params.grammar_triggers = { { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<tool_call>" } };
++
++    // a lazy grammar brings the reasoning-budget sampler along; the grammar stays off while thinking
++    params.reasoning_budget_start = common_tokenize(g_vocab, "<think>", false, false);
++    params.reasoning_budget_end   = { common_tokenize(g_vocab, "</think>", false, false) };
++
++    // saved while thinking: a tool call opened after the rollback point must not leak into the restored state
++    {
++        common_sampler * a = common_sampler_init(model, params);
++        CHECK(accept(a, "<think>let me"));
++        common_sampler * at = common_sampler_clone(a);
++        // tokenized apart so the end tag matches the reasoning-budget end sequence
++        CHECK(accept(a, " see"));
++        CHECK(accept(a, "</think>"));
++        CHECK(accept(a, "<tool_call>ab"));
++        {
++            common_sampler * t = common_sampler_clone(a);
++            CHECK(!accept(t, "9")); // done thinking and triggered
++            common_sampler_free(t);
++        }
++        common_sampler_copy(at, a);
++        CHECK(accept(a, " <tool_call>9 9")); // still thinking, so no grammar
++        CHECK(accept(a, "</think>"));
++        CHECK(accept(a, "ok <tool_call>z"));
++        CHECK(!accept(a, "9"));
++        common_sampler_free(at);
++        common_sampler_free(a);
++    }
++
++    // free text, then half of the trigger
++    common_sampler * s = common_sampler_init(model, params);
++    CHECK(s);
++    CHECK(accept(s, "sure, 123 <tool"));
++
++    common_sampler * save = common_sampler_clone(s);
++
++    // run ahead past the trigger, as a verify step would, then roll back
++    CHECK(accept(s, "_call>abc"));
++    {
++        common_sampler * t = common_sampler_clone(s);
++        CHECK(!accept(t, "9")); // triggered: digits are out
++        common_sampler_free(t);
++    }
++    common_sampler_copy(save, s);
++
++    // restored: the trigger has not fired, and the buffered "<tool" is still there,
++    // so finishing the trigger fires it and the grammar then applies
++    {
++        common_sampler * t = common_sampler_clone(s);
++        CHECK(accept(t, "9")); // still free text
++        common_sampler_free(t);
++    }
++    CHECK(accept(s, "_call>xyz"));
++    CHECK(!accept(s, "9"));
++
++    // copy into a sampler that was never on this path (the slot's sampler after a reset)
++    {
++        common_sampler * fresh = common_sampler_init(model, params);
++        common_sampler_copy(save, fresh);
++        CHECK(accept(fresh, "_call>q"));
++        CHECK(!accept(fresh, "7"));
++        common_sampler_free(fresh);
++    }
++
++    common_sampler_free(save);
++    common_sampler_free(s);
++    llama_model_free(model);
++    llama_backend_free();
++
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tools/server/bench/spec_grammar_stress.py b/tools/server/bench/spec_grammar_stress.py
+new file mode 100644
+index 000000000..8f81348de
+--- /dev/null
++++ b/tools/server/bench/spec_grammar_stress.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++# Tool-call corruption stress test for speculative decoding under a grammar (--spec-grammar).
++#
++# Sends N tool-call requests to a running llama-server and checks every call:
++#   - the reply parses into tool_calls (finish_reason "tool_calls")
++#   - each call's arguments are valid JSON with the required keys
++#   - no string argument carries a template tag (<parameter=, </parameter>, </function>, <tool_call>, ...)
++# Run it once against a server started without --spec-grammar and once with it, same model and flags
++# otherwise, and compare the two summaries. The 2026-09-15 failure showed up as template tags in
++# string arguments.
++#
++#   python3 spec_grammar_stress.py --url http://127.0.0.1:8080 -n 200 --temp 0.6 --out on.jsonl
++
++import argparse
++import json
++import re
++import sys
++import time
++import urllib.error
++import urllib.request
++
++TAG = re.compile(r"</?(tool_call|function|parameter)\b|<parameter=|<function=")
++
++TOOLS = [
++    {"type": "function", "function": {
++        "name": "write_file",
++        "description": "Write a file to disk.",
++        "parameters": {"type": "object", "properties": {
++            "path": {"type": "string"}, "content": {"type": "string"}},
++            "required": ["path", "content"]}}},
++    {"type": "function", "function": {
++        "name": "run_command",
++        "description": "Run a shell command.",
++        "parameters": {"type": "object", "properties": {
++            "command": {"type": "string"}, "cwd": {"type": "string"}},
++            "required": ["command"]}}},
++    {"type": "function", "function": {
++        "name": "edit_file",
++        "description": "Replace text in a file.",
++        "parameters": {"type": "object", "properties": {
++            "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
++            "required": ["path", "old", "new"]}}},
++]
++REQUIRED = {t["function"]["name"]: t["function"]["parameters"]["required"] for t in TOOLS}
++
++# string arguments with markup, code and repetition: where the tag ambiguity bites
++PROMPTS = [
++    "Write an HTML page to /tmp/a.html with a table of 8 rows of fruit names and prices.",
++    "Create /tmp/parse.py: a Python function that parses XML like <item><name>x</name></item> into dicts, with tests.",
++    "Write a bash script /tmp/loop.sh that prints numbers 1 to 20, each on its own line, with comments.",
++    "In /tmp/cfg.yaml replace 'port: 8080' with 'port: 9090'.",
++    "Run `grep -rn TODO src/` in /home/user/proj.",
++    "Write /tmp/notes.md: a markdown checklist of 12 steps to set up a Kubernetes cluster.",
++    "Create /tmp/schema.json with a JSON schema for a user object with 10 fields.",
++    "Write /tmp/tpl.jinja: a Jinja template that renders a list of tool calls as <tool_call> blocks.",
++]
++# prompts whose arguments legitimately contain template tags: kept for the parse check, skipped by the tag check
++TAG_OK = {len(PROMPTS) - 1}
++
++
++def post(url, body, timeout):
++    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.loads(r.read())
++
++
++def check(resp, tags_ok=False):
++    choice = resp["choices"][0]
++    calls = choice["message"].get("tool_calls") or []
++    content = choice["message"].get("content") or ""
++    if choice.get("finish_reason") == "length":
++        return "truncated", ""  # not a corruption verdict; raise --max-tokens
++    if not calls:
++        return "no_call", ("tag in content" if not tags_ok and TAG.search(content) else "")
++    for c in calls:
++        name = c["function"]["name"]
++        try:
++            args = json.loads(c["function"]["arguments"])
++        except Exception as e:
++            return "bad_json", str(e)
++        if name not in REQUIRED or not isinstance(args, dict):
++            return "bad_name", name
++        missing = [k for k in REQUIRED[name] if k not in args]
++        if missing:
++            return "missing_arg", ",".join(missing)
++        for k, v in args.items():
++            if not tags_ok and isinstance(v, str) and TAG.search(v):
++                return "tag_in_arg", f"{name}.{k}: {TAG.search(v).group(0)}"
++    return "ok", ""
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--url", default="http://127.0.0.1:8080")
++    ap.add_argument("-n", type=int, default=200)
++    ap.add_argument("--temp", type=float, default=0.6)
++    # auto gives the lazy grammar (trigger buffer + reasoning-budget sampler), the 2026-09-15 setup
++    ap.add_argument("--tool-choice", choices=["auto", "required"], default="auto")
++    ap.add_argument("--max-tokens", type=int, default=2048)
++    ap.add_argument("--timeout", type=float, default=600)
++    ap.add_argument("--out", default="")
++    a = ap.parse_args()
++
++    out = open(a.out, "w") if a.out else None
++    counts, n_draft, n_acc, n_pred, t_pred = {}, 0, 0, 0, 0.0
++    t0 = time.time()
++    for i in range(a.n):
++        body = {
++            "messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}],
++            "tools": TOOLS, "tool_choice": a.tool_choice,
++            "temperature": a.temp, "seed": i, "max_tokens": a.max_tokens,
++        }
++        try:
++            resp = post(a.url, body, a.timeout)
++            verdict, detail = check(resp, i % len(PROMPTS) in TAG_OK)
++            tm = resp.get("timings", {})
++        except urllib.error.HTTPError as e:
++            msg = e.read().decode(errors="replace")
++            # the tool-call parser refusing the output is the same failure class as a tag in an argument
++            verdict = "parse_error" if "does not match" in msg else "http_error"
++            resp, detail, tm = None, msg[:200], {}
++        except Exception as e:
++            resp, verdict, detail, tm = None, "http_error", str(e), {}
++        counts[verdict] = counts.get(verdict, 0) + 1
++        n_draft += tm.get("draft_n", 0)
++        n_acc += tm.get("draft_n_accepted", 0)
++        n_pred += tm.get("predicted_n", 0)
++        t_pred += tm.get("predicted_ms", 0.0) / 1000
++        if out:
++            out.write(json.dumps({"i": i, "verdict": verdict, "detail": detail, "resp": resp}) + "\n")
++        if verdict != "ok":
++            print(f"[{i}] {verdict} {detail}", file=sys.stderr)
++
++    summary = {
++        "n": a.n, "temp": a.temp, "tool_choice": a.tool_choice, "counts": counts,
++        "bad": a.n - counts.get("ok", 0) - counts.get("truncated", 0),
++        "draft_n": n_draft, "draft_accepted": n_acc,
++        "accept_rate": round(n_acc / n_draft, 3) if n_draft else None,
++        "tok_per_s": round(n_pred / t_pred, 2) if t_pred else None,
++        "wall_s": round(time.time() - t0, 1),
++    }
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e9e3b371b..f6aaee56a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -319,6 +319,9 @@ struct server_slot {
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
+ 
++    // --spec-grammar: draft for grammar-constrained requests too (see get_n_draft_max)
++    bool spec_grammar = false;
++
+     // context checkpoints captured inside the current batch instead of splitting it
+     // (see llama_state_seq_capture_add)
+     struct ckpt_capture {
+@@ -631,7 +634,16 @@ struct server_slot {
+         // the milder, already-mitigated version of the same underlying phenomenon).
+         // Plain chat/completion requests (no grammar) keep the full speculative-decoding
+         // speed win.
+-        if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE) {
++        //
++        // --spec-grammar lifts this guard. The verify path keeps grammar output exact: each
++        // position is sampled through the grammar and then accepted before the next one is
++        // checked, so a rejected draft token never reaches the grammar, and a checkpoint
++        // restore copies the whole sampler (grammar and lazy-trigger state included) back.
++        // The 2026-09-15 corruption most likely came from the SSM_CONV_SPLIT conv-state bug
++        // (7f64d1946, 2026-09-14), which wrote a garbage conv state on every multi-token
++        // ubatch, i.e. every verify step, and was fixed on 2026-09-24 (0359ec5d4). Off by
++        // default until a stress run on a build with that fix shows no tag corruption.
++        if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE && !spec_grammar) {
+             return 0;
+         }
+ 
+@@ -1628,6 +1640,10 @@ private:
+             return false;
+         }
+ 
++        if (params_base.speculative.grammar && params_base.speculative.has_synth()) {
++            SRV_WRN("%s", "--spec-grammar is ignored with --spec-synth-*: synthetic acceptance skips the grammar\n");
++        }
++
+         for (int i = 0; i < params_base.n_parallel; i++) {
+             server_slot & slot = slots[i];
+ 
+@@ -1638,6 +1654,9 @@ private:
+             slot.spec    = spec.get();
+             slot.n_ctx   = n_ctx_slot();
+ 
++            // synthetic acceptance takes draft tokens without the grammar, so it keeps the guard
++            slot.spec_grammar = params_base.speculative.grammar && !params_base.speculative.has_synth();
++
+             slot.mctx                   = mctx;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+ 
+diff --git a/tools/server/tests/unit/test_speculative.py b/tools/server/tests/unit/test_speculative.py
+index 0d41b1173..f424be16f 100644
+--- a/tools/server/tests/unit/test_speculative.py
++++ b/tools/server/tests/unit/test_speculative.py
+@@ -1,4 +1,5 @@
+ import pytest
++import re
+ from utils import *
+ 
+ # We use a F16 MOE gguf as main model, and q4_0 as draft model
+@@ -265,3 +266,82 @@ def test_draft_token_probs():
+         assert abs(tok_draft["logprob"] - tok_no_draft["logprob"]) < 0.25
+     # real logprobs are not all exactly 0.0 (prob 1.0)
+     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
++
++
++def test_grammar_drafts_only_with_spec_grammar():
++    global server
++    # lowercase words only, so the grammar rejects most of what the stories model would say
++    request = {
++        "prompt": "I believe the meaning of life is",
++        "temperature": 0.0,
++        "n_predict": 32,
++        "grammar": "root ::= [a-z]+ (\" \" [a-z]+)*",
++        "return_tokens": True,
++    }
++
++    server.model_draft = None
++    server.spec_type = None
++    server.start()
++    res = server.make_request("POST", "/completion", data=request)
++    assert res.status_code == 200
++    tokens_plain = res.body["tokens"]
++    server.stop()
++
++    # default: the guard keeps grammar requests on plain decode
++    create_server()
++    server.start()
++    res = server.make_request("POST", "/completion", data=request)
++    assert res.status_code == 200
++    assert res.body["timings"].get("draft_n", 0) == 0
++    assert res.body["tokens"] == tokens_plain
++    server.stop()
++
++    # --spec-grammar: drafts, and greedy output under the grammar is unchanged
++    create_server()
++    server.spec_grammar = True
++    server.start()
++    res = server.make_request("POST", "/completion", data=request)
++    assert res.status_code == 200
++    assert res.body["timings"]["draft_n"] > 0
++    assert res.body["tokens"] == tokens_plain
++    assert re.fullmatch(r"[a-z]+( [a-z]+)*", res.body["content"])
++
++
++# Hybrid/recurrent targets (qwen35 family) cannot trim a rejected draft out of their recurrent state,
++# so with ngram-mod alone (no spare rs sequences) every partial acceptance restores a checkpoint
++# and replays: the restore has to bring the grammar back too. Needs a local qwen35-family GGUF,
++# e.g. LLAMA_TEST_HYBRID_MODEL=Qwen3.5-0.8B-Q8_0.gguf
++@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="LLAMA_TEST_HYBRID_MODEL not set")
++def test_grammar_spec_checkpoint_restore_hybrid(tmp_path, monkeypatch):
++    global server
++    monkeypatch.setenv("LLAMA_TRACE", "1") # logs each "restore checkpoint"
++    server = ServerProcess()
++    server.log_path = str(tmp_path / "server.log")
++    server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
++    server.model_hf_repo = None
++    server.model_hf_file = None
++    server.n_ctx = 4096
++    server.n_slots = 1
++    server.spec_type = "ngram-mod"
++    server.spec_grammar = True
++    server.start()
++    n_draft, n_acc = 0, 0
++    # sampled, so drafts from the repeated list get rejected part way and the slot restores
++    for seed in range(8):
++        res = server.make_request("POST", "/completion", data={
++            "prompt": "Shopping list, one per line:\n- milk\n- eggs\n- bread\n- milk\n- apples\n- eggs\n- rice\n- bread\n-",
++            "temperature": 0.8,
++            "seed": seed,
++            "n_predict": 128,
++            "grammar": "root ::= (\" \" [a-z]+ \"\\n-\")+",
++        })
++        assert res.status_code == 200
++        # n_predict can stop anywhere inside the last item
++        assert re.fullmatch(r"( [a-z]+\n-)*( [a-z]*\n?)?", res.body["content"]), repr(res.body["content"])
++        n_draft += res.body["timings"].get("draft_n", 0)
++        n_acc   += res.body["timings"].get("draft_n_accepted", 0)
++    server.stop()
++    n_restore = open(server.log_path).read().count("(restore checkpoint)")
++    assert n_draft > 0
++    assert n_acc < n_draft
++    assert n_restore >= 4, f"only {n_restore} checkpoint restores, the replay path was barely exercised"
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index 36da99741..e888fc2e8 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -105,6 +105,7 @@ class ServerProcess:
+     spec_draft_n_ubatch: int | None = None
+     spec_synth_len: float | None = None
+     spec_synth_rates: List[float] | None = None
++    spec_grammar: bool = False
+     no_ui: bool | None = None
+     jinja: bool | None = None
+     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
+@@ -269,6 +270,8 @@ class ServerProcess:
+         if self.spec_synth_rates is not None:
+             rates = ",".join(str(rate) for rate in self.spec_synth_rates)
+             server_args.extend(["--spec-synth-rates", rates])
++        if self.spec_grammar:
++            server_args.append("--spec-grammar")
+         if self.no_ui:
+             server_args.append("--no-ui")
+         if self.no_models_autoload:
+-- 
+2.43.0
+
