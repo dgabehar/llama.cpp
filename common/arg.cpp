@@ -4301,6 +4301,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
 
     add_opt(common_arg(
+        {"--spec-grammar"},
+        {"--no-spec-grammar"},
+        string_format("also draft for grammar-constrained requests (tool calls, json schema); each accepted token is still checked against the grammar (default: %s)",
+            params.speculative.grammar ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.grammar = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_GRAMMAR"));
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

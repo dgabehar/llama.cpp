@@ -1,4 +1,5 @@
 import pytest
+import re
 from utils import *
 
 # We use a F16 MOE gguf as main model, and q4_0 as draft model
@@ -265,3 +266,82 @@ def test_draft_token_probs():
         assert abs(tok_draft["logprob"] - tok_no_draft["logprob"]) < 0.25
     # real logprobs are not all exactly 0.0 (prob 1.0)
     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
+
+
+def test_grammar_drafts_only_with_spec_grammar():
+    global server
+    # lowercase words only, so the grammar rejects most of what the stories model would say
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "n_predict": 32,
+        "grammar": "root ::= [a-z]+ (\" \" [a-z]+)*",
+        "return_tokens": True,
+    }
+
+    server.model_draft = None
+    server.spec_type = None
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    tokens_plain = res.body["tokens"]
+    server.stop()
+
+    # default: the guard keeps grammar requests on plain decode
+    create_server()
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["timings"].get("draft_n", 0) == 0
+    assert res.body["tokens"] == tokens_plain
+    server.stop()
+
+    # --spec-grammar: drafts, and greedy output under the grammar is unchanged
+    create_server()
+    server.spec_grammar = True
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["tokens"] == tokens_plain
+    assert re.fullmatch(r"[a-z]+( [a-z]+)*", res.body["content"])
+
+
+# Hybrid/recurrent targets (qwen35 family) cannot trim a rejected draft out of their recurrent state,
+# so with ngram-mod alone (no spare rs sequences) every partial acceptance restores a checkpoint
+# and replays: the restore has to bring the grammar back too. Needs a local qwen35-family GGUF,
+# e.g. LLAMA_TEST_HYBRID_MODEL=Qwen3.5-0.8B-Q8_0.gguf
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="LLAMA_TEST_HYBRID_MODEL not set")
+def test_grammar_spec_checkpoint_restore_hybrid(tmp_path, monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_TRACE", "1") # logs each "restore checkpoint"
+    server = ServerProcess()
+    server.log_path = str(tmp_path / "server.log")
+    server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.n_ctx = 4096
+    server.n_slots = 1
+    server.spec_type = "ngram-mod"
+    server.spec_grammar = True
+    server.start()
+    n_draft, n_acc = 0, 0
+    # sampled, so drafts from the repeated list get rejected part way and the slot restores
+    for seed in range(8):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "Shopping list, one per line:\n- milk\n- eggs\n- bread\n- milk\n- apples\n- eggs\n- rice\n- bread\n-",
+            "temperature": 0.8,
+            "seed": seed,
+            "n_predict": 128,
+            "grammar": "root ::= (\" \" [a-z]+ \"\\n-\")+",
+        })
+        assert res.status_code == 200
+        # n_predict can stop anywhere inside the last item
+        assert re.fullmatch(r"( [a-z]+\n-)*( [a-z]*\n?)?", res.body["content"]), repr(res.body["content"])
+        n_draft += res.body["timings"].get("draft_n", 0)
+        n_acc   += res.body["timings"].get("draft_n_accepted", 0)
+    server.stop()
+    n_restore = open(server.log_path).read().count("(restore checkpoint)")
+    assert n_draft > 0
+    assert n_acc < n_draft
+    assert n_restore >= 4, f"only {n_restore} checkpoint restores, the replay path was barely exercised"

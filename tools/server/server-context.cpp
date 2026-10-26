@@ -319,6 +319,9 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
+    // --spec-grammar: draft for grammar-constrained requests too (see get_n_draft_max)
+    bool spec_grammar = false;
+
     // context checkpoints captured inside the current batch instead of splitting it
     // (see llama_state_seq_capture_add)
     struct ckpt_capture {
@@ -631,7 +634,16 @@ struct server_slot {
         // the milder, already-mitigated version of the same underlying phenomenon).
         // Plain chat/completion requests (no grammar) keep the full speculative-decoding
         // speed win.
-        if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE) {
+        //
+        // --spec-grammar lifts this guard. The verify path keeps grammar output exact: each
+        // position is sampled through the grammar and then accepted before the next one is
+        // checked, so a rejected draft token never reaches the grammar, and a checkpoint
+        // restore copies the whole sampler (grammar and lazy-trigger state included) back.
+        // The 2026-09-15 corruption most likely came from the SSM_CONV_SPLIT conv-state bug
+        // (7f64d1946, 2026-09-14), which wrote a garbage conv state on every multi-token
+        // ubatch, i.e. every verify step, and was fixed on 2026-09-24 (0359ec5d4). Off by
+        // default until a stress run on a build with that fix shows no tag corruption.
+        if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE && !spec_grammar) {
             return 0;
         }
 
@@ -1628,6 +1640,10 @@ private:
             return false;
         }
 
+        if (params_base.speculative.grammar && params_base.speculative.has_synth()) {
+            SRV_WRN("%s", "--spec-grammar is ignored with --spec-synth-*: synthetic acceptance skips the grammar\n");
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1637,6 +1653,9 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+
+            // synthetic acceptance takes draft tokens without the grammar, so it keeps the guard
+            slot.spec_grammar = params_base.speculative.grammar && !params_base.speculative.has_synth();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
