@@ -392,8 +392,8 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
-    // draft for requests with a grammar too (tool calls, json schema); off keeps them on plain decode
-    bool grammar = false;
+    // draft for requests with a grammar too (tool calls, json schema); --no-spec-grammar keeps them on plain decode
+    bool grammar = true;
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;

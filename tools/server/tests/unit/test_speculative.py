@@ -268,7 +268,7 @@ def test_draft_token_probs():
     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
 
 
-def test_grammar_drafts_only_with_spec_grammar():
+def test_grammar_drafts_unless_no_spec_grammar():
     global server
     # lowercase words only, so the grammar rejects most of what the stories model would say
     request = {
@@ -287,8 +287,9 @@ def test_grammar_drafts_only_with_spec_grammar():
     tokens_plain = res.body["tokens"]
     server.stop()
 
-    # default: the guard keeps grammar requests on plain decode
+    # --no-spec-grammar: the guard keeps grammar requests on plain decode
     create_server()
+    server.spec_grammar = False
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
@@ -296,9 +297,8 @@ def test_grammar_drafts_only_with_spec_grammar():
     assert res.body["tokens"] == tokens_plain
     server.stop()
 
-    # --spec-grammar: drafts, and greedy output under the grammar is unchanged
+    # default: drafts, and greedy output under the grammar is unchanged
     create_server()
-    server.spec_grammar = True
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200

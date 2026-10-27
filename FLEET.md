@@ -1138,13 +1138,18 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
     (opt-in, `LLAMA_TEST_HYBRID_MODEL`). Synthetic acceptance
     (`--spec-synth-*`, bench only) does skip the grammar.
   - **The guard** (`3e7b73528`, `server: disable speculative decoding for
-    grammar-constrained requests`) stays the default: `get_n_draft_max()`
-    returns 0 for any request with a grammar (tool calls, JSON schema), so
-    agent traffic decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with
-    drafts). **`--spec-grammar`** (env `LLAMA_ARG_SPEC_GRAMMAR`, default off)
-    lifts it, opt-in; it is ignored with a warning under `--spec-synth-*`.
-    Keep it off in production until a stress run on the real model
-    (Qwen3.8-27B, Vulkan) matches the CPU result below.
+    grammar-constrained requests`): `get_n_draft_max()` returns 0 for any
+    request with a grammar (tool calls, JSON schema), so agent traffic
+    decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with drafts).
+    **Default flipped 2026-10-27: `--spec-grammar` is now ON** (env
+    `LLAMA_ARG_SPEC_GRAMMAR`; `--no-spec-grammar` is the escape hatch and
+    restores the guard). Evidence: live Vulkan 27B, 17 requests, 0 tag
+    corruption, 72% accept, 13.6 vs 4.47 tok/s; fleet smoke 54 PASS / 0 FAIL;
+    K2 on 3 backends, 80% accept with valid tool-call args. The earlier
+    corruption was the SSM_CONV_SPLIT conv-window bug fixed in `0359ec5d4`.
+    Under `--spec-synth-*` (bench only) the guard still applies, now with an
+    info line instead of a warning (the flag is on by default, so it cannot
+    tell an explicit request).
   - **Parser-side hardening, reverted** (`2d13e476c` bounded the
     xml-arg-string with `until_one_of`; reverted 2026-10-26 by `qwen3-coder:
     let a string argument hold the format's own tags as text`). The rule is
@@ -1154,8 +1159,8 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
     the final parse reject what the grammar allowed: a value holding
     `<tool_call>`/`<function=` as text (writing a chat template) returned
     HTTP 500. Nothing in the parser or grammar stops a tag-repetition
-    runaway; with the state bug fixed, the guard is the remaining
-    conservative default and `--spec-grammar` the opt-out.
+    runaway; with the state bug fixed, drafting under the grammar is the
+    default and `--no-spec-grammar` the opt-out.
     `test_qwen3_coder_arg_tags` (`tests/test-chat.cpp`) pins what the
     grammar still bounds.
   - **Reasoning end, same class** (`qwen3-coder: end the reasoning only at a
