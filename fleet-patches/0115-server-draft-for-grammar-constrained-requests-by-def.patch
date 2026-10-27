@@ -1,0 +1,217 @@
+From ae33b89b005c6c4eb216e2df2313879fe293b043 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 27 Oct 2026 10:14:14 -0500
+Subject: [PATCH] server: draft for grammar-constrained requests by default
+ (--spec-grammar on)
+
+Tool-call and JSON-schema requests now speculate by default, which is what
+agent traffic needs (27B Vulkan: 13.6 vs 4.47 tok/s). --no-spec-grammar
+(env LLAMA_ARG_SPEC_GRAMMAR=0) restores the 2026-09-15 guard.
+
+Evidence for flipping the default: live Vulkan 27B, 17 requests, 0 tag
+corruption, 72% accept; fleet smoke 54 PASS / 0 FAIL; K2 on 3 backends
+80% accept with valid tool-call args. The corruption the guard was added
+for was the SSM_CONV_SPLIT conv-window bug, fixed in 0359ec5d4.
+
+Under --spec-synth-* (bench only) the guard still applies; since the flag
+is now on by default the old warning would fire on every synth run, so it
+becomes an info line. The server test now asserts drafting by default and
+draft_n == 0 with --no-spec-grammar; the test harness option becomes
+spec_grammar=True by default. Adds the flag to the server README table and
+records the flip in FLEET.md.
+
+Assisted-by: Claude Sonnet 5.5
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ FLEET.md                                    | 23 +++++++++++++--------
+ common/arg.cpp                              |  2 +-
+ common/common.h                             |  4 ++--
+ tools/server/README.md                      |  1 +
+ tools/server/server-context.cpp             | 10 ++++-----
+ tools/server/tests/unit/test_speculative.py |  8 +++----
+ tools/server/tests/utils.py                 |  6 +++---
+ 7 files changed, 30 insertions(+), 24 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index fdac013eb..f7ffbc05d 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -1138,13 +1138,18 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
+     (opt-in, `LLAMA_TEST_HYBRID_MODEL`). Synthetic acceptance
+     (`--spec-synth-*`, bench only) does skip the grammar.
+   - **The guard** (`3e7b73528`, `server: disable speculative decoding for
+-    grammar-constrained requests`) stays the default: `get_n_draft_max()`
+-    returns 0 for any request with a grammar (tool calls, JSON schema), so
+-    agent traffic decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with
+-    drafts). **`--spec-grammar`** (env `LLAMA_ARG_SPEC_GRAMMAR`, default off)
+-    lifts it, opt-in; it is ignored with a warning under `--spec-synth-*`.
+-    Keep it off in production until a stress run on the real model
+-    (Qwen3.8-27B, Vulkan) matches the CPU result below.
++    grammar-constrained requests`): `get_n_draft_max()` returns 0 for any
++    request with a grammar (tool calls, JSON schema), so agent traffic
++    decodes plainly (27B on gabesrv06: ~4.5 tok/s vs ~14 with drafts).
++    **Default flipped 2026-10-27: `--spec-grammar` is now ON** (env
++    `LLAMA_ARG_SPEC_GRAMMAR`; `--no-spec-grammar` is the escape hatch and
++    restores the guard). Evidence: live Vulkan 27B, 17 requests, 0 tag
++    corruption, 72% accept, 13.6 vs 4.47 tok/s; fleet smoke 54 PASS / 0 FAIL;
++    K2 on 3 backends, 80% accept with valid tool-call args. The earlier
++    corruption was the SSM_CONV_SPLIT conv-window bug fixed in `0359ec5d4`.
++    Under `--spec-synth-*` (bench only) the guard still applies, now with an
++    info line instead of a warning (the flag is on by default, so it cannot
++    tell an explicit request).
+   - **Parser-side hardening, reverted** (`2d13e476c` bounded the
+     xml-arg-string with `until_one_of`; reverted 2026-10-26 by `qwen3-coder:
+     let a string argument hold the format's own tags as text`). The rule is
+@@ -1154,8 +1159,8 @@ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_kee
+     the final parse reject what the grammar allowed: a value holding
+     `<tool_call>`/`<function=` as text (writing a chat template) returned
+     HTTP 500. Nothing in the parser or grammar stops a tag-repetition
+-    runaway; with the state bug fixed, the guard is the remaining
+-    conservative default and `--spec-grammar` the opt-out.
++    runaway; with the state bug fixed, drafting under the grammar is the
++    default and `--no-spec-grammar` the opt-out.
+     `test_qwen3_coder_arg_tags` (`tests/test-chat.cpp`) pins what the
+     grammar still bounds.
+   - **Reasoning end, same class** (`qwen3-coder: end the reasoning only at a
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 884d29a37..817449326 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4303,7 +4303,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+     add_opt(common_arg(
+         {"--spec-grammar"},
+         {"--no-spec-grammar"},
+-        string_format("also draft for grammar-constrained requests (tool calls, json schema); each accepted token is still checked against the grammar (default: %s)",
++        string_format("draft for grammar-constrained requests (tool calls, json schema) too; each accepted token is still checked against the grammar, --no-spec-grammar decodes them plainly (default: %s)",
+             params.speculative.grammar ? "enabled" : "disabled"),
+         [](common_params & params, bool value) {
+             params.speculative.grammar = value;
+diff --git a/common/common.h b/common/common.h
+index 73bb405d6..af6209124 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -392,8 +392,8 @@ struct common_params_speculative {
+     double synth_len = -1.0;
+     std::vector<double> synth_rates;
+ 
+-    // draft for requests with a grammar too (tool calls, json schema); off keeps them on plain decode
+-    bool grammar = false;
++    // draft for requests with a grammar too (tool calls, json schema); --no-spec-grammar keeps them on plain decode
++    bool grammar = true;
+ 
+     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+     common_params_speculative_draft draft;
+diff --git a/tools/server/README.md b/tools/server/README.md
+index 997a2c1c8..b9a5786d3 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -270,6 +270,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
+ | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
+ | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
++| `--spec-grammar, --no-spec-grammar` | draft for grammar-constrained requests (tool calls, json schema) too; each accepted token is still checked against the grammar, --no-spec-grammar decodes them plainly (default: enabled)<br/>(env: LLAMA_ARG_SPEC_GRAMMAR) |
+ | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
+ | `--spec-draft-sampling {greedy,probabilistic}` | how the draft is sampled: greedy takes its argmax, probabilistic samples it and has the target verify by rejection sampling (default: greedy)<br/>(env: LLAMA_ARG_SPEC_DRAFT_SAMPLING) |
+ | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f6aaee56a..d0c63ff5d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -319,7 +319,7 @@ struct server_slot {
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
+ 
+-    // --spec-grammar: draft for grammar-constrained requests too (see get_n_draft_max)
++    // --spec-grammar (on by default; --no-spec-grammar turns it off): draft for grammar-constrained requests too (see get_n_draft_max)
+     bool spec_grammar = false;
+ 
+     // context checkpoints captured inside the current batch instead of splitting it
+@@ -635,14 +635,14 @@ struct server_slot {
+         // Plain chat/completion requests (no grammar) keep the full speculative-decoding
+         // speed win.
+         //
+-        // --spec-grammar lifts this guard. The verify path keeps grammar output exact: each
++        // --spec-grammar (on by default since 2026-10-27; --no-spec-grammar restores this guard) lifts it. The verify path keeps grammar output exact: each
+         // position is sampled through the grammar and then accepted before the next one is
+         // checked, so a rejected draft token never reaches the grammar, and a checkpoint
+         // restore copies the whole sampler (grammar and lazy-trigger state included) back.
+         // The 2026-09-15 corruption most likely came from the SSM_CONV_SPLIT conv-state bug
+         // (7f64d1946, 2026-09-14), which wrote a garbage conv state on every multi-token
+-        // ubatch, i.e. every verify step, and was fixed on 2026-09-24 (0359ec5d4). Off by
+-        // default until a stress run on a build with that fix shows no tag corruption.
++        // ubatch, i.e. every verify step, and was fixed on 2026-09-24 (0359ec5d4). With that fix
++        // the default was flipped on 2026-10-27 after live runs showed no tag corruption.
+         if (task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE && !spec_grammar) {
+             return 0;
+         }
+@@ -1641,7 +1641,7 @@ private:
+         }
+ 
+         if (params_base.speculative.grammar && params_base.speculative.has_synth()) {
+-            SRV_WRN("%s", "--spec-grammar is ignored with --spec-synth-*: synthetic acceptance skips the grammar\n");
++            SRV_INF("%s", "grammar-constrained requests keep plain decode under --spec-synth-*: synthetic acceptance skips the grammar\n");
+         }
+ 
+         for (int i = 0; i < params_base.n_parallel; i++) {
+diff --git a/tools/server/tests/unit/test_speculative.py b/tools/server/tests/unit/test_speculative.py
+index f424be16f..a328272da 100644
+--- a/tools/server/tests/unit/test_speculative.py
++++ b/tools/server/tests/unit/test_speculative.py
+@@ -268,7 +268,7 @@ def test_draft_token_probs():
+     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
+ 
+ 
+-def test_grammar_drafts_only_with_spec_grammar():
++def test_grammar_drafts_unless_no_spec_grammar():
+     global server
+     # lowercase words only, so the grammar rejects most of what the stories model would say
+     request = {
+@@ -287,8 +287,9 @@ def test_grammar_drafts_only_with_spec_grammar():
+     tokens_plain = res.body["tokens"]
+     server.stop()
+ 
+-    # default: the guard keeps grammar requests on plain decode
++    # --no-spec-grammar: the guard keeps grammar requests on plain decode
+     create_server()
++    server.spec_grammar = False
+     server.start()
+     res = server.make_request("POST", "/completion", data=request)
+     assert res.status_code == 200
+@@ -296,9 +297,8 @@ def test_grammar_drafts_only_with_spec_grammar():
+     assert res.body["tokens"] == tokens_plain
+     server.stop()
+ 
+-    # --spec-grammar: drafts, and greedy output under the grammar is unchanged
++    # default: drafts, and greedy output under the grammar is unchanged
+     create_server()
+-    server.spec_grammar = True
+     server.start()
+     res = server.make_request("POST", "/completion", data=request)
+     assert res.status_code == 200
+diff --git a/tools/server/tests/utils.py b/tools/server/tests/utils.py
+index e888fc2e8..b88df132e 100644
+--- a/tools/server/tests/utils.py
++++ b/tools/server/tests/utils.py
+@@ -105,7 +105,7 @@ class ServerProcess:
+     spec_draft_n_ubatch: int | None = None
+     spec_synth_len: float | None = None
+     spec_synth_rates: List[float] | None = None
+-    spec_grammar: bool = False
++    spec_grammar: bool = True
+     no_ui: bool | None = None
+     jinja: bool | None = None
+     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
+@@ -270,8 +270,8 @@ class ServerProcess:
+         if self.spec_synth_rates is not None:
+             rates = ",".join(str(rate) for rate in self.spec_synth_rates)
+             server_args.extend(["--spec-synth-rates", rates])
+-        if self.spec_grammar:
+-            server_args.append("--spec-grammar")
++        if not self.spec_grammar:
++            server_args.append("--no-spec-grammar")
+         if self.no_ui:
+             server_args.append("--no-ui")
+         if self.no_models_autoload:
+-- 
+2.43.0
+
