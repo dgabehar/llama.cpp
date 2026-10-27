@@ -4303,7 +4303,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-grammar"},
         {"--no-spec-grammar"},
-        string_format("also draft for grammar-constrained requests (tool calls, json schema); each accepted token is still checked against the grammar (default: %s)",
+        string_format("draft for grammar-constrained requests (tool calls, json schema) too; each accepted token is still checked against the grammar, --no-spec-grammar decodes them plainly (default: %s)",
             params.speculative.grammar ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.speculative.grammar = value;

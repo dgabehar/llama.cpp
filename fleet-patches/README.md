@@ -146,6 +146,7 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0112 | `f6a35691b` | qwen3-coder: end the reasoning only at a real call opener, not a bare <tool_call> |
 | 0113 | `90f0e772f` | k2-horizon: end the reasoning only at a real call start, not a bare call tag |
 | 0114 | `a6a56f6a9` | server: add --spec-grammar to draft for grammar-constrained requests |
+| 0115 | `ae33b89b0` | server: draft for grammar-constrained requests by default (--spec-grammar on) |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
@@ -153,7 +154,7 @@ fixes"). Fork-only, not submitted upstream.
 
 This mirror was rebuilt on 2026-10-07 for the K2-Horizon adoption sync and extended on 2026-10-08
 with the K2 fixes (0088, 0089) and the sync-workflow removal (0090), then on 2026-10-22 with the merged test/vulkan patches (0091-0098)
-and the tool_choice none fix (0099-0105), then on 2026-10-23 with the op-count fix (0106) the i64 tiled-concat test (0107) the K2 tool_choice none fixes (0108, 0109), then on 2026-10-25 with the atomic slot save (0110), then on 2026-10-26 with the qwen3-coder literal-tag argument and reasoning-end fixes (0111, 0112) and the K2 reasoning-end fix (0113), and the opt-in --spec-grammar flag to draft under a grammar (0114): 114 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
+and the tool_choice none fix (0099-0105), then on 2026-10-23 with the op-count fix (0106) the i64 tiled-concat test (0107) the K2 tool_choice none fixes (0108, 0109), then on 2026-10-25 with the atomic slot save (0110), then on 2026-10-26 with the qwen3-coder literal-tag argument and reasoning-end fixes (0111, 0112) and the K2 reasoning-end fix (0113), and the opt-in --spec-grammar flag to draft under a grammar (0114), then on 2026-10-27 with the flip of --spec-grammar to on by default (0115): 115 patches (87 from the adoption sync; 12 K2 model/conversion/tokenizer patches were dropped or replaced by
 upstream's, see FLEET.md "Upstream sync 2026-10 K2 adoption"). Patch numbers
 changed; refer to patches by subject.
 
