@@ -1,0 +1,90 @@
+From 41b2ad40df825b6e212f727660ebebc54b23cb5b Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 22:09:17 -0500
+Subject: [PATCH] models : fix the conv-state window over the transposed new
+ tokens
+
+build_conv_window (added with GGML_OP_SSM_CONV_SPLIT) cut token ranges out of
+new_tokens, a transposed view whose dim 0 has a row-sized stride, with
+ggml_view_3d. A view always gets a unit dim-0 stride, so any window wider than
+one new token read the wrong memory and saved a garbage conv state.
+
+Single-token decode only ever takes a 1-token slice, so plain generation
+looked fine. Prefill corrupted the state for the first few generated tokens,
+and draft-mtp verification (a 3-token ubatch plus rollback snapshots every
+step) corrupted it continuously: the target accepted tokens it gives ~0
+probability, which showed up as garbled reasoning and repeated </think> on
+Qwen3.8-27B.
+
+Cut the range from the untransposed [conv_channels, n_t, n_seqs] layout and
+transpose it back. On Qwen3.8-27B-UD-Q4_K_XL with draft-mtp n_max 2, 12
+sampled "Say OK." replies: tokens the plain target gives p < 0.002 went from
+22 to 0, replies with more than one </think> from 3/12 to 0/12, and draft
+acceptance rose from ~0.5 to 0.75-0.89.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/models/delta-net-base.cpp | 33 ++++++++++++++++++++++++---------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 93866b61d..3f0e5ac0a 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -456,6 +456,28 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+ // kernel width. The straddling case is the one the old concat-based code got
+ // "for free"; here it costs a small (at most dm1-wide) concat instead of one
+ // sized by the full n_t.
++//
++// new_tokens is a transposed view: its dim 0 (tokens) has a row-sized stride.
++// ggml_view_* always gives a view a unit dim-0 stride, so a token range is cut
++// from the untransposed [conv_channels, n_t, n_seqs] layout and transposed back.
++static ggml_tensor * build_token_cols(
++        ggml_context * ctx0,
++        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], transposed view
++        int64_t        start,
++        int64_t        count,
++        int64_t        conv_channels,
++        int64_t        n_seqs) {
++    ggml_tensor * rows = ggml_transpose(ctx0, new_tokens);
++    GGML_ASSERT(rows->nb[0] == ggml_type_size(rows->type));
++
++    rows = ggml_view_3d(ctx0, rows,
++            conv_channels, count, n_seqs,
++            rows->nb[1], rows->nb[2],
++            start * rows->nb[1]);
++
++    return ggml_transpose(ctx0, rows);
++}
++
+ static ggml_tensor * build_conv_window(
+         ggml_context * ctx0,
+         ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
+@@ -471,10 +493,7 @@ static ggml_tensor * build_conv_window(
+     }
+ 
+     if (s_idx >= dm1) {
+-        return ggml_view_3d(ctx0, new_tokens,
+-                dm1, conv_channels, n_seqs,
+-                new_tokens->nb[1], new_tokens->nb[2],
+-                (s_idx - dm1) * new_tokens->nb[0]);
++        return build_token_cols(ctx0, new_tokens, s_idx - dm1, dm1, conv_channels, n_seqs);
+     }
+ 
+     ggml_tensor * prefix_part =
+@@ -483,11 +502,7 @@ static ggml_tensor * build_conv_window(
+                 prefix->nb[1], prefix->nb[2],
+                 s_idx * prefix->nb[0]);
+ 
+-    ggml_tensor * new_tokens_part =
+-        ggml_view_3d(ctx0, new_tokens,
+-                s_idx, conv_channels, n_seqs,
+-                new_tokens->nb[1], new_tokens->nb[2],
+-                0);
++    ggml_tensor * new_tokens_part = build_token_cols(ctx0, new_tokens, 0, s_idx, conv_channels, n_seqs);
+ 
+     return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
+ }
+-- 
+2.43.0
+

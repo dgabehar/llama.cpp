@@ -1,0 +1,109 @@
+From 0ab13d2bbb5b1df189f9726f392a5fea4d952a9d Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 14:24:15 -0500
+Subject: [PATCH] server : don't update the prompt cache of a busy slot picked
+ by id_slot
+
+A request pinned with id_slot to a slot that is still processing gets
+that slot back from get_available_slot, and the caller defers it. Before
+returning, get_available_slot ran the similarity pass, which skips busy
+slots, so f_keep came out 0 and the prompt cache update ran on the busy
+slot: prompt_save, then prompt_load of the cached prompt that best
+matches the pinned request. That replaced the running task's context
+with another prompt's cached state mid-generation, and the running task
+kept generating on it.
+
+Seen in production: a request got another conversation's code word back
+from its final tokens, when a second client's request pinned to the same
+slot arrived just before the answer. The slot held 3588 tokens more than
+its task accounted for.
+
+Return a busy slot right away and never update the cache of a slot that
+is processing. The regression test fails without the fix and passes with
+it.
+
+Assisted-by: Claude Opus 5.5
+---
+ tools/server/server-context.cpp           | 10 ++++++
+ tools/server/tests/unit/test_slot_save.py | 40 +++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 20ba6c806..a17a28446 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1664,6 +1664,13 @@ private:
+             ret = get_slot_by_id(task.id_slot);
+             if (ret) {
+                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
++
++                // the slot is still running another task: the caller defers this one. Return before
++                // the prompt cache update below, which would swap the running task's context for
++                // another prompt's cached state
++                if (ret->is_processing()) {
++                    return ret;
++                }
+             }
+         }
+ 
+@@ -1749,6 +1756,9 @@ private:
+             // cache prompts only for completion tasks
+             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+ 
++            // never touch the context of a slot that is still processing
++            update_cache = update_cache && !ret->is_processing();
++
+             if (update_cache) {
+                 SRV_TRC("%s", "updating prompt cache\n");
+ 
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index a36186617..ba64808af 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -676,3 +676,43 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
+     assert res.status_code == 200
+     assert res.body["timings"]["cache_n"] == 0
+     assert res.body["content"] == content
++
++
++def test_request_pinned_to_busy_slot_does_not_touch_its_context():
++    # a request pinned to a slot that is still generating is deferred. Before it is,
++    # slot selection must not run the prompt cache update on that slot: it would load
++    # another prompt's cached state into the running task mid-generation
++    global server
++    server.n_slots = 2
++    server.n_ctx = 2048
++    server.server_slots = True
++    server.start()
++
++    prompt_a = "Once upon a time there was a little girl named Lily who loved to play in the park"
++    prompt_b = "The old man walked slowly to the harbor to watch the ships"
++    data_a = {"prompt": prompt_a, "id_slot": 1, "n_predict": 1800, "ignore_eos": True, "cache_prompt": True}
++
++    # put prompt_b in the prompt cache: run it on slot 1, then displace it
++    for p in [prompt_b, "Tom had a red ball"]:
++        res = server.make_request("POST", "/completion", data={"prompt": p, "id_slot": 1, "n_predict": 4})
++        assert res.status_code == 200
++
++    solo = server.make_request("POST", "/completion", data={**data_a, "id_slot": 0})
++    assert solo.status_code == 200
++
++    out = {}
++    thread = threading.Thread(target=lambda: out.__setitem__("a", server.make_request("POST", "/completion", data=data_a)))
++    thread.start()
++    busy = False
++    for _ in range(2000):
++        slots = server.make_request("GET", "/slots").body
++        if slots[1]["is_processing"]:
++            busy = True
++            break
++    assert busy
++    res = server.make_request("POST", "/completion", data={"prompt": prompt_b, "id_slot": 1, "n_predict": 4})
++    assert res.status_code == 200
++    thread.join()
++
++    assert out["a"].status_code == 200
++    assert out["a"].body["content"] == solo.body["content"]
+-- 
+2.43.0
+

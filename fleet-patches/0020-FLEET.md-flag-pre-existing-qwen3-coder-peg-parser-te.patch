@@ -1,0 +1,50 @@
+From 27e786074bd599a83df0c4d0375c0dcb1009490e Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 17 Sep 2026 16:37:54 -0500
+Subject: [PATCH] FLEET.md: flag pre-existing qwen3-coder peg-parser test crash
+
+test_template_output_peg_parsers() (tests/test-chat.cpp) already crashes
+uncaught on models/templates/Qwen3-Coder.jinja's html tool, hitting the
+same "now finding less tool calls" invariant this branch's server fix
+(35e651927) addresses -- but this test calls compute_diffs() directly,
+bypassing update_chat_msg(), so it isn't caught by that fix. Confirmed via
+git stash that the crash pre-dates 35e651927 and is unaffected by it.
+Documented in "Known-fragile areas" as NOT FIXED (the parser's own
+false-positive tool-call detection is a separate, deeper problem, out of
+scope for that fix) so it doesn't get lost.
+
+Assisted-by: Claude Sonnet 5
+---
+ FLEET.md | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/FLEET.md b/FLEET.md
+index 23779cc6a..0a284655b 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -82,3 +82,22 @@ discipline by standing convention).
+     behind the primary fix, not a replacement for it.
+   Both verified live on gabesrv06 (4/4 clean tool calls) before merging to
+   `fleet-patches`.
++
++- **`tests/test-chat.cpp`'s `test_template_output_peg_parsers()` crashes
++  (uncaught `std::terminate`) on `models/templates/Qwen3-Coder.jinja`'s
++  `html` tool.** Found 2026-09-17 while fixing the server-side "now finding
++  less tool calls" invariant crash (see `35e651927`, `server: end
++  generation cleanly on a tool-call-diff inconsistency`). Root cause: a
++  partial PEG reparse of that template's output speculatively opens an
++  `html` tool call that a fuller reparse of the same text later retracts --
++  `common_chat_msg_diff::compute_diffs()` throws on the retraction (now
++  `common_chat_msg_diff_invalid_error`), and this test calls `compute_diffs`
++  directly rather than through the server's `update_chat_msg()`, so it
++  isn't caught by that fix at all. Confirmed via `git stash` that this
++  crash pre-dates `35e651927` and is unaffected by it either way. **NOT
++  FIXED** -- this is the qwen3-coder PEG parser's own false-positive
++  tool-call detection, a separate, deeper parsing problem than the server
++  crash above; out of scope for that session's task on purpose. Repro:
++  `./build/bin/test-chat` (default args, no template filter) crashes deep
++  into `test_template_output_peg_parsers`; see the commit message of
++  `35e651927` for the exact backtrace/output.
+-- 
+2.43.0
+

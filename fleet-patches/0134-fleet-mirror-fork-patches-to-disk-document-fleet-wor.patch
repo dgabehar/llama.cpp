@@ -1,0 +1,36 @@
+From d5a1ba215ebc61399d8796947a82c66d7750da82 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 15 Sep 2026 09:14:43 -0500
+Subject: [PATCH] fleet: mirror fork patches to disk, document fleet workflow
+ separately
+
+Adds fleet-patches/*.patch (git format-patch mirror of every
+fork-exclusive commit, plus a regenerate.sh script) so the patch set
+survives without a live clone of the branch and a rebase conflict has
+a static reference to work from. Previously these existed only as
+commits on fleet-patches itself.
+
+Adds FLEET.md (fork-only, doesn't exist upstream, zero rebase-conflict
+risk) for operational knowledge that doesn't belong in AGENTS.md/
+CLAUDE.md since those are shared verbatim with ggml-org/llama.cpp and
+get replayed through every rebase. Documents the patch-mirror workflow
+and the known-fragile draft-mtp+parallel+split-KV-cache area (two real
+bugs already fixed there, a third -- MTP+grammar corruption -- found
+today, not yet patched).
+
+Assisted-by: Claude Sonnet 5
+---
+ CLAUDE.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 302cdeab99..2f2e0c8023 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -1 +1,3 @@
+ IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file before beginning any work.
++
++If this checkout is the `dgabehar/llama.cpp` fork (not upstream), also read [FLEET.md](FLEET.md) -- fork-only notes (fleet patch maintenance, known-fragile areas) that don't apply to upstream contributors and don't live in this file to avoid rebase conflicts.
+-- 
+2.43.0
+

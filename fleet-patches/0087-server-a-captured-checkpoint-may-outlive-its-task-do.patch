@@ -1,0 +1,75 @@
+From 649e5e50a3d944c4469dc963a150d07fbe58b856 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 13:22:02 -0500
+Subject: [PATCH] server : a captured checkpoint may outlive its task: don't
+ read slot.task for it
+
+Fleet QA round 7 (Dawn): a multi-device master segfaulted on the second of
+two back-to-back requests (NULL read in create_checkpoint,
+server-context.cpp:2419, `slot.task->id`). A request that ends right after
+its prompt decode (n_predict 1, EOS or a stop as the first token) releases
+its slot while that slot's in-batch capture is still pending, since captures
+are read only after a later decode. The next task's create_captured_checkpoints
+then made the checkpoint with the slot's task already reset.
+
+The capture now records the id of the task that submitted it, and
+create_checkpoint uses that instead of slot.task (still slot.task for
+checkpoints made directly). Reproduced and verified under ASan with
+LLAMA_SERVER_CKPT_CAPTURE=1 on Qwen3.5-4B: 4/4 back-to-back n_predict 1
+requests, where the second one used to crash.
+
+Only multi-device masters capture by default, so the single-device
+production masters were not exposed.
+
+Assisted-by: Claude Opus 5.5
+---
+ tools/server/server-context.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 35b05694c..20ba6c806 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -263,6 +263,9 @@ struct server_slot {
+         int64_t   n_tokens; // prompt tokens covered by the checkpoint
+         llama_pos pos;      // position of the last of them
+         int32_t   i_batch;  // index of that token in the batch
++        // the task that submitted it: the checkpoint may be created after that task finished and the slot
++        // released it (a request ending right after its prompt, e.g. n_predict 1 or EOS first)
++        int       id_task = -1;
+ 
+         // set once the batch holding it has been submitted; it is read after a later llama_decode()
+         // has been submitted too, so that reading it does not drain the pipeline
+@@ -2414,9 +2417,10 @@ private:
+ 
+     // n_tokens_ckpt: the number of prompt tokens covered by the checkpoint
+     // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
++    // id_task_ckpt: the task the checkpoint belongs to, when the slot may no longer hold it (captured checkpoints)
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
+-            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr) {
+-        const int id_task = slot.task->id;
++            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr, int id_task_ckpt = -1) {
++        const int id_task = id_task_ckpt >= 0 ? id_task_ckpt : slot.task ? slot.task->id : -1;
+ 
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+@@ -3314,7 +3318,7 @@ private:
+                     std::vector<uint8_t> data(n);
+                     llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
+ 
+-                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft);
++                    create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft, cap.id_task);
+                 }
+             }
+ 
+@@ -4003,6 +4007,7 @@ private:
+                             }
+ 
+                             slot.ckpt_captures.push_back({ (int64_t) slot.prompt.n_tokens(), pos, (int32_t) batch.size() - 1 });
++                            slot.ckpt_captures.back().id_task = slot.task ? slot.task->id : -1;
+ 
+                             return true;
+                         };
+-- 
+2.43.0
+

@@ -1,0 +1,64 @@
+From 0f453a6f3fab43dd562292fcc14431263399304a Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Thu, 24 Sep 2026 20:37:55 -0500
+Subject: [PATCH] llama: add llama_model_n_devices_used
+
+Number of non-CPU devices that hold layers of the model, i.e. the stages of
+a layer split.
+
+Assisted-by: Claude Opus 5.5
+---
+ include/llama.h     |  3 +++
+ src/llama-model.cpp | 15 +++++++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/include/llama.h b/include/llama.h
+index cd456c364..b62c0a5e4 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -603,6 +603,9 @@ extern "C" {
+     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
++
++    // number of non-CPU devices that hold layers of the model (the stages of a layer split)
++    LLAMA_API int32_t llama_model_n_devices_used(const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0950a4c21..09bfc559d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -35,6 +35,7 @@
+ #include <map>
+ #include <numeric>
+ #include <regex>
++#include <set>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -2892,6 +2893,20 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
+     return model->hparams.n_layer_nextn;
+ }
+ 
++int32_t llama_model_n_devices_used(const llama_model * model) {
++    std::set<ggml_backend_dev_t> devs;
++    auto add = [&](ggml_backend_dev_t dev) {
++        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            devs.insert(dev);
++        }
++    };
++    for (int il = 0; il < (int) model->hparams.n_layer(); ++il) {
++        add(model->dev_layer(il));
++    }
++    add(model->dev_output());
++    return (int32_t) devs.size();
++}
++
+ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
+     return model->hparams.dflash_selector_top_k;
+ }
+-- 
+2.43.0
+
