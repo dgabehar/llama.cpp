@@ -29,6 +29,10 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <functional>
+#include <map>
+#include <optional>
+#include <string_view>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -1731,6 +1735,14 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (prompt_cache_disk()) {
+                prompt_cache->on_evict = [this](const server_prompt_cache_state & state) {
+                    prompt_cache_disk_evict(state);
+                };
+                SRV_INF("prompt cache entries of %zu+ tokens evicted from RAM are kept in '%s'\n",
+                        PROMPT_CACHE_DISK_MIN_TOKENS, params_base.slot_save_path.c_str());
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2022,9 +2034,11 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const slot_files_pass pass(*this);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                prompt_cache_save(*ret);
+
+                if (!prompt_cache_disk_load(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -2800,9 +2814,10 @@ private:
         // launch all child tasks first
         size_t idx = 0;
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
+        const slot_files_pass pass(*this);
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
+            if (prompt_cache && prompt_cache_save(*slot)) {
                 prompt_cache->update();
             }
 
@@ -2938,24 +2953,28 @@ private:
         }
     }
 
-    // returns false if the appendix could not be written completely
-    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+    // the slot-prefixed log line when a helper runs for a live slot, the server form when it has none (a prompt cache spill)
+#define SLT_OR_SRV(lvl, slot, fmt, ...) \
+    do { if ((slot) != nullptr) { SLT_##lvl(*(slot), fmt, __VA_ARGS__); } else { SRV_##lvl(fmt, __VA_ARGS__); } } while (0)
+
+    // returns false if the appendix could not be written completely; slot is only used for logging, may be null
+    bool save_slot_checkpoints(const std::string & filepath, const std::list<common_prompt_checkpoint> & checkpoints, const server_slot * slot, size_t & n_written) const {
         n_written = 0;
-        if (slot.prompt.checkpoints.empty()) {
+        if (checkpoints.empty()) {
             return true;
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {
-            SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
+            SLT_OR_SRV(WRN, slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
             return false;
         }
         const uint32_t magic   = SLOT_CKPT_MAGIC;
         const uint32_t version = SLOT_CKPT_VERSION;
-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        const uint32_t count   = (uint32_t) checkpoints.size();
         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
-        for (const auto & cur : slot.prompt.checkpoints) {
+        for (const auto & cur : checkpoints) {
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
@@ -2965,10 +2984,10 @@ private:
         }
         ofs.flush();
         if (!ofs) {
-            SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+            SLT_OR_SRV(WRN, slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
             return false;
         }
-        SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
+        SLT_OR_SRV(INF, slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
                 count, (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
     }
@@ -3037,22 +3056,26 @@ private:
     static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
     static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
 
-    // returns false if the draft state could not be written completely
-    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
-        n_written = 0;
-        std::vector<uint8_t> data_dft;
-        std::vector<uint8_t> data_spec;
+    // the live draft state of a slot: the full draft context and the speculative state
+    void capture_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
+        data_dft.clear();
+        data_spec.clear();
         if (ctx_dft != nullptr) {
             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
         common_speculative_get_state(spec.get(), slot.id, data_spec);
+    }
+
+    // returns false if the draft state could not be written completely; slot is only used for logging, may be null
+    bool save_slot_draft(const std::string & filepath, const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
+        n_written = 0;
         if (data_dft.empty() && data_spec.empty()) {
             return true;
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {
-            SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
+            SLT_OR_SRV(WRN, slot, "failed to append the draft state to '%s'\n", filepath.c_str());
             return false;
         }
         const uint32_t magic   = SLOT_DRAFT_MAGIC;
@@ -3063,10 +3086,10 @@ private:
         ckpt_write_buf(ofs, data_spec, n_written);
         ofs.flush();
         if (!ofs) {
-            SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
+            SLT_OR_SRV(WRN, slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
             return false;
         }
-        SLT_INF(slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
+        SLT_OR_SRV(INF, slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
     }
 
@@ -3111,6 +3134,400 @@ private:
         }
         SLT_INF(slot, "restored the draft state (%.3f MiB) from '%s'\n", (float) n_read / 1024 / 1024, filepath.c_str());
         return n_read;
+    }
+
+    // writes a slot save file: the llama state payload (write_state writes it, header and token list included, to the
+    // path it is given and returns its size, 0 on failure), then the checkpoint and draft appendices
+    // all of it goes to a temp file that is renamed over filepath only once it is on disk, so a failed or interrupted
+    // save keeps the old file; the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
+    // returns the file size, 0 on failure (err says why); slot is only used for logging, null for a prompt cache spill
+    size_t slot_file_save(
+            const std::string & filepath,
+            const server_slot * slot,
+            const std::function<size_t(const std::string &)> & write_state,
+            const std::list<common_prompt_checkpoint> & checkpoints,
+            const std::vector<uint8_t> & data_dft,
+            const std::vector<uint8_t> & data_spec,
+            std::string & err) const {
+        const std::filesystem::path fspath = std::filesystem::u8path(filepath);
+        const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
+        const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
+        const auto fail = [&](const char * msg) -> size_t {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
+            err = msg;
+            return 0;
+        };
+
+        const size_t nwrite = write_state(tmppath);
+        if (nwrite == 0) {
+            return fail("Unable to save slot");
+        }
+
+        size_t nwrite_ckpt = 0;
+        if (!save_slot_checkpoints(tmppath, checkpoints, slot, nwrite_ckpt)) {
+            return fail("Unable to save slot: incomplete context checkpoints");
+        }
+
+        size_t nwrite_dft = 0;
+        if (!save_slot_draft(tmppath, data_dft, data_spec, slot, nwrite_dft)) {
+            return fail("Unable to save slot: incomplete draft state");
+        }
+
+        if (!fsync_path(tmppath)) {
+            SLT_OR_SRV(WRN, slot, "failed to sync '%s'\n", tmppath.c_str());
+            return fail("Unable to save slot: sync failed");
+        }
+        {
+            std::error_code ec;
+            std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
+            if (ec) {
+                SLT_OR_SRV(WRN, slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
+                return fail("Unable to save slot: rename failed");
+            }
+        }
+        // persist the rename itself; the new file is already in place, so a failure is only logged
+        if (!fsync_path(dirpath)) {
+            SLT_OR_SRV(WRN, slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
+        }
+
+        return nwrite + nwrite_ckpt + nwrite_dft;
+    }
+
+    // restores a slot save file into the slot: the llama state, then the checkpoint and draft appendices
+    // returns the bytes read, 0 on failure (err says why, the slot is cleared)
+    size_t slot_file_restore(server_slot & slot, const std::string & filepath, std::string & err) {
+        size_t nread = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & e) {
+            slot.prompt_clear();
+            err = e.what();
+            return 0;
+        }
+
+        // nread is the end offset of the llama state payload within the file
+        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+        const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
+
+        return nread + nread_ckpt + nread_dft;
+    }
+
+    //
+    // prompt cache on disk
+    //
+    // with --slot-save-path, an entry that the RAM prompt cache evicts (or skips as larger than its whole limit) is
+    // written to the slot dir as an ordinary slot save file, and a prompt the RAM cache cannot serve is looked up among
+    // the slot files there. Models that cannot shift or partially reuse their memory (hybrid/recurrent, SWA) re-prefill
+    // the whole prompt on every miss, so one disk round trip of the state is far cheaper than the miss it avoids.
+    // The files use the slot save format and naming of the explicit /slots save, so the slot-dir GC and the cross-node
+    // sync treat them like any other save.
+    //
+    // ponytail: both the write and the lookup run synchronously on the server loop (a multi-GiB state stalls every slot
+    //           for a few seconds); a writer thread that owns the evicted buffer would lift it, at the cost of holding
+    //           one extra entry in RAM above --cache-ram while it writes
+    // ponytail: fixed size threshold; weigh the state bytes against an estimated prefill time if small prompts with
+    //           large states (many checkpoints) turn out to churn the disk
+    static constexpr size_t   PROMPT_CACHE_DISK_MIN_TOKENS = 4096;
+    // must equal the file-local io_magic in src/llama-context.cpp (see FLEET.md, upstream-sync checklist)
+    static constexpr uint32_t LLAMA_STATE_SEQ_IO_MAGIC     = 0xaf143cd8;
+
+    // slot files that failed to restore, with their mtime at the time, so a bad file is not read again on every miss
+    // pruned on every slot dir scan: an entry whose file is gone or was rewritten is dropped
+    std::map<std::string, std::filesystem::file_time_type> prompt_cache_disk_bad;
+
+    bool prompt_cache_disk() const {
+        return prompt_cache && !params_base.slot_save_path.empty();
+    }
+
+    bool prompt_cache_disk_is_bad(const std::string & path) const {
+        return prompt_cache_disk_bad.count(path) > 0;
+    }
+
+    struct slot_file {
+        std::string   path;
+        server_tokens tokens;
+    };
+
+    // the path and the token list of each slot save file in the slot dir (*.bin, no dot-files)
+    // reads only the file header and the token list
+    std::vector<slot_file> slot_files_scan() const {
+        std::vector<slot_file> res;
+        try {
+            for (const auto & ent : std::filesystem::directory_iterator(std::filesystem::u8path(params_base.slot_save_path))) {
+                const std::string name = ent.path().filename().u8string();
+                if (name.empty() || name[0] == '.' || ent.path().extension() != ".bin" || !ent.is_regular_file()) {
+                    continue;
+                }
+                std::ifstream ifs(ent.path(), std::ios::binary | std::ios::ate);
+                const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+                uint32_t hdr[3] = { 0, 0, 0 }; // magic, version, token count
+                if (file_size < sizeof(hdr) || !ifs.seekg(0) || !ifs.read((char *) hdr, sizeof(hdr)) ||
+                    hdr[0] != LLAMA_STATE_SEQ_MAGIC || hdr[1] != LLAMA_STATE_SEQ_VERSION ||
+                    (size_t) hdr[2] > (file_size - sizeof(hdr)) / sizeof(llama_token)) {
+                    continue;
+                }
+                llama_tokens packed(hdr[2]);
+                if (!ifs.read((char *) packed.data(), packed.size() * sizeof(llama_token))) {
+                    continue;
+                }
+                try {
+                    res.push_back({ ent.path().u8string(), server_tokens::deserialize(packed, mctx != nullptr) });
+                } catch (const std::exception &) {
+                    continue;
+                }
+            }
+        } catch (const std::exception & e) {
+            SRV_WRN("failed to list the slot dir '%s': %s\n", params_base.slot_save_path.c_str(), e.what());
+        }
+        return res;
+    }
+
+    // one prompt cache pass (slot selection, or saving an idle or a child slot) scans the slot dir once: the disk save
+    // checks of every entry it evicts and the disk lookup share that scan; outside a pass every call scans
+    bool                                  slot_files_pass_open = false;
+    std::optional<std::vector<slot_file>> slot_files_cache;
+
+    struct slot_files_pass {
+        server_context_impl & ctx;
+        explicit slot_files_pass(server_context_impl & ctx) : ctx(ctx) {
+            ctx.slot_files_pass_open = true;
+            ctx.slot_files_cache.reset();
+        }
+        ~slot_files_pass() {
+            ctx.slot_files_pass_open = false;
+            ctx.slot_files_cache.reset();
+        }
+    };
+
+    std::vector<slot_file> & slot_files() {
+        if (!slot_files_pass_open || !slot_files_cache) {
+            slot_files_cache = slot_files_scan();
+
+            // forget bad files that were deleted (slot-dir gc) or rewritten since they failed
+            for (auto it = prompt_cache_disk_bad.begin(); it != prompt_cache_disk_bad.end();) {
+                std::error_code ec;
+                const auto mtime = std::filesystem::last_write_time(std::filesystem::u8path(it->first), ec);
+                if (ec || mtime != it->second) {
+                    it = prompt_cache_disk_bad.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return *slot_files_cache;
+    }
+
+    // writes a prompt cache entry to the slot dir, unless a slot file there already holds the whole prompt
+    void prompt_cache_disk_save(
+            const server_tokens & tokens,
+            const std::list<common_prompt_checkpoint> & checkpoints,
+            const std::function<size_t(const std::string &, const std::vector<char> &)> & write_state,
+            const std::vector<uint8_t> & data_dft,
+            const std::vector<uint8_t> & data_spec) {
+        const int64_t t_start = ggml_time_us();
+
+        std::vector<char> packed;
+        try {
+            packed = tokens.serialize();
+        } catch (const std::exception & e) {
+            SRV_WRN("prompt cache: not saved to disk: %s\n", e.what());
+            return;
+        }
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+        auto & files = slot_files();
+
+        // a file that failed to restore does not count: the prompt is written again, over it if it has the same name
+        for (const auto & f : files) {
+            if (!prompt_cache_disk_is_bad(f.path) && f.tokens.get_common_prefix(tokens) == tokens.size()) {
+                SRV_INF("prompt cache: '%s' already holds this prompt (%zu tokens), not saved to disk\n", f.path.c_str(), tokens.size());
+                return;
+            }
+        }
+
+        // the name comes from a hash of the token list; a name already taken by a file with other tokens
+        // (a hash collision, or a file not readable as a slot file) is never overwritten, a suffix is added instead
+        const uint64_t hash = std::hash<std::string_view>{}(std::string_view(packed.data(), packed.size()));
+        std::string filepath;
+        for (int i = 0; i < 8 && filepath.empty(); ++i) {
+            char name[64];
+            if (i == 0) {
+                snprintf(name, sizeof(name), "prompt-cache-%016" PRIx64 ".bin", hash);
+            } else {
+                snprintf(name, sizeof(name), "prompt-cache-%016" PRIx64 "-%d.bin", hash, i);
+            }
+            const std::string cand = params_base.slot_save_path + name;
+            std::error_code ec;
+            if (!std::filesystem::exists(std::filesystem::u8path(cand), ec) && !ec) {
+                filepath = cand;
+                break;
+            }
+            for (const auto & f : files) {
+                if (f.path == cand && f.tokens.size() == tokens.size() && f.tokens.get_common_prefix(tokens) == tokens.size()) {
+                    filepath = cand;
+                    break;
+                }
+            }
+        }
+        if (filepath.empty()) {
+            SRV_WRN("prompt cache: no free file name for %zu tokens in '%s', not saved to disk\n", tokens.size(), params_base.slot_save_path.c_str());
+            return;
+        }
+
+        std::string err;
+        const size_t n_bytes = slot_file_save(filepath, nullptr, [&](const std::string & path) { return write_state(path, packed); },
+                checkpoints, data_dft, data_spec, err);
+        if (n_bytes == 0) {
+            SRV_WRN("prompt cache: failed to save %zu tokens to '%s': %s\n", tokens.size(), filepath.c_str(), err.c_str());
+            return;
+        }
+
+        // keep the shared scan current: the next save check or the lookup of this pass sees the new file
+        const auto it = std::find_if(files.begin(), files.end(), [&](const slot_file & f) { return f.path == filepath; });
+        if (it != files.end()) {
+            it->tokens = tokens.clone();
+        } else {
+            files.push_back({ filepath, tokens.clone() });
+        }
+        prompt_cache_disk_bad.erase(filepath);
+
+        SRV_INF("prompt cache: saved %zu tokens to '%s' (%.3f MiB, %.2f ms)\n",
+                tokens.size(), filepath.c_str(), n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // an entry the RAM prompt cache evicts
+    void prompt_cache_disk_evict(const server_prompt_cache_state & state) {
+        const auto & main = state.data.main;
+        if (state.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS || main.size() <= 8) {
+            return;
+        }
+
+        // the entry holds llama_state_seq_get_data_ext output: io_magic(u32) seq_id(i32), then the same payload
+        // llama_state_seq_save_file writes after its own header and token list
+        uint32_t magic = 0;
+        memcpy(&magic, main.data(), sizeof(magic));
+        if (magic != LLAMA_STATE_SEQ_IO_MAGIC) {
+            SRV_WRN("prompt cache: unexpected state layout (magic %08x), not saved to disk\n", magic);
+            return;
+        }
+
+        const auto write_state = [&](const std::string & path, const std::vector<char> & packed) -> size_t {
+            const uint32_t hdr[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) (packed.size() / sizeof(llama_token)) };
+            std::ofstream ofs(std::filesystem::u8path(path), std::ios::binary | std::ios::trunc);
+            ofs.write((const char *) hdr, sizeof(hdr));
+            ofs.write(packed.data(), packed.size());
+            ofs.write((const char *) main.data() + 8, main.size() - 8);
+            ofs.flush();
+            return ofs ? sizeof(hdr) + packed.size() + main.size() - 8 : 0;
+        };
+
+        // the RAM cache keeps no speculative state, only the draft context
+        prompt_cache_disk_save(state.prompt.tokens, state.prompt.checkpoints, write_state, state.data.drft, {});
+    }
+
+    // saves the slot to the RAM prompt cache; a state the cache skips as larger than its whole limit goes to disk instead
+    bool prompt_cache_save(server_slot & slot) {
+        if (slot.prompt_save(*prompt_cache)) {
+            return true;
+        }
+
+        if (!prompt_cache_disk() || prompt_cache->limit_size == 0 || slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
+            return false;
+        }
+
+        size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft != nullptr) {
+            size += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            size += ckpt.size();
+        }
+        if (size <= prompt_cache->limit_size) {
+            return false; // skipped for another reason, e.g. already in the cache
+        }
+
+        std::vector<uint8_t> data_dft;
+        std::vector<uint8_t> data_spec;
+        capture_slot_draft(slot, data_dft, data_spec);
+
+        prompt_cache_disk_save(slot.prompt.tokens, slot.prompt.checkpoints, [&](const std::string & path, const std::vector<char> & packed) {
+            GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+            return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot.id,
+                    reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        }, data_dft, data_spec);
+
+        return false;
+    }
+
+    // before the RAM prompt cache loads anything: restore the slot file that shares the longest prefix with the new
+    // prompt, when it beats both what the slot holds and the best RAM cache entry by PROMPT_CACHE_DISK_MIN_TOKENS
+    // returns true if the slot now holds the file; on false the slot and the RAM cache are untouched, except that a
+    // failed restore leaves the slot empty - its state is in the RAM cache (prompt_cache_save ran first), so the
+    // caller's RAM cache load gives the same result as if the disk had not been tried
+    bool prompt_cache_disk_load(server_slot & slot, const server_tokens & tokens) {
+        if (!prompt_cache_disk() || tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
+            return false;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        const size_t lcp_slot = slot.prompt.tokens.get_common_prefix(tokens);
+        const size_t lcp_ram  = std::max(lcp_slot, prompt_cache->lcp_best(tokens));
+
+        std::string path_best;
+        size_t lcp_best   = 0;
+        size_t n_tok_best = 0;
+        for (const auto & f : slot_files()) {
+            const size_t lcp = f.tokens.get_common_prefix(tokens);
+            if (lcp < lcp_ram + PROMPT_CACHE_DISK_MIN_TOKENS || lcp <= lcp_best ||
+                !server_prompt_cache::keeps_enough(lcp, f.tokens.size()) || prompt_cache_disk_is_bad(f.path)) {
+                continue;
+            }
+            path_best  = f.path;
+            lcp_best   = lcp;
+            n_tok_best = f.tokens.size();
+        }
+
+        if (path_best.empty()) {
+            return false;
+        }
+
+        std::string err;
+        const size_t n_bytes = slot_file_restore(slot, path_best, err);
+        if (n_bytes == 0) {
+            std::error_code ec;
+            prompt_cache_disk_bad[path_best] = std::filesystem::last_write_time(std::filesystem::u8path(path_best), ec);
+            SLT_WRN(slot, "prompt cache: failed to restore '%s', skipped from now on: %s\n", path_best.c_str(), err.c_str());
+            return false;
+        }
+
+        SLT_INF(slot, "prompt cache: restored %zu tokens from '%s' (%zu of %zu prompt tokens reusable, slot and RAM cache had %zu; %.3f MiB, %.2f ms)\n",
+                n_tok_best, path_best.c_str(), lcp_best, tokens.size(), lcp_ram, n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+        return true;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3184,11 +3601,12 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        const slot_files_pass pass(*this);
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if (prompt_cache_save(slot)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -3340,56 +3758,20 @@ private:
                         break;
                     }
 
-                    // write the state, the checkpoints and the draft state to a temp file and rename it over
-                    // filepath only once all of it is on disk, so a failed or interrupted save keeps the old file
-                    // the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
-                    const std::filesystem::path fspath = std::filesystem::u8path(filepath);
-                    const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
-                    const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
-                    const auto fail = [&](const char * msg) {
-                        std::error_code ec;
-                        std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
-                        send_error(task, msg, ERROR_TYPE_SERVER);
-                    };
-
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, tmppath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        fail("Unable to save slot");
-                        break;
-                    }
 
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(tmppath, *slot, nwrite_ckpt)) {
-                        fail("Unable to save slot: incomplete context checkpoints");
-                        break;
-                    }
+                    std::vector<uint8_t> data_dft;
+                    std::vector<uint8_t> data_spec;
+                    capture_slot_draft(*slot, data_dft, data_spec);
 
-                    size_t nwrite_dft = 0;
-                    if (!save_slot_draft(tmppath, *slot, nwrite_dft)) {
-                        fail("Unable to save slot: incomplete draft state");
+                    std::string err;
+                    const size_t n_bytes = slot_file_save(filepath, slot, [&](const std::string & path) {
+                        return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot->id,
+                                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    }, slot->prompt.checkpoints, data_dft, data_spec, err);
+                    if (n_bytes == 0) {
+                        send_error(task, err, ERROR_TYPE_SERVER);
                         break;
-                    }
-
-                    if (!fsync_path(tmppath)) {
-                        SLT_WRN(*slot, "failed to sync '%s'\n", tmppath.c_str());
-                        fail("Unable to save slot: sync failed");
-                        break;
-                    }
-                    {
-                        std::error_code ec;
-                        std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
-                        if (ec) {
-                            SLT_WRN(*slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
-                            fail("Unable to save slot: rename failed");
-                            break;
-                        }
-                    }
-                    // persist the rename itself; the new file is already in place, so a failure is only logged
-                    if (!fsync_path(dirpath)) {
-                        SLT_WRN(*slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -3401,7 +3783,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_save_ms;
 
                     // Make an otherwise-indistinguishable empty save legible: a slot whose
@@ -3442,42 +3824,12 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    std::string err;
+                    const size_t n_bytes = slot_file_restore(*slot, filepath, err);
+                    if (n_bytes == 0) {
+                        send_error(task, "Unable to restore slot: " + err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3488,7 +3840,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;

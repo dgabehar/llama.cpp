@@ -2,6 +2,7 @@ import pytest
 from utils import *
 import base64
 import requests
+import shutil
 import struct
 import threading
 
@@ -1189,3 +1190,145 @@ def test_prompt_cache_swa_window(swa_window_server):
 
     assert cached["cache_n"]  == direct["cache_n"]
     assert cached["prompt_n"] == direct["prompt_n"]
+
+
+# the RAM prompt cache spills an evicted entry to the slot dir, and a later miss restores it from there
+# instead of re-processing the whole prompt. tinygemma3 with a small SWA window stands in for the fleet's
+# hybrid/recurrent models: it cannot reuse a partial memory either, so a miss is a full re-prefill
+PROMPT_CACHE_DISK_MIN_TOKENS = 4096  # server-context.cpp
+
+
+def disk_cache_server(slot_save_path, cache_ram=20):
+    srv = ServerPreset.tinygemma3()
+    srv.override_kv = "gemma3.attention.sliding_window=int:64"
+    srv.slot_save_path = slot_save_path
+    srv.temperature = 0.0
+    srv.n_predict = 4
+    srv.n_slots = 1
+    srv.n_ctx = 8192
+    # an entry for long_prompt() is ~13 MiB: 20 MiB holds one, so the next one evicts it;
+    # 1 MiB holds none, so the RAM cache skips every entry as too large
+    srv.cache_ram = cache_ram
+    return srv
+
+
+def long_prompt(i):
+    return f"Story {i}. " + f"The quick brown fox number {i} jumps over the lazy dog. " * 400
+
+
+def timed_completion(srv, prompt):
+    t0 = time.perf_counter()
+    res = srv.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True})
+    assert res.status_code == 200
+    return res.body["timings"], time.perf_counter() - t0
+
+
+def spill_files(path):
+    return sorted(f for f in os.listdir(path) if f.startswith("prompt-cache-") and f.endswith(".bin"))
+
+
+# cache_ram=-1: no size limit, so only the token limit (n_ctx) evicts
+@pytest.mark.parametrize("with_disk,cache_ram,draft", [(True, 20, False), (True, 1, False), (True, -1, False), (True, 40, True), (False, 20, False)])
+def test_prompt_cache_disk_restores_evicted_prompt(tmp_path, with_disk, cache_ram, draft):
+    srv = disk_cache_server(str(tmp_path) if with_disk else None, cache_ram)
+    if draft:
+        # the entry then also holds the draft context, written as the draft appendix
+        srv.model_draft_hf_repo = srv.model_hf_repo
+        srv.spec_type = "draft-simple"
+    srv.start()
+
+    cold, cold_s = timed_completion(srv, long_prompt(0))
+    assert cold["prompt_n"] >= PROMPT_CACHE_DISK_MIN_TOKENS
+    # other prompts, so the RAM cache evicts the first one
+    for i in range(1, 4):
+        timed_completion(srv, long_prompt(i))
+
+    again, again_s = timed_completion(srv, long_prompt(0))
+    print(f"with_disk={with_disk} cache_ram={cache_ram}: cold prompt_n={cold['prompt_n']} prompt_ms={cold['prompt_ms']:.1f} wall={cold_s:.3f}s; "
+          f"again prompt_n={again['prompt_n']} cache_n={again['cache_n']} prompt_ms={again['prompt_ms']:.1f} wall={again_s:.3f}s")
+
+    if not with_disk:
+        # evicted and gone: the whole prompt is processed again
+        assert again["prompt_n"] >= cold["prompt_n"] - 64
+        return
+
+    # restored from disk: only the tail of the prompt is processed
+    assert again["cache_n"] >= cold["prompt_n"] - 64
+    assert again["prompt_n"] <= 64
+    assert again["prompt_ms"] < cold["prompt_ms"] / 4
+
+    # the spilled files are ordinary slot save files: the explicit restore endpoint reads them too
+    files = spill_files(tmp_path)
+    assert len(files) >= 3
+    for f in files:
+        res = srv.make_request("POST", "/slots/0?action=restore", data={"filename": f})
+        assert res.status_code == 200
+        assert res.body["n_read"] == os.path.getsize(tmp_path / f)
+
+
+# a short prompt is not worth a disk round trip
+def test_prompt_cache_disk_skips_short_prompts(tmp_path):
+    srv = disk_cache_server(str(tmp_path))
+    srv.start()
+    for i in range(6):
+        res = srv.make_request("POST", "/completion", data={"prompt": f"Story {i}. " + "Once upon a time " * 20, "cache_prompt": True})
+        assert res.status_code == 200
+    assert spill_files(tmp_path) == []
+
+
+# a disk file that fails to restore must not cost the request what the RAM cache would have given it
+def test_prompt_cache_disk_failed_restore_keeps_ram_hit(tmp_path):
+    srv = disk_cache_server(str(tmp_path))
+    srv.n_ctx = 16384
+    srv.start()
+
+    short = long_prompt(0)
+    full  = short + "Chapter two. " + "A slow green turtle number 7 walks under the busy bridge. " * 400
+
+    # a slot file for the full prompt, with its token list intact and its state cut short
+    res = timed_completion(srv, full)[0]
+    assert res["prompt_n"] - len(srv.make_request("POST", "/tokenize", data={"content": short}).body["tokens"]) > PROMPT_CACHE_DISK_MIN_TOKENS + 64
+    res = srv.make_request("POST", "/slots/0?action=save", data={"filename": "broken.bin"})
+    assert res.status_code == 200
+    broken = tmp_path / "broken.bin"
+    size = os.path.getsize(broken)
+    with open(broken, "r+b") as f:
+        f.truncate(size // 2)
+
+    # the RAM cache then holds the short prompt (a ~13 MiB entry; the full one does not fit in 20 MiB)
+    short_res = timed_completion(srv, short)[0]
+    timed_completion(srv, "Once upon a time " * 20)
+
+    # the broken file beats the RAM entry by more than PROMPT_CACHE_DISK_MIN_TOKENS, so it is tried first and fails;
+    # the request must still reuse the RAM entry, not start from an empty slot
+    again = timed_completion(srv, full)[0]
+    print(f"short prompt_n={short_res['prompt_n']} cache_n={short_res['cache_n']}; again prompt_n={again['prompt_n']} cache_n={again['cache_n']}")
+    assert again["cache_n"] >= short_res["prompt_n"] + short_res["cache_n"] - 64
+
+    # a later request does not try the broken file again
+    again2 = timed_completion(srv, full)[0]
+    assert again2["cache_n"] >= again["prompt_n"] + again["cache_n"] - 64
+
+
+# a spill never overwrites a file that holds another prompt under the name it would use
+def test_prompt_cache_disk_name_taken_by_other_prompt(tmp_path):
+    srv = disk_cache_server(str(tmp_path))
+    srv.start()
+    for i in range(4):
+        timed_completion(srv, long_prompt(i))
+    # prompts 0 and 1 were evicted and spilled, in that order
+    files = sorted(spill_files(tmp_path), key=lambda f: os.path.getmtime(tmp_path / f))
+    assert len(files) == 2
+    name_0, name_1 = files
+    # the name of prompt 0 now holds prompt 1
+    shutil.copyfile(tmp_path / name_1, tmp_path / name_0)
+    with open(tmp_path / name_0, "rb") as f:
+        taken = f.read()
+
+    # prompt 0 is not on disk any more: it is processed again, then evicted and spilled again
+    for i in [0, 4, 5]:
+        timed_completion(srv, long_prompt(i))
+
+    with open(tmp_path / name_0, "rb") as f:
+        assert f.read() == taken
+    assert name_0.removesuffix(".bin") + "-1.bin" in spill_files(tmp_path)

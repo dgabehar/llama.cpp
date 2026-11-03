@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <functional>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -729,6 +730,18 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // (optional) called with each entry the size or token limit evicts, right before it is freed
+    std::function<void(const server_prompt_cache_state &)> on_evict;
+
+    // a cached prompt is only loaded if the new prompt keeps at least this share of it (don't trash large prompts);
+    // the slot-dir lookup in server-context.cpp applies the same rule
+    static constexpr float MIN_KEEP_RATIO = 0.25f;
+
+    // true if the new prompt keeps enough of a cached prompt with n_cached tokens, of which lcp are common
+    static bool keeps_enough(size_t lcp, size_t n_cached) {
+        return n_cached > 0 && float(lcp) >= MIN_KEEP_RATIO * float(n_cached);
+    }
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -736,6 +749,9 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // the longest common prefix with tokens_new among the entries load() would consider, 0 if none
+    size_t lcp_best(const server_tokens & tokens_new) const;
 
     void update();
 };
