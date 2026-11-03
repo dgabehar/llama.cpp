@@ -284,6 +284,15 @@ home-infrastructure artifact must change in the same series.
    appendix (`SLOT_CKPT_VERSION`, `save_slot_checkpoints`) and the `/slots`,
    `/slots/<id>?action=save|restore` and `/props` JSON keys
    (`id_slot`, `is_processing`, `n_saved`, `n_restored`, `filename`, `n_ctx`).
+   Also the file-local `io_magic` (`0xaf143cd8`) in `src/llama-context.cpp`, which
+   `llama_state_seq_get_data_ext` writes ahead of the seq_id: our
+   `LLAMA_STATE_SEQ_IO_MAGIC` in `server-context.cpp` duplicates it, and the prompt
+   cache spill (`prompt_cache_disk_evict`) refuses every entry whose first 4 bytes
+   differ, so a change upstream turns the spill of evicted entries off with only a
+   warning in the log (`unexpected state layout`); only the pytest
+   `test_prompt_cache_disk_restores_evicted_prompt` catches it, and only when it runs.
+   `git diff OLD..NEW -- src/llama-context.cpp | rg io_magic`, and check the
+   `get_data_ext` output still starts with magic + seq_id (8 bytes) before the payload.
 5. Flags the fleet uses (values-*.yaml `extraArgs`, chart templates): extract with
    `rg -oN -h -- '--?[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
    in home-infrastructure (non-comment lines), then confirm every
@@ -871,6 +880,47 @@ converter (`home-infrastructure` `kvrepl_nstream_convert.py`) and restore need n
 written any more (the draft state lives in the SDFT appendix), so there is no second path to make atomic. Windows:
 no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_keeps_previous_file` (a directory at
 `<dir>/.<file>.tmp` makes the second save fail; the first file must be unchanged and restorable), fails before the fix.
+
+## Prompt cache spills to the slot dir (added 2026-11-03)
+
+With `--slot-save-path` set and `--cache-ram` on, the RAM prompt cache no longer just frees an entry it evicts. The
+entry is written to the slot dir as an ordinary slot save file, `prompt-cache-<16 hex>.bin`. The same happens to an
+entry the cache skips because it is larger than the whole `--cache-ram` limit. When a request then misses the RAM
+cache, the server scans the slot dir and restores the file whose token list shares the longest prefix with the
+request. The scan covers every `*.bin` there, including the LiteLLM hook's session saves and files pulled from peers.
+Why: Loki on gabesrv06 (qwen38-27b, `--parallel 1`) and gabesrv10 (qwen38-flash, `--parallel 2`), both with
+`--cache-ram 8192`, showed entries of 3.2-7.6 GiB, so a second conversation evicts the first. Both models are
+hybrid-recurrent, so a miss is a full re-prefill: 50K-170K tokens, 8-47 minutes on the 27B, 13.7 minutes on flash
+right after a "making room for prompt cache entry" line.
+
+- Format: the slot save format, unchanged: the `ggsq` header with `LLAMA_STATE_SEQ_VERSION` (4), the serialized
+  token list, the state, then the SCKP checkpoints and the SDFT draft appendix. The RAM entry holds
+  `llama_state_seq_get_data_ext` output, which is `io_magic` + `seq_id` (8 bytes) followed by the same payload
+  `llama_state_seq_save_file` writes, so the spill writes the header and tokens and then the entry minus those 8
+  bytes. The draft context goes to SDFT with an empty speculative state, because the RAM cache keeps none. The save
+  goes through the atomic-save path above, shared with `action=save` (`slot_file_save`). The restore is the
+  `action=restore` path (`slot_file_restore`), so checkpoint-based reuse (patch 0002) works the same on a disk hit.
+  `kvrepl_nstream_convert.py`, the slot-cache gc and the sync treat these files like any other save.
+- Thresholds: prompts under 4096 tokens are neither spilled nor looked up. The disk is looked up before the RAM cache
+  loads anything, and a disk hit must beat both what the slot holds and the best RAM cache entry by 4096 tokens, and
+  must keep at least a quarter of the file (`server_prompt_cache::MIN_KEEP_RATIO`, the RAM cache's own rule). If the
+  restore fails, the RAM cache load runs as if the disk had not been tried (the slot's own state was saved to the RAM
+  cache first). A prompt that a slot file already contains whole is not written again. A file that fails to restore
+  is skipped until its mtime changes, and forgotten once it is deleted. The file name is a hash of the token list; a
+  name taken by a file with other tokens is never overwritten (a `-<n>` suffix is added). One prompt cache pass (slot
+  selection, idle or child slot save) scans the slot dir once, shared by its spills and its lookup.
+- Disk: nothing deletes these files except the slot-cache gc (age cap, size cap, free-space floor). Each spill is as
+  large as the RAM entry (GiBs on the 27B). With `slotCacheReplication` on (gabesrv06 and the gabesrv10 router),
+  spills replicate to the peer like any save.
+- Known ceiling: the spill write (with fsync) and the lookup run synchronously on the server loop, so every slot
+  stalls while a multi-GiB state is written or read. A writer thread would lift this, at the cost of holding one
+  more entry in RAM above `--cache-ram` until the write finishes.
+- Tests: `test_slot_save.py::test_prompt_cache_disk_restores_evicted_prompt` (evicted, oversized and draft-model
+  cases plus a no-disk control; it asserts on `prompt_n`/`cache_n`/`prompt_ms`) and
+  `test_prompt_cache_disk_skips_short_prompts`. Live on Qwen3.5-0.8B (CPU): an evicted 4.8K-token prompt came back
+  as 4 processed tokens in 0.37 s, against 4817 tokens and 11.7 s without the patch. A spill converted to 2 streams
+  by kvrepl was restored by the first request on a fresh `--parallel 2` server. Not yet measured on
+  production-size states (3-8 GiB) or on the fleet's own disks.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 

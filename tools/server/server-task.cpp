@@ -1839,6 +1839,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            if (on_evict) {
+                on_evict(states.front());
+            }
             states.pop_front();
         }
     }
@@ -1896,7 +1899,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        if (!keeps_enough(lcp_cur, it->prompt.tokens.size())) {
             continue;
         }
 
@@ -1953,11 +1956,25 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+size_t server_prompt_cache::lcp_best(const server_tokens & tokens_new) const {
+    size_t res = 0;
+    for (const auto & state : states) {
+        const size_t lcp = state.prompt.tokens.get_common_prefix(tokens_new);
+        if (keeps_enough(lcp, state.prompt.tokens.size())) {
+            res = std::max(res, lcp);
+        }
+    }
+    return res;
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (on_evict) {
+                on_evict(states.front());
+            }
             states.pop_front();
         }
     }
@@ -1973,6 +1990,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (on_evict) {
+                on_evict(states.front());
+            }
             states.pop_front();
         }
     }
