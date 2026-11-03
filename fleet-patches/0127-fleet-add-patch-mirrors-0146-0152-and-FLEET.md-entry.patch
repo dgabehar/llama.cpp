@@ -1,0 +1,1963 @@
+From b16c58a8049b16f60bada3e95487da5a2df01069 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 30 Sep 2026 15:43:55 -0500
+Subject: [PATCH] fleet: add patch mirrors 0146-0152 and FLEET.md entry for K2
+ fix build F2
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ FLEET.md                                      |  43 +
+ ...eply-guard-tag-mask-O-1-per-candidat.patch | 169 ++++
+ ...parser-gaps-all-reasoning-efforts-ba.patch | 738 ++++++++++++++++++
+ ...de-an-unclosed-reasoning-block-tools.patch | 314 ++++++++
+ ...e-a-tool-call-only-once-its-argument.patch | 118 +++
+ ...cept-the-tool-arguments-in-any-order.patch |  94 +++
+ ...-end-of-turn-inside-an-unclosed-reas.patch | 237 ++++++
+ ...ion-breaker-for-an-open-reasoning-bl.patch | 149 ++++
+ fleet-patches/README.md                       |   7 +
+ 9 files changed, 1869 insertions(+)
+ create mode 100644 fleet-patches/0146-sampling-empty-reply-guard-tag-mask-O-1-per-candidat.patch
+ create mode 100644 fleet-patches/0147-chat-K2-Horizon-parser-gaps-all-reasoning-efforts-ba.patch
+ create mode 100644 fleet-patches/0148-K2-hold-EOG-inside-an-unclosed-reasoning-block-tools.patch
+ create mode 100644 fleet-patches/0149-K2-parser-surface-a-tool-call-only-once-its-argument.patch
+ create mode 100644 fleet-patches/0150-K2-parser-accept-the-tool-arguments-in-any-order.patch
+ create mode 100644 fleet-patches/0151-K2-guard-turn-an-end-of-turn-inside-an-unclosed-reas.patch
+ create mode 100644 fleet-patches/0152-K2-guard-repetition-breaker-for-an-open-reasoning-bl.patch
+
+diff --git a/FLEET.md b/FLEET.md
+index 3a4d9cb54..9556585fd 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -736,6 +736,49 @@ The master then hangs forever. The stack is in `rpc_dispatcher::send()` →
+   non-stream; live-session replay 0/60 stream, 0/60 non-stream empty / stuck /
+   Kimi (before the fix: live stream 16/60 Kimi, 1 empty, 2 stuck).
+ 
++- **K2-Horizon-7B fix build F2: parser gaps, reasoning-block guard, repetition
++  breaker** (2026-09-30, patches 0146-0152, fork commits `11e9b4b63`,
++  `0088f823d`, `3449022c9`, `d5812222e`, `f893af144`, `59b910d75`, `ed3ab13ad`).
++  - 0146 (`11e9b4b63`): the armed empty-reply guard / tag mask did a
++    `std::find` over the EOG and tag id lists per candidate per token (about
++    +1.5 ms/token on a ~250k vocab); now a per-vocab flag table, same behavior.
++    Test: `test-empty-reply-guard` (200 randomized candidate layouts vs the old
++    rule, plus a 250k-candidate timing print).
++  - 0147 (`0088f823d`): K2 parser gaps. Reasoning open tag taken from the
++    generation prompt (low/medium/high all parse); bare `<ifm|tool_call>` block
++    (no section opener/end) is a call; a complete Kimi-form call is surfaced;
++    stray `</ifm|think*>`, `<|close|>`, `<|sep|>`, EOG text dropped; a parse
++    failure falls back to reasoning + content instead of throwing. Test:
++    `tests/test-chat.cpp` (efforts, bare/Kimi calls, stray tags, fallback, 18000-case
++    no-throw fuzz).
++  - 0148 (`3449022c9`): with tools offered, EOG inside an unclosed reasoning
++    block is held; only known K2/Kimi markup is stripped from replayed reasoning
++    (was: any `<|...|>`).
++  - 0149 (`d5812222e`): a call cut off by EOG/max_tokens (arguments healed to
++    `{`) is no longer surfaced as a call; falls back to reasoning/content at the
++    end of generation.
++  - 0150 (`f893af144`): tagged-args parser takes the arguments in any order
++    (was required-first in schema order; K2 writes e.g. `path` before the
++    required `pattern`, which surfaced a call with arguments `{`, Grafana F7 t3).
++  - 0151 (`59b910d75`): masking EOG alone in an open reasoning block pushed
++    replayed turns into 4096-token loops; the close tag now takes the best EOG
++    logit while the block is open (capped), so "stop" becomes "close reasoning".
++  - 0152 (`ed3ab13ad`): repetition breaker: a reasoning line of 16+ chars written
++    three times in the block the prompt opened forces the close tag (R17 live
++    seed 0 looped on "Let me check the GitHub releases..." from turn 31).
++    Known gap: only identical repeated lines are caught.
++  Tests for 0147-0152: `tests/test-chat.cpp`, `tests/test-empty-reply-guard.cpp`.
++  QA (Dawn, K2 results doc in home-infrastructure
++  `docs/architecture/model-test-plan-k2-horizon-7b-results.md`): GO for a canary.
++  R17 live 4 independent seeds 0 empty / 0 runaway / 0 badcall; F7 t3 19/20 OK;
++  R01 0/48, R01b 0/48 (baseline fleet build: 4/144 on junk-history replay, 20/20
++  leaks at medium/high effort). Pending: garage R17 and a decode-speed check.
++  **Upstream rebase point:** ggml-org/llama.cpp PR
++  [#29535](https://github.com/ggml-org/llama.cpp/pull/29535) (open, K2 Horizon
++  support). When it lands, rebase onto it; our patches still needed on top: the
++  EOG guard, bare `<ifm|tool_call>`, Kimi-form opener, `<|close|>` leak,
++  optional-before-required argument order, and the repetition breaker.
++
+ - **draft-mtp + `--parallel>1` + split (non-unified) KV cache on
+   hybrid/linear-attention architectures** (Qwen3.5/Qwen3.6/Qwen3.8's
+   `qwen35`/`qwen3_5` family) is a genuinely fragile combination this fleet
+diff --git a/fleet-patches/0146-sampling-empty-reply-guard-tag-mask-O-1-per-candidat.patch b/fleet-patches/0146-sampling-empty-reply-guard-tag-mask-O-1-per-candidat.patch
+new file mode 100644
+index 000000000..dd1ab53a8
+--- /dev/null
++++ b/fleet-patches/0146-sampling-empty-reply-guard-tag-mask-O-1-per-candidat.patch
+@@ -0,0 +1,169 @@
++From 11e9b4b63190cbcea9b901f7944c20a708db5028 Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Tue, 29 Sep 2026 17:12:10 -0500
++Subject: [PATCH] sampling: empty-reply guard/tag mask: O(1) per-candidate
++ masking
++
++apply() ran std::find over the EOG and tag id lists for every candidate (twice) on each token while armed,
++about +1.5 ms/token over a ~250k vocab. Membership is now a per-vocab flag table built at init, the
++"last candidate standing" check stops at the first other finite candidate, and when the candidates are the
++full vocab in id order only the few masked ids are touched. Behavior unchanged.
++
++test-empty-reply-guard: 200 randomized candidate layouts (identity, shuffled, sparse, sorted, -inf, out-of-range
++ids, last-candidate) compared against the old std::find rule, plus a 250k-candidate timing print
++(new 0.0003 ms/token vs old rule ~0.66-0.79 ms/token on this CPU).
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/sampling.cpp              | 33 +++++++++++-----
++ tests/test-empty-reply-guard.cpp | 65 ++++++++++++++++++++++++++++++++
++ 2 files changed, 89 insertions(+), 9 deletions(-)
++
++diff --git a/common/sampling.cpp b/common/sampling.cpp
++index 563265fb5..b1a82f7d2 100644
++--- a/common/sampling.cpp
+++++ b/common/sampling.cpp
++@@ -155,6 +155,8 @@ struct common_empty_reply_guard {
++     // armed: token ids of every tag except the section opener; masked while no native section is open (a call
++     // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
++     std::vector<llama_token> tag_ids;
+++    // per token id: 1 = EOG, 2 = tag (built at init)
+++    std::vector<uint8_t>     flags;
++ };
++ 
++ static const char * const k_kimi_markers[] = {
++@@ -287,18 +289,28 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
++     if (!mask_eog && !mask_tags) {
++         return;
++     }
+++    // O(1) membership from a per-vocab flag table (built at init); was a std::find per candidate (~1.5 ms/token at 250k)
+++    const uint8_t flag = (mask_eog ? 1 : 0) | (mask_tags ? 2 : 0);
++     const auto masked = [&](llama_token id) {
++-        return (mask_eog  && std::find(ctx->eog.begin(),     ctx->eog.end(),     id) != ctx->eog.end()) ||
++-               (mask_tags && std::find(ctx->tag_ids.begin(), ctx->tag_ids.end(), id) != ctx->tag_ids.end());
+++        return id >= 0 && (size_t) id < ctx->flags.size() && (ctx->flags[id] & flag);
++     };
++-    // never mask the last candidate standing
++-    size_t n_other = 0;
++-    for (size_t i = 0; i < cur_p->size; ++i) {
++-        if (!masked(cur_p->data[i].id) && cur_p->data[i].logit != -INFINITY) {
++-            n_other++;
++-        }
+++    // never mask the last candidate standing: stop at the first other finite candidate
+++    bool has_other = false;
+++    for (size_t i = 0; i < cur_p->size && !has_other; ++i) {
+++        has_other = cur_p->data[i].logit != -INFINITY && !masked(cur_p->data[i].id);
+++    }
+++    if (!has_other) {
+++        return;
++     }
++-    if (n_other == 0) {
+++    // full-vocab candidates in id order (the usual case): jump straight to the few masked ids
+++    const auto direct = [&](const std::vector<llama_token> & ids, bool on) {
+++        return !on || std::all_of(ids.begin(), ids.end(), [&](llama_token id) {
+++            return id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id;
+++        });
+++    };
+++    if (direct(ctx->eog, mask_eog) && direct(ctx->tag_ids, mask_tags)) {
+++        for (llama_token id : ctx->eog)     { if (mask_eog)  { cur_p->data[id].logit = -INFINITY; } }
+++        for (llama_token id : ctx->tag_ids) { if (mask_tags) { cur_p->data[id].logit = -INFINITY; } }
++         return;
++     }
++     for (size_t i = 0; i < cur_p->size; ++i) {
++@@ -358,6 +370,9 @@ struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_
++             ctx->eog.push_back(id);
++         }
++     }
+++    ctx->flags.assign(n_vocab, 0);
+++    for (llama_token id : ctx->eog)     { ctx->flags[id] |= 1; }
+++    for (llama_token id : ctx->tag_ids) { if (id >= 0 && id < n_vocab) { ctx->flags[id] |= 2; } }
++     return llama_sampler_init(&common_empty_reply_guard_i, ctx);
++ }
++ 
++diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
++index 62fa0a24c..cd96b2674 100644
++--- a/tests/test-empty-reply-guard.cpp
+++++ b/tests/test-empty-reply-guard.cpp
++@@ -3,6 +3,9 @@
++ // an opencode turn (2026-09-28): "\n<|tool_calls_section_begin|><|tool_call_begin|>" then EOG. Those markers
++ // are not vocab tokens of that model, so a vocab that does not have them either (gpt-2) tokenizes them the same way.
++ 
+++#include <algorithm>
+++#include <chrono>
+++#include <random>
++ #include "llama.h"
++ #include "common.h"
++ #include "sampling.h"
++@@ -305,6 +308,68 @@ int main(int argc, char ** argv) {
++             llama_token_data_array p1 = { d1, 1, -1, false };
++             llama_sampler_apply(g2, &p1);
++             CHECK(!std::isinf(d1[0].logit));
+++            // the masking must equal the reference std::find rule for any candidate layout (identity, shuffled, sparse,
+++            // sorted, with -inf, ids past the vocab), and its per-token cost is timed against that old rule
+++            {
+++                const int n_v = llama_vocab_n_tokens(v2);
+++                std::vector<llama_token> eogs;
+++                for (llama_token t = 0; t < n_v; ++t) { if (llama_vocab_is_eog(v2, t)) { eogs.push_back(t); } }
+++                const std::vector<llama_token> tag_v = { id[1], id[2], id[3] };
+++                auto ref = [&](std::vector<llama_token_data> & c, bool m_eog, bool m_tag) {
+++                    auto masked = [&](llama_token t) {
+++                        return (m_eog && std::find(eogs.begin(), eogs.end(), t) != eogs.end()) ||
+++                               (m_tag && std::find(tag_v.begin(), tag_v.end(), t) != tag_v.end());
+++                    };
+++                    size_t n_other = 0;
+++                    for (auto & x : c) { if (!masked(x.id) && x.logit != -INFINITY) { n_other++; } }
+++                    if (n_other == 0) { return; }
+++                    for (auto & x : c) { if (masked(x.id)) { x.logit = -INFINITY; } }
+++                };
+++                std::mt19937 rng(42);
+++                for (int iter = 0; iter < 200; ++iter) {
+++                    const bool armed_open = iter % 2;            // tags masked only while no native section is open
+++                    const bool seen       = iter % 4 < 2;        // EOG masked only before any output
+++                    std::vector<llama_token_data> c;
+++                    const int kind = iter % 5;
+++                    for (llama_token t = 0; t < n_v; ++t) {
+++                        if (kind == 3 && rng() % 3) { continue; } // sparse
+++                        c.push_back({ t, (rng() % 7 == 0) ? -INFINITY : (float) (rng() % 100) / 10.f, 0.f });
+++                    }
+++                    if (kind == 1 || kind == 4) { std::shuffle(c.begin(), c.end(), rng); }
+++                    if (kind == 2) { std::sort(c.begin(), c.end(), [](auto & a, auto & b) { return a.logit > b.logit; }); }
+++                    if (kind == 4) { c.push_back({ n_v + 5, 1.f, 0.f }); c.push_back({ -1, 1.f, 0.f }); }
+++                    if (iter % 11 == 0) { for (auto & x : c) { if (x.id != id[1] && x.id != eogs[0]) { x.logit = -INFINITY; } } } // last candidates
+++                    llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
+++                    if (!seen) { llama_sampler_accept(gg, ord); }
+++                    if (armed_open) { llama_sampler_accept(gg, id[0]); }
+++                    std::vector<llama_token_data> exp = c, got = c;
+++                    ref(exp, seen || armed_open, !armed_open); // an open native section holds EOG too
+++                    llama_token_data_array pp = { got.data(), got.size(), -1, false };
+++                    llama_sampler_apply(gg, &pp);
+++                    bool same = true;
+++                    for (size_t i = 0; i < exp.size(); ++i) { same = same && exp[i].logit == got[i].logit; }
+++                    CHECK(same);
+++                    llama_sampler_free(gg);
+++                }
+++                // timing on a 250k candidate array (identity order, as the sampler sees it), no output yet, tags masked
+++                const int N = 250000;
+++                std::vector<llama_token_data> big(N);
+++                for (int i = 0; i < N; ++i) { big[i] = { i, (float) (i % 97), 0.f }; }
+++                llama_sampler * gg = common_sampler_init_empty_reply_guard(v2, {}, tags);
+++                using clk = std::chrono::steady_clock;
+++                const int reps = 200;
+++                double t_new = 0, t_old = 0;
+++                for (int r = 0; r < reps; ++r) {
+++                    std::vector<llama_token_data> a = big, b = big;
+++                    llama_token_data_array pa = { a.data(), a.size(), -1, false };
+++                    auto t0 = clk::now(); llama_sampler_apply(gg, &pa); auto t1 = clk::now();
+++                    ref(b, true, true);   auto t2 = clk::now();
+++                    t_new += std::chrono::duration<double, std::milli>(t1 - t0).count();
+++                    t_old += std::chrono::duration<double, std::milli>(t2 - t1).count();
+++                }
+++                printf("guard apply over %d candidates: new %.4f ms/token, old std::find rule %.4f ms/token\n", N, t_new / reps, t_old / reps);
+++                llama_sampler_free(gg);
+++            }
++             llama_sampler_free(g2);
++             llama_model_free(m2);
++         }
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0147-chat-K2-Horizon-parser-gaps-all-reasoning-efforts-ba.patch b/fleet-patches/0147-chat-K2-Horizon-parser-gaps-all-reasoning-efforts-ba.patch
+new file mode 100644
+index 000000000..d4d963075
+--- /dev/null
++++ b/fleet-patches/0147-chat-K2-Horizon-parser-gaps-all-reasoning-efforts-ba.patch
+@@ -0,0 +1,738 @@
++From 0088f823d410cb1af3f8cce02531d1020db325bd Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Tue, 29 Sep 2026 18:29:21 -0500
++Subject: [PATCH] chat: K2-Horizon parser gaps (all reasoning efforts,
++ bare/Kimi calls, stray tags, never throw)
++
++- reasoning: the open tag is picked from the generation prompt (start_alts), so
++  medium/high (<ifm|think_fast>/<ifm|think>) parse like low; any close tag ends it
++- a bare <ifm|tool_call> block (no <ifm|tool_calls> opener, or a missing per-call/
++  section end) is a tool call; several calls parse whatever parallel_tool_calls says
++- a complete Kimi-form call (in reasoning or content) is surfaced as a tool call
++- stray </ifm|think*>, <|close|>, <|sep|>, EOG text and trailing junk are dropped with
++  tools offered too; tool markup is dropped from content without tools / tool_choice none
++- a parse failure falls back to reasoning + content (lenient-fallback rule) instead of throwing
++- tests: efforts, bare/Kimi calls, stray tags, no-tools calls, fallback, 18000-case no-throw fuzz
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/chat-auto-parser-generator.cpp | 198 +++++++++++++++---
++ common/chat-auto-parser.h             |  19 ++
++ common/chat-diff-analyzer.cpp         |  19 +-
++ common/chat.cpp                       |  13 ++
++ tests/test-chat.cpp                   | 289 ++++++++++++++++++++++++++
++ 5 files changed, 511 insertions(+), 27 deletions(-)
++
++diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
++index 73567c85c..e59deb989 100644
++--- a/common/chat-auto-parser-generator.cpp
+++++ b/common/chat-auto-parser-generator.cpp
++@@ -15,6 +15,25 @@ using json = common_json;
++ 
++ namespace autoparser {
++ 
+++// The reasoning open tag the generation prompt actually ended with: templates that pick the tag by request (K2-Horizon:
+++// one tag per reasoning_effort) list the other spellings as start_alts. Falls back to the registered start tag.
+++static std::string opened_reasoning_start(const analyze_reasoning & r, const std::string & generation_prompt) {
+++    std::string best = r.start;
+++    size_t      pos  = r.start.empty() ? std::string::npos : generation_prompt.find(r.start);
+++    for (const auto & alt : r.start_alts) {
+++        const size_t at = generation_prompt.find(alt);
+++        if (at != std::string::npos && (pos == std::string::npos || at < pos)) {
+++            best = alt;
+++            pos  = at;
+++        }
+++    }
+++    return best;
+++}
+++
+++static bool request_uses_tools(const generation_params & inputs) {
+++    return inputs.tools.is_array() && !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+++}
+++
++ parser_build_context::parser_build_context(common_chat_peg_builder & p, const generation_params & inputs) :
++     p(p),
++     inputs(inputs),
++@@ -45,8 +64,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
++         data.stops_after_reasoning = autoparser.content.stray_ends;
++         // stray_ends_no_tools are real tool-call syntax once tools are offered, so they must never
++         // stop generation in that case -- only fold them in when this request has none.
++-        bool request_has_tools = inputs.tools.is_array() && !inputs.tools.empty();
++-        if (!request_has_tools) {
+++        if (!request_uses_tools(inputs)) {
++             data.stops_after_reasoning.insert(data.stops_after_reasoning.end(),
++                 autoparser.content.stray_ends_no_tools.begin(), autoparser.content.stray_ends_no_tools.end());
++         }
++@@ -66,8 +84,9 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
++         const auto & msg = inputs.continue_msg;
++ 
++         if (!autoparser.reasoning.start.empty()) {
++-            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start));
++-            data.generation_prompt += autoparser.reasoning.start + msg.reasoning_content;
+++            const std::string opened = opened_reasoning_start(autoparser.reasoning, data.generation_prompt);
+++            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(opened));
+++            data.generation_prompt += opened + msg.reasoning_content;
++             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++                 data.generation_prompt += autoparser.reasoning.end;
++             }
++@@ -105,6 +124,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
++             data.grammar_triggers = {
++                 { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, trigger_marker }
++             };
+++            if (autoparser.tools.format.section_optional && !autoparser.tools.format.per_call_start.empty()) {
+++                // a bare per-call block (no section opener) is constrained the same way
+++                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, autoparser.tools.format.per_call_start });
+++            }
++             if (autoparser.tools.format.openai_wrapper_trigger) {
++                 // model emits the OpenAI function wrapper, trigger on it
++                 data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "{\"type\": \"function\"," });
++@@ -127,13 +150,21 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
++         ctx.content              = &content;
++         ctx.reasoning            = &reasoning;
++ 
+++        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+++        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+++
+++        // A grammar-less request may also get a complete Kimi-form call; the reasoning parser needs to know it
+++        // (a call emitted while still "thinking" ends the reasoning). Not under a required-call grammar.
+++        if (tools.format.kimi_fallback && tools.format.mode == tool_format::TAG_WITH_TAGGED && !has_response_format &&
+++            has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && jinja_caps.supports_tool_calls) {
+++            ctx.kimi_openers = { "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
+++            ctx.kimi_calls   = tools.build_kimi_calls(ctx);
+++        }
+++
++         // Build reasoning parser
++         ctx.reasoning_parser = reasoning.build_parser(ctx);
++ 
++         auto parser = p.eps();
++-
++-        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
++-        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
++ 
++         if (has_response_format) {
++@@ -149,8 +180,15 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
++         } else {
++             parser = content.build_parser(ctx);
++         }
++-        const std::string reasoning_start = trim_whitespace(reasoning.start);
++-        return pure_content ? p.prefix(generation_prompt, reasoning_start) + parser : p.prefix(generation_prompt, reasoning_start) << parser;
+++        const std::string reasoning_start = trim_whitespace(opened_reasoning_start(reasoning, generation_prompt));
+++        auto              prefix          = p.prefix(generation_prompt, reasoning_start);
+++        auto              root            = pure_content ? prefix + parser : prefix << parser;
+++        if (tools.format.drop_tail && ctx.extracting_reasoning) {
+++            // K2-Horizon: output that fits no shape above must never fail the turn (common_chat_peg_parse falls back
+++            // to this rule): keep the reasoning it can tell apart and hand back everything else as content.
+++            p.rule("lenient-fallback", prefix << (ctx.reasoning_parser + p.space() + p.content(p.rest()) + p.end()));
+++        }
+++        return root;
++     });
++ }
++ 
++@@ -179,17 +217,34 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
++                 }
++             }
++             auto body = p.reasoning(p.until_one_of(ends)) + p.choice(closers);
+++            auto opening = p.eps();
++             if (start.empty()) {
++-                return p.optional(body);
++-            }
++-            auto opening = p.optspace(start);
++-            if (!start_alts.empty()) {
++-                // the generation prompt's own newline after the open tag comes first, hence the space()
++-                std::vector<common_peg_parser> repeats = { p.literal(trim_whitespace(start)) };
++-                for (const auto & alt : start_alts) {
++-                    repeats.push_back(p.literal(trim_whitespace(alt)));
+++                if (!ctx.kimi_calls) {
+++                    return p.optional(body);
+++                }
+++            } else {
+++                opening = p.optspace(start);
+++                if (!start_alts.empty()) {
+++                    // the request picks the open tag (K2-Horizon: by reasoning_effort), so any spelling may be the one
+++                    // the generation prompt opened; the generation prompt's own newline after it comes first
+++                    std::vector<common_peg_parser> firsts = { opening };
+++                    std::vector<common_peg_parser> repeats = { p.literal(trim_whitespace(start)) };
+++                    for (const auto & alt : start_alts) {
+++                        firsts.push_back(p.optspace(alt));
+++                        repeats.push_back(p.literal(trim_whitespace(alt)));
+++                    }
+++                    opening = p.choice(firsts) + p.zero_or_more(p.space() + p.choice(repeats));
++                 }
++-                opening = opening + p.zero_or_more(p.space() + p.choice(repeats));
+++            }
+++            if (ctx.kimi_calls) {
+++                // A complete Kimi-form call inside the reasoning ends it (the call is parsed after it); a Kimi opener
+++                // that does not lead to a complete call is plain reasoning text, as before.
+++                auto stops = ends;
+++                stops.insert(stops.end(), ctx.kimi_openers.begin(), ctx.kimi_openers.end());
+++                auto kimi_closers = closers;
+++                kimi_closers.push_back(p.peek(*ctx.kimi_first));
+++                auto kimi_body = p.reasoning(p.until_one_of(stops)) + p.choice(kimi_closers);
+++                return p.optional(p.choice({ opening + kimi_body, opening + body }));
++             }
++             return p.optional(opening + body);
++         }
++@@ -222,7 +277,7 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
++     // real tool-call syntax, parsed by analyze_tools instead, so this path never sees them (build_parser
++     // only calls analyze_content::build_parser once tools are ruled out for this request).
++     std::vector<std::string> ends = stray_ends;
++-    if (!(ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty())) {
+++    if (!request_uses_tools(ctx.inputs)) {
++         ends.insert(ends.end(), stray_ends_no_tools.begin(), stray_ends_no_tools.end());
++     }
++ 
++@@ -344,6 +399,10 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p,
++         auto close_peek = arguments.tolerate_intertag_whitespace
++                               ? p.peek(p.space() + p.literal(format.per_call_end))
++                               : p.peek(p.literal(format.per_call_end));
+++        if (format.section_optional) {
+++            close_peek = p.peek(p.space() + p.choice({ p.literal(format.per_call_end), p.literal(format.section_end),
+++                                                        p.literal(format.per_call_start) }));
+++        }
++         func_parser = func_parser + p.tool_close(close_peek);
++     } else {
++         func_parser = func_parser + p.tool_close(p.space());  // force this to process tool closing callbacks in mapper
++@@ -428,6 +487,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
++ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
++     auto &       p           = ctx.p;
++     const auto & inputs      = ctx.inputs;
+++    const bool   parallel    = inputs.parallel_tool_calls || format.always_parallel;
++ 
++     auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
++ 
++@@ -511,16 +571,27 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
++     common_peg_parser tool_calls = p.eps();
++ 
++     if (!format.per_call_start.empty()) {
++-        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
++-        if (inputs.parallel_tool_calls) {
+++        // a block whose own end tag is missing still ends at the section end or at the next call
+++        auto call_end = format.section_optional ?
+++            p.choice({ p.literal(format.per_call_end), p.peek(p.literal(format.section_end)), p.peek(p.literal(format.per_call_start)) }) :
+++            p.literal(format.per_call_end);
+++        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + call_end;
+++        if (parallel) {
++             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
++         } else {
++             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.space());
++         }
++         if (!format.section_start.empty()) {
++-            tool_calls = p.trigger_rule("tool-calls",
++-                                        p.literal(format.section_start) + p.space() + tool_calls + p.space() +
++-                                            (format.section_end.empty() ? p.end() : p.literal(format.section_end) + p.space()));
+++            if (format.section_optional) {
+++                // a bare per-call block is a call too, and so is a section that is never closed
+++                tool_calls = p.trigger_rule("tool-calls",
+++                                            p.optional(p.literal(format.section_start) + p.space()) + tool_calls + p.space() +
+++                                                p.optional(p.literal(format.section_end) + p.space()));
+++            } else {
+++                tool_calls = p.trigger_rule("tool-calls",
+++                                            p.literal(format.section_start) + p.space() + tool_calls + p.space() +
+++                                                (format.section_end.empty() ? p.end() : p.literal(format.section_end) + p.space()));
+++            }
++         }
++     } else {
++         std::string separator = ", ";  // Default
++@@ -535,13 +606,92 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
++         }
++     }
++ 
+++    const auto tool_calls_native = tool_calls;
+++    if (ctx.kimi_calls) {
+++        // outside the trigger rule on purpose: the lazy grammar only ever constrains the native form
+++        tool_calls = p.choice({ tool_calls, *ctx.kimi_calls });
+++    }
+++
+++    const auto tool_calls_core = tool_calls;
++     if (!require_tools) {
++         tool_calls = p.optional(tool_calls);
++     }
++ 
++     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
++     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+++    if (format.drop_tail) {
+++        // the content also ends at a bare call block, a Kimi-form call and the stray tags the model tacks on
+++        // (a second reasoning close tag, ...)
+++        std::vector<std::string> openers = { trigger_marker };
+++        if (!format.per_call_start.empty()) {
+++            openers.push_back(format.per_call_start);
+++        }
+++        openers.insert(openers.end(), ctx.kimi_openers.begin(), ctx.kimi_openers.end());
+++        std::vector<std::string> stops = openers;
+++        if (ctx.content) {
+++            stops.insert(stops.end(), ctx.content->stray_ends.begin(), ctx.content->stray_ends.end());
+++        }
+++        // Whatever follows a call is dropped. Where no call is attempted, a stray tag and everything after it is
+++        // dropped; a call that fails to parse is not dropped -- the parse fails and lenient-fallback keeps the text.
+++        // stray tags before any content (a repeated close tag right after the reasoning) are skipped, not an end
+++        std::vector<common_peg_parser> strays;
+++        if (ctx.content) {
+++            for (const auto & e : ctx.content->stray_ends) {
+++                strays.push_back(p.literal(e));
+++            }
+++        }
+++        auto lead = strays.empty() ? p.eps() : p.zero_or_more(p.space() + p.choice(strays));
+++        std::vector<common_peg_parser> attempts;
+++        for (const auto & o : openers) {
+++            attempts.push_back(p.literal(o));
+++        }
+++        auto tail        = p.optional(p.rest());
+++        auto tools_part  = tool_calls_core + tail;
+++        if (!require_tools) {
+++            tools_part = p.choice({ tools_part, p.negate(p.choice(attempts)) + tail });
+++        }
+++        if (!ctx.kimi_openers.empty()) {
+++            // a Kimi opener that never became a call, followed by the native call
+++            std::vector<std::string> native_openers = { trigger_marker };
+++            if (!format.per_call_start.empty()) {
+++                native_openers.push_back(format.per_call_start);
+++            }
+++            tools_part = p.choice({ tools_part, p.until_one_of(native_openers) + tool_calls_native + tail });
+++        }
+++        // a stray tag ends the content, but a call after it (a garbled restart that still calls) is a call
+++        auto skip = p.optional(p.until_one_of(openers));
+++        return ctx.reasoning_parser + lead + p.space() + p.optional(p.content(p.until_one_of(stops))) + skip + tools_part + p.end();
+++    }
++     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
++ }
++ 
+++common_peg_parser analyze_tools::build_kimi_calls(parser_build_context & ctx) const {
+++    auto &       p      = ctx.p;
+++    const auto & inputs = ctx.inputs;
+++
+++    // `<|tool_call_begin|>[functions.]name[:N][<|tool_call_argument_begin|>|<|sep|>]{json}<|tool_call_end|>`
+++    common_peg_parser tool_choice = p.choice();
+++    foreach_function(inputs.tools, [&](const json & tool) {
+++        const auto & func   = tool.at("function");
+++        std::string  name   = func.at("name");
+++        const auto   schema = common_chat_tool_parameters(func);
+++
+++        auto open = p.tool_open(p.optional(p.literal("functions.")) + p.tool_name(p.literal(name)) +
+++                                p.optional(p.literal(":") + p.chars("0-9", 1, -1)));
+++        auto sep  = p.choice({ p.literal("<|tool_call_argument_begin|>"), p.literal("<|sep|>"), p.eps() });
+++        auto args = p.tool_args(p.schema(p.json(), "kimi-tool-" + name + "-schema", schema));
+++        tool_choice |= p.rule("kimi-tool-" + name,
+++                              p.atomic(open + p.space() + sep + p.space() + args) + p.space() +
+++                                  p.tool_close(p.literal("<|tool_call_end|>")));
+++    });
+++
+++    auto call  = p.literal("<|tool_call_begin|>") + p.space() + tool_choice + p.space();
+++    auto calls = p.one_or_more(call);
+++    // only the first call is looked ahead at by the reasoning parser: waiting for the whole rest would stall it
+++    ctx.kimi_first = p.choice({ p.literal("<|tool_calls_section_begin|>") + p.space() + call, call });
+++    return p.choice({ p.literal("<|tool_calls_section_begin|>") + p.space() + calls +
+++                          p.optional(p.literal("<|tool_calls_section_end|>") + p.space()),
+++                      calls });
+++}
+++
++ }  // namespace autoparser
++diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
++index bdb884c91..4ad7c99be 100644
++--- a/common/chat-auto-parser.h
+++++ b/common/chat-auto-parser.h
++@@ -189,6 +189,18 @@ struct tool_format_analysis {
++     std::string              id_field;
++     std::string              gen_id_field;
++     std::vector<std::string> parameter_order;
+++
+++    // K2-Horizon quirks (the official weights do not always emit the exact template shape):
+++    // - the section opener/closer is optional: a bare per-call block is a tool call too
+++    // - several calls in one turn are parsed whatever parallel_tool_calls says (throwing on them loses the turn)
+++    // - a per-call block may be closed by the section end / the next call instead of its own end tag
+++    bool section_optional = false;
+++    bool always_parallel  = false;
+++    // a complete call in the Kimi form (`<|tool_call_begin|>name<|sep|>{json}<|tool_call_end|>`, the section
+++    // wrapper optional) is surfaced as a tool call too, also when the model emitted it inside its reasoning
+++    bool kimi_fallback = false;
+++    // whatever follows the last call (a stray close tag, EOG text) is dropped instead of failing the parse
+++    bool drop_tail = false;
++ };
++ 
++ struct tool_function_analysis {
++@@ -230,6 +242,10 @@ struct parser_build_context {
++     bool                              extracting_reasoning = false;
++     const analyze_reasoning *         reasoning            = nullptr;
++     const analyze_content *           content              = nullptr;
+++    // Kimi-form call fallback (see tool_format_analysis::kimi_fallback); unset when not applicable to this request
+++    std::optional<common_peg_parser>  kimi_calls;
+++    std::optional<common_peg_parser>  kimi_first;  // just the first call, up to its end tag (what ends reasoning)
+++    std::vector<std::string>          kimi_openers;
++ 
++     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
++ };
++@@ -330,6 +346,9 @@ struct analyze_tools : analyze_base {
++ 
++     common_peg_parser build_parser(parser_build_context & ctx) const override;
++ 
+++    // Kimi-form calls (see tool_format_analysis::kimi_fallback) for the tools of this request
+++    common_peg_parser build_kimi_calls(parser_build_context & ctx) const;
+++
++   private:
++     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format
++     void analyze_tool_calls(const analyze_reasoning & reasoning, bool supports_parallel_tool_calls);
++diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
++index 23ffcd5dc..92bd97df1 100644
++--- a/common/chat-diff-analyzer.cpp
+++++ b/common/chat-diff-analyzer.cpp
++@@ -244,9 +244,22 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
++               // the "high" tag, whatever the template opened) and sometimes start the tool call without
++               // closing the reasoning at all (seen live 2026-09-26): both are consumed by the reasoning parser.
++               analysis.reasoning.start_alts = { "<ifm|think>", "<ifm|think_fast>" };
++-              analysis.reasoning.implicit_ends_with_tools = { "<ifm|tool_calls>" };
++-              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
++-              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>" };
+++              analysis.reasoning.implicit_ends_with_tools = { "<ifm|tool_calls>", "<ifm|tool_call>" };
+++              // The generation prompt opens the tag of the request's reasoning_effort ("<ifm|think>" high,
+++              // "<ifm|think_fast>" medium, "<ifm|think_faster>" low): all of them are accepted as the open tag
+++              // (start_alts) and as the close tag (end_alts), so no effort loses its reasoning. The stray ends
+++              // also cover the Kimi/harmony delimiters the model sometimes derails into after its answer.
+++              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>",
+++                                              "<|close|>", "<|sep|>", "<|open|>", "<|ifm|im_end|>", "<|ifm|endoftext|>" };
+++              // no call is possible (no tools, or tool_choice none): a call the model emits anyway is dropped from
+++              // the content, from its first tag on
+++              analysis.content.stray_ends_no_tools = { "</ifm|arg_value>", "</ifm|tool_call>", "</ifm|tool_calls>",
+++                                                       "<ifm|tool_calls>", "<ifm|tool_call>", "<ifm|arg_key>", "<ifm|arg_value>",
+++                                                       "<|tool_calls_section_begin|>", "<|tool_call_begin|>" };
+++              analysis.tools.format.section_optional = true;
+++              analysis.tools.format.always_parallel  = true;
+++              analysis.tools.format.kimi_fallback    = true;
+++              analysis.tools.format.drop_tail        = true;
++               // With the reasoning open tag already in the prompt, the official weights sometimes end the
++               // turn with their very first token (EOG): 1 output token, no content, and the client takes it
++               // for a finished turn. The reply must hold something before an EOG token is allowed.
++diff --git a/common/chat.cpp b/common/chat.cpp
++index d7e041466..53524a9d5 100644
++--- a/common/chat.cpp
+++++ b/common/chat.cpp
++@@ -1543,6 +1543,19 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
++             return msg;
++         }
++         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+++        if (src_parser.has_rule("lenient-fallback")) {
+++            // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
+++            common_chat_msg msg;
+++            msg.role = "assistant";
+++            common_peg_parse_context fctx(effective_input, flags);
+++            auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
+++            if (!fres.fail()) {
+++                common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
+++            } else {
+++                msg.content = input;
+++            }
+++            return msg;
+++        }
++         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
++         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
++     }
++diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
++index 891e51d16..349d598d3 100644
++--- a/tests/test-chat.cpp
+++++ b/tests/test-chat.cpp
++@@ -22,6 +22,7 @@
++ #include "json.h"
++ #include <set>
++ #include <stdexcept>
+++#include <random>
++ #include <string>
++ 
++ using json = common_json;
++@@ -5152,6 +5153,294 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
++             .run();
++     }
++ 
+++    // K2-Horizon parser gaps found by Dawn QA (2026-09-29): every reasoning_effort, a bare call block, a Kimi-form
+++    // call, stray tags with tools offered, a call nobody asked for, and output that fits no shape.
+++    {
+++        auto tst = peg_tester("models/templates/k2-horizon.jinja", detailed_debug);
+++
+++        static common_chat_tool k2_bash_tool{
+++            /* .name = */ "bash",
+++            /* .description = */ "Executes a bash command",
+++            /* .parameters = */ R"({
+++                "type": "object",
+++                "properties": { "command": { "type": "string" } },
+++                "required": ["command"]
+++            })",
+++        };
+++        const std::string call_ls =
+++            "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n"
+++            "</ifm|tool_call>\n</ifm|tool_calls>";
+++        const common_chat_tool_call ls_call{ "bash", R"({"command":"ls"})", "" };
+++
+++        // 1. medium/high open <ifm|think_fast> / <ifm|think>: the reasoning is parsed and either close tag ends it
+++        for (const char * effort : { "\"medium\"", "\"high\"" }) {
+++            for (const char * close : { "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>" }) {
+++                for (bool with_tools : { false, true }) {
+++                    auto t = tst.test(std::string("Count the files first.") + close + "\nThere are 3.")
+++                                 .template_kwarg("reasoning_effort", effort)
+++                                 .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                                 .expect_reasoning("Count the files first.")
+++                                 .expect_content("There are 3.");
+++                    if (with_tools) {
+++                        t.tools({ k2_bash_tool });
+++                    }
+++                    t.run();
+++                }
+++            }
+++            tst.test(std::string("Need a listing.</ifm|think>\n") + call_ls)
+++                .template_kwarg("reasoning_effort", effort)
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_reasoning("Need a listing.")
+++                .expect_tool_calls({ ls_call })
+++                .run();
+++            // the model repeats the open tag as its first output, or never closes before the call
+++            tst.test(std::string("<ifm|think>\nNeed a listing.\n") + call_ls)
+++                .template_kwarg("reasoning_effort", effort)
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_reasoning("Need a listing.")
+++                .expect_tool_calls({ ls_call })
+++                .run();
+++        }
+++        // the default effort is high
+++        tst.test("Reasoning.</ifm|think>\nAnswer.")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("Reasoning.")
+++            .expect_content("Answer.")
+++            .run();
+++
+++        // 2. a bare <ifm|tool_call> block (no <ifm|tool_calls> opener) is a tool call
+++        const std::string bare =
+++            "<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>";
+++        for (const char * effort : { "\"low\"", "\"medium\"", "\"high\"" }) {
+++            const char * close = std::string(effort) == "\"low\"" ? "</ifm|think_faster>" : "</ifm|think>";
+++            tst.test(std::string("\n") + bare)
+++                .template_kwarg("reasoning_effort", effort)
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_tool_calls({ ls_call })
+++                .run();
+++            tst.test(std::string(close) + "\n" + bare)
+++                .template_kwarg("reasoning_effort", effort)
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_tool_calls({ ls_call })
+++                .run();
+++            tst.test(std::string("Let me check.\n") + bare)
+++                .template_kwarg("reasoning_effort", effort)
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_reasoning("Let me check.")
+++                .expect_tool_calls({ ls_call })
+++                .run();
+++        }
+++        tst.test(std::string("Checking.</ifm|think_faster>I will list it.\n") + bare)
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("Checking.")
+++            .expect_content("I will list it.")
+++            .expect_tool_calls({ ls_call })
+++            .run();
+++        // the call block's own end tag missing: the section end (or the next call) ends it
+++        tst.test("</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+++                 "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_calls>")
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tools({ k2_bash_tool })
+++            .expect_tool_calls({ ls_call })
+++            .run();
+++
+++        // several calls in one turn are all parsed, whatever parallel_tool_calls says
+++        for (bool parallel : { false, true }) {
+++            tst.test(std::string("</ifm|think_faster>\n<ifm|tool_calls>\n") + bare.substr(0) + "\n" + bare + "\n</ifm|tool_calls>")
+++                .template_kwarg("reasoning_effort", "\"low\"")
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .parallel_tool_calls(parallel)
+++                .tools({ k2_bash_tool })
+++                .expect_tool_calls({ ls_call, ls_call })
+++                .run();
+++        }
+++
+++        // 4. a stray reasoning close tag / harmony delimiter after the answer is dropped with tools offered too
+++        tst.test("Repeat it.</ifm|think>git.example.com</ifm|think>git.example.co\nI'm sorry")
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("Repeat it.")
+++            .expect_content("git.example.com")
+++            .run();
+++        for (const char * junk : { "<|close|>", "<|close|>argument<|sep|>", "<|sep|>" }) {
+++            tst.test(std::string("Reasoning.</ifm|think_faster>\nThe answer.") + junk)
+++                .template_kwarg("reasoning_effort", "\"low\"")
+++                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++                .tools({ k2_bash_tool })
+++                .expect_reasoning("Reasoning.")
+++                .expect_content("The answer.")
+++                .run();
+++        }
+++        tst.test("</ifm|think_faster>\n<|close|>")
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("")
+++            .expect_content("")
+++            .run();
+++
+++        // 5. a full call nobody can take (no tools, or tool_choice none) is not content and not a call
+++        tst.test(std::string("Reasoning.</ifm|think_faster>\n") + call_ls)
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .expect_reasoning("Reasoning.")
+++            .expect_content("")
+++            .run();
+++        tst.test(std::string("Reasoning.</ifm|think_faster>\nSure. ") + call_ls)
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("Reasoning.")
+++            .expect_content("Sure.")
+++            .run();
+++        tst.test("Reasoning here.</ifm|think_faster>Sure, it is git.example.co</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+++            .template_kwarg("reasoning_effort", "\"low\"")
+++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+++            .tools({ k2_bash_tool })
+++            .expect_reasoning("Reasoning here.")
+++            .expect_content("Sure, it is git.example.co")
+++            .run();
+++    }
+++
+++    // K2-Horizon: a call in the Kimi form (`<|tool_call_begin|>...`) and parse failures. The lazy grammar only
+++    // ever triggers on the native form, so these cannot go through peg_tester (it insists on a trigger).
+++    {
+++        common_chat_templates_ptr tmpls = read_templates("models/templates/k2-horizon.jinja");
+++        common_chat_tool bash{ "bash", "Executes a bash command",
+++                               R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+++        auto make = [&](const char * effort, bool with_tools, common_chat_tool_choice choice = COMMON_CHAT_TOOL_CHOICE_AUTO,
+++                        bool parallel = false) {
+++            common_chat_templates_inputs in;
+++            in.messages              = { message_user };
+++            in.add_generation_prompt = true;
+++            in.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+++            in.tool_choice           = choice;
+++            in.parallel_tool_calls   = parallel;
+++            in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+++            if (with_tools) {
+++                in.tools = { bash };
+++            }
+++            return make_peg_parser(tmpls.get(), in);
+++        };
+++        auto trim_ws = [](const std::string & v) {
+++            const size_t b = v.find_first_not_of(" \n");
+++            return b == std::string::npos ? std::string() : v.substr(b, v.find_last_not_of(" \n") + 1 - b);
+++        };
+++        // parse every prefix as a stream would (the diffs must stay valid), then the whole text
+++        auto stream_parse = [](const make_peg_parser & parser, const std::string & text) {
+++            common_chat_msg prev;
+++            prev.role = "assistant";
+++            for (size_t i = 1; i < text.size(); ++i) {
+++                common_chat_msg cur = parser.parse(text.substr(0, i), true);
+++                common_chat_msg_diff::compute_diffs(prev, cur);
+++                prev = cur;
+++            }
+++            common_chat_msg whole = parser.parse(text, false);
+++            common_chat_msg_diff::compute_diffs(prev, whole);
+++            return whole;
+++        };
+++
+++        const std::vector<std::string> kimi = {
+++            R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|><|tool_calls_section_end|>)",
+++            R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0{"command":"ls"}<|tool_call_end|><|tool_calls_section_end|>)",
+++            R"(<|tool_calls_section_begin|><|tool_call_begin|>bash<|sep|>{"command":"ls"}<|tool_call_end|>)",
+++            R"(<|tool_call_begin|>functions.bash:1<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>)",
+++        };
+++        for (const char * effort : { "low", "high" }) {
+++            auto parser = make(effort, true);
+++            for (const auto & call : kimi) {
+++                // complete call while still "thinking": surfaced, never swallowed by the reasoning
+++                auto m = stream_parse(parser, "Let me look.\n" + call);
+++                assert_equals((size_t) 1, m.tool_calls.size());
+++                assert_equals(std::string("bash"), m.tool_calls[0].name);
+++                assert_equals(std::string(R"({"command":"ls"})"), m.tool_calls[0].arguments);
+++                assert_equals(std::string("Let me look."), trim_ws(m.reasoning_content));
+++                assert_equals(std::string(""), m.content);
+++                // ... and after the reasoning is closed
+++                const char * close = std::string(effort) == "low" ? "</ifm|think_faster>" : "</ifm|think>";
+++                m = stream_parse(parser, std::string("Let me look.") + close + "\n" + call);
+++                assert_equals((size_t) 1, m.tool_calls.size());
+++                assert_equals(std::string(R"({"command":"ls"})"), m.tool_calls[0].arguments);
+++                assert_equals(std::string("Let me look."), trim_ws(m.reasoning_content));
+++                assert_equals(std::string(""), m.content);
+++            }
+++            // an opener that never becomes a call, then the native rewrite (seen live)
+++            auto m = stream_parse(parser, std::string("Checking.\n<|tool_calls_section_begin|><|tool_call_begin|>\n") +
+++                                              (std::string(effort) == "low" ? "</ifm|think_faster>\n" : "</ifm|think>\n") +
+++                                              "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+++                                              "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>");
+++            assert_equals((size_t) 1, m.tool_calls.size());
+++            assert_equals(std::string(""), m.content);
+++        }
+++        // text after the last call (EOG text the model spells out) is dropped
+++        {
+++            auto m = make("low", true).parse(
+++                "</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+++                "<ifm|arg_value>ls</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>trailing", false);
+++            assert_equals((size_t) 1, m.tool_calls.size());
+++            assert_equals(std::string(""), m.content);
+++        }
+++        // no tools: the Kimi call is not a call and not content
+++        {
+++            auto m = stream_parse(make("low", false), "Thinking.</ifm|think_faster>\n" + kimi[0]);
+++            assert_equals((size_t) 0, m.tool_calls.size());
+++            assert_equals(std::string(""), m.content);
+++        }
+++
+++        // 6a. a call that does not parse (here: the json call format, which the parser does not know) is neither
+++        // thrown on nor dropped: the reasoning stays reasoning, the text of the call is handed back as content
+++        {
+++            auto m = make("low", true).parse(
+++                "Thinking.</ifm|think_faster>\n<ifm|tool_calls>\n<ifm|tool_call>{\"name\":\"bash\"}</ifm|tool_call>\n</ifm|tool_calls>", false);
+++            assert_equals((size_t) 0, m.tool_calls.size());
+++            assert_equals(std::string("Thinking."), trim_ws(m.reasoning_content));
+++            assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
+++        }
+++
+++        // 6b. the parser never throws: whatever the model emits parses to something (fuzz, fixed seed)
+++        const std::vector<std::string> pieces = {
+++            "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>",
+++            "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>", "</ifm|tool_call>", "<ifm|arg_key>", "</ifm|arg_key>",
+++            "<ifm|arg_value>", "</ifm|arg_value>", "<|tool_calls_section_begin|>", "<|tool_call_begin|>", "<|tool_call_end|>",
+++            "<|tool_calls_section_end|>", "<|tool_call_argument_begin|>", "<|close|>", "<|sep|>", "<|open|>", "<|ifm|im_end|>",
+++            "bash", "command", "ls", "\n", " ", "{\"command\":\"ls\"}", "{", "}", "\"", "Answer.", "\xc3\xa9", "<", "|", "functions.bash:0",
+++        };
+++        std::mt19937 rng(20260929);
+++        size_t       parsed = 0;
+++        for (const char * effort : { "low", "medium", "high" }) {
+++            for (int variant = 0; variant < 4; ++variant) {
+++                auto parser = make(effort, variant != 0, variant == 3 ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO,
+++                                   variant == 2);
+++                for (int n = 0; n < 1500; ++n) {
+++                    std::string text;
+++                    for (size_t k = rng() % 12; k > 0; --k) {
+++                        text += pieces[rng() % pieces.size()];
+++                    }
+++                    try {
+++                        parser.parse(text, false);
+++                        parser.parse(text, true);
+++                        ++parsed;
+++                    } catch (const std::exception & e) {
+++                        throw std::runtime_error(std::string("K2 parser threw (") + e.what() + ") on: " + text);
+++                    }
+++                }
+++            }
+++        }
+++        assert_equals((size_t) 18000, parsed);
+++    }
+++
++     // Kimi-K2-Thinking tests - custom parser
++     // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
++     {
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0148-K2-hold-EOG-inside-an-unclosed-reasoning-block-tools.patch b/fleet-patches/0148-K2-hold-EOG-inside-an-unclosed-reasoning-block-tools.patch
+new file mode 100644
+index 000000000..0a080a8f0
+--- /dev/null
++++ b/fleet-patches/0148-K2-hold-EOG-inside-an-unclosed-reasoning-block-tools.patch
+@@ -0,0 +1,314 @@
++From 3449022c9e2a193b4071394366cbf6549bf5fb99 Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Wed, 30 Sep 2026 09:18:53 -0500
++Subject: [PATCH] K2: hold EOG inside an unclosed reasoning block (tools
++ offered); strip only known K2/Kimi markup from replayed reasoning
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/chat-auto-parser-generator.cpp |  8 +++++
++ common/chat.cpp                       |  6 ++--
++ common/chat.h                         |  3 ++
++ common/common.h                       |  2 ++
++ common/sampling.cpp                   | 24 ++++++++++++--
++ common/sampling.h                     |  2 +-
++ tests/test-chat.cpp                   |  6 ++--
++ tests/test-empty-reply-guard.cpp      | 48 +++++++++++++++++++++++++++
++ tools/server/server-common.cpp        |  3 ++
++ tools/server/server-schema.cpp        |  6 ++++
++ 10 files changed, 98 insertions(+), 10 deletions(-)
++
++diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
++index e59deb989..deacebd65 100644
++--- a/common/chat-auto-parser-generator.cpp
+++++ b/common/chat-auto-parser-generator.cpp
++@@ -74,6 +74,14 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
++         data.no_empty_reply_inert = autoparser.no_empty_reply_inert;
++         if (inputs.tools.is_array() && !inputs.tools.empty()) {
++             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
+++            std::string gp = data.generation_prompt;
+++            gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
+++            for (const auto & tag : autoparser.no_empty_reply_inert) {
+++                if (tag.compare(0, 2, "</") != 0 && gp.size() >= tag.size() &&
+++                    gp.compare(gp.size() - tag.size(), tag.size(), tag) == 0) {
+++                    data.no_empty_reply_open = true;
+++                }
+++            }
++         }
++     }
++ 
++diff --git a/common/chat.cpp b/common/chat.cpp
++index 53524a9d5..5abef9539 100644
++--- a/common/chat.cpp
+++++ b/common/chat.cpp
++@@ -1018,15 +1018,15 @@ static void map_developer_role_to_system(json & messages) {
++ // sees a tag it was not asked to open, and a junk reasoning (a Kimi tool-call opener, `<|close|>`, ...) replayed by
++ // the client from a stalled turn primes the next turn to repeat it (opencode session ses_f16214d2: 25 of 26 replayed
++ // reasonings junk, 10/40 replay samples opened a Kimi call; 0/40 with the tags matched). So render the history
++-// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip foreign
++-// `<|...|>` and `<ifm|...>` markup from it, and drop assistant turns that are left with nothing at all (an empty
+++// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip the known K2/Kimi
+++// markup tokens (`<|tool_call_begin|>`, `<|close|>`, ... never arbitrary `<|...`) and `<ifm|...>` tags from it, and drop assistant turns that are left with nothing at all (an empty
++ // past turn teaches ending the turn right after the reasoning).
++ static void k2_history_reasoning(json & messages, const std::string & effort) {
++     const char * field = effort == "low" ? "think_faster" : effort == "medium" ? "think_fast" : nullptr;
++     if (!field) {
++         return; // high: history tag == generation tag already
++     }
++-    static const std::regex foreign(R"(<\|[A-Za-z_]*(?:\|>)?|</?ifm\|[a-z_]+>)");
+++    static const std::regex foreign(R"(<\|(?:tool_calls_section_begin|tool_calls_section_end|tool_call_begin|tool_call_end|tool_call_argument_begin|close|sep|open)(?![A-Za-z_])(?:\|>)?|</?ifm\|[a-z_]+>)");
++     json out = json::array();
++     for (auto & m : messages) {
++         if (!m.is_object() || m.value("role", "") != "assistant") {
++diff --git a/common/chat.h b/common/chat.h
++index 82ac21710..80e027dfe 100644
++--- a/common/chat.h
+++++ b/common/chat.h
++@@ -295,6 +295,9 @@ struct common_chat_params {
++     // tool-call tag pairs { section open, close, inner open, close, ... } when tools are offered: EOG is masked from
++     // an opener until the section is closed and the inner tags are balanced (capped)
++     std::vector<std::string>            no_empty_reply_hold;
+++    // the generation prompt ends inside an open reasoning block (tools offered): the reply starts in reasoning, and
+++    // EOG stays masked until that block is closed (or a call opens), capped
+++    bool                                no_empty_reply_open = false;
++     std::string                         parser;
++     common_chat_msg_delimiters          message_delimiters;
++ };
++diff --git a/common/common.h b/common/common.h
++index becfb0276..b1ad5c59c 100644
++--- a/common/common.h
+++++ b/common/common.h
++@@ -302,6 +302,8 @@ struct common_params_sampling {
++     // native tool-call tag pairs (tools offered), see common_chat_params::no_empty_reply_hold: EOG is also masked
++     // from an opener until the section is closed and its inner tags are balanced, capped
++     std::vector<std::string>  no_empty_reply_hold;
+++    // the prompt ends inside an open reasoning block: hold EOG until it closes (tools offered only), capped
+++    bool                      no_empty_reply_open = false;
++ 
++     bool backend_sampling = false;
++ 
++diff --git a/common/sampling.cpp b/common/sampling.cpp
++index b1a82f7d2..40bc6feb8 100644
++--- a/common/sampling.cpp
+++++ b/common/sampling.cpp
++@@ -155,6 +155,11 @@ struct common_empty_reply_guard {
++     // armed: token ids of every tag except the section opener; masked while no native section is open (a call
++     // that skips the opener, or a stray close, has no valid continuation; seen live as "</ifm|tool_calls>" first)
++     std::vector<llama_token> tag_ids;
+++    // the generation starts inside an open reasoning block (tools offered): EOG stays masked until an inert close
+++    // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
+++    bool                     open_initial = false;
+++    bool                     r_open       = false;
+++    int                      n_reason     = 0;
++     // per token id: 1 = EOG, 2 = tag (built at init)
++     std::vector<uint8_t>     flags;
++ };
++@@ -195,6 +200,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
++             case 0:
++             case 2: {
++                 // the opener again while the first is unfinished: the model is looping, let it end
+++                ctx->r_open = false; // a call was started: the call holds take over
++                 const bool repeat = which == 0 ? ctx->in_section : ctx->in_call;
++                 (which == 0 ? ctx->in_section : ctx->in_call) = true;
++                 if (repeat) {
++@@ -216,6 +222,7 @@ static void common_empty_reply_guard_scan(common_empty_reply_guard * ctx) {
++                     if (!ctx->n_open) {
++                         ctx->n_held = 0;
++                     }
+++                    ctx->r_open = false;
++                     ctx->held = ctx->n_open = true;
++                     ctx->n_closed = false;
++                     ctx->kimi_held = ctx->kimi_loop = false; // the model switched to its own format
++@@ -246,7 +253,7 @@ static bool common_empty_reply_guard_holds(const common_empty_reply_guard * ctx)
++     if (!ctx->seen_output) {
++         return true;
++     }
++-    return (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
+++    return (ctx->r_open && ctx->n_reason < k_hold_cap) || (ctx->held && ctx->n_held < k_hold_cap) || (ctx->kimi_held && ctx->n_kimi < k_kimi_hold_cap);
++ }
++ 
++ static const char * common_empty_reply_guard_name(const struct llama_sampler * /*smpl*/) {
++@@ -259,8 +266,16 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
++         return;
++     }
++     if (std::find(ctx->inert.begin(), ctx->inert.end(), token) != ctx->inert.end()) {
+++        if (ctx->open_initial || ctx->r_open) {
+++            const std::string tag = common_token_to_piece(ctx->vocab, token, true);
+++            ctx->r_open = tag.compare(0, 2, "</") != 0; // a close tag ends the block, an open tag (re)opens one
+++            ctx->n_reason = 0;
+++        }
++         return;
++     }
+++    if (ctx->r_open && ++ctx->n_reason == k_hold_cap) {
+++        LOG_DBG("%s: empty-reply guard: %d tokens inside an unclosed reasoning block, releasing EOG\n", __func__, k_hold_cap);
+++    }
++     const std::string piece = common_token_to_piece(ctx->vocab, token, false);
++     // the native markers are special tokens, which only render with special=true
++     ctx->tail += ctx->hold.empty() ? piece : common_token_to_piece(ctx->vocab, token, true);
++@@ -325,6 +340,8 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
++     ctx->seen_output = false;
++     ctx->tail.clear();
++     ctx->in_section = ctx->in_call = false;
+++    ctx->r_open = ctx->open_initial;
+++    ctx->n_reason = 0;
++     common_empty_reply_guard_release(ctx);
++ }
++ 
++@@ -354,8 +371,9 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
++             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
++ }
++ 
++-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold) {
+++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, bool reasoning_open) {
++     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
+++    ctx->open_initial = ctx->r_open = reasoning_open && !ctx->hold.empty();
++     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
++     // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
++     for (size_t i = 1; i < ctx->hold.size(); ++i) {
++@@ -608,7 +626,7 @@ struct common_sampler * common_sampler_init(
++     }
++ 
++     if (params.no_empty_reply) {
++-        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold);
+++        eguard = common_sampler_init_empty_reply_guard(vocab, params.no_empty_reply_inert, params.no_empty_reply_hold, params.no_empty_reply_open);
++     }
++ 
++     if (params.mirostat == 0) {
++diff --git a/common/sampling.h b/common/sampling.h
++index 1c52a7472..f2ec7af2b 100644
++--- a/common/sampling.h
+++++ b/common/sampling.h
++@@ -45,7 +45,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
++ 
++ // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
++ // the empty-reply guard sampler (see sampling.cpp); a common_sampler owns one when params.no_empty_reply is set
++-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {});
+++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {}, bool reasoning_open = false);
++ 
++ void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
++ void                    common_sampler_reset (struct common_sampler * gsmpl);
++diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
++index 349d598d3..ada762051 100644
++--- a/tests/test-chat.cpp
+++++ b/tests/test-chat.cpp
++@@ -7772,7 +7772,7 @@ static void test_k2_history_reasoning() {
++     partial.content = "Done.";
++     common_chat_msg real;
++     real.role = "assistant";
++-    real.reasoning_content = "Check the file.";
+++    real.reasoning_content = "Check the file. p <|> q, <|x|> and <|cl|>.";
++     real.content = "Looks fine.";
++ 
++     common_chat_tool bash{ "bash", "Executes a bash command",
++@@ -7785,7 +7785,7 @@ static void test_k2_history_reasoning() {
++         inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
++         const std::string tag = std::string("ifm|think_") + (std::string(effort) == "low" ? "faster" : "fast");
++         const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
++-        assert_contains(prompt, "<" + tag + ">\nCheck the file.\n</" + tag + ">\nLooks fine.");
+++        assert_contains(prompt, "<" + tag + ">\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</" + tag + ">\nLooks fine.");
++         if (prompt.find("<ifm|think>") != std::string::npos || prompt.find("</ifm|think>") != std::string::npos) {
++             throw std::runtime_error("K2 history still rendered with the high-effort tag at effort " + std::string(effort));
++         }
++@@ -7809,7 +7809,7 @@ static void test_k2_history_reasoning() {
++         inputs.messages              = { user, real, user };
++         inputs.add_generation_prompt = true;
++         inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
++-        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file.\n</ifm|think>\nLooks fine.");
+++        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file. p <|> q, <|x|> and <|cl|>.\n</ifm|think>\nLooks fine.");
++     }
++     LOG_ERR("%s passed\n", __func__);
++ }
++diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
++index cd96b2674..abdb2b935 100644
++--- a/tests/test-empty-reply-guard.cpp
+++++ b/tests/test-empty-reply-guard.cpp
++@@ -162,6 +162,54 @@ int main(int argc, char ** argv) {
++     CHECK(!eog_allowed(g));
++     llama_sampler_free(g);
++ 
+++    // open reasoning block (prompt ends inside it, tools offered): EOG masked until the block closes or a call opens.
+++    // Stand-ins for the reasoning tags: "<" opens, "</" closes (the guard tells them apart by the "</" prefix).
+++    {
+++        const auto t_open  = common_tokenize(vocab, "<", false, false);
+++        const auto t_close = common_tokenize(vocab, "</", false, false);
+++        if (t_open.size() == 1 && t_close.size() == 1) {
+++            const std::vector<llama_token> inert = { t_open[0], t_close[0] };
+++            // the incident: reasoning text, no close, then EOG
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+++            CHECK(!eog_allowed(g));
+++            feed(g, vocab, "Next I will run the tests");
+++            CHECK(!eog_allowed(g));                 // unclosed reasoning: text does not release
+++            llama_sampler * c3 = llama_sampler_clone(g);
+++            llama_sampler_accept(g, t_close[0]);
+++            CHECK(eog_allowed(g));                  // closed
+++            CHECK(!eog_allowed(c3));                // the clone kept the open block
+++            llama_sampler_reset(c3);
+++            CHECK(!eog_allowed(c3));
+++            llama_sampler_free(c3);
+++            llama_sampler_free(g);
+++            // cap: released after k_hold_cap tokens
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+++            for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
+++            CHECK(!eog_allowed(g));
+++            llama_sampler_accept(g, g_other);
+++            CHECK(eog_allowed(g));
+++            llama_sampler_free(g);
+++            // a native call opener inside the block hands over to the call hold
+++            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, true); // (the stand-in tags would eat parts of the markers)
+++            feed(g, vocab, "x<ifm|tool_calls>");
+++            CHECK(!eog_allowed(g));
+++            feed(g, vocab, "</ifm|tool_calls>");
+++            CHECK(eog_allowed(g));
+++            llama_sampler_free(g);
+++            // no tools (no hold) or prompt not in reasoning: never held
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, true);
+++            feed(g, vocab, "text");
+++            CHECK(eog_allowed(g));
+++            llama_sampler_free(g);
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, false);
+++            feed(g, vocab, "text");
+++            CHECK(eog_allowed(g));
+++            llama_sampler_free(g);
+++        } else {
+++            fprintf(stderr, "skip open-reasoning tests: stand-in tags are not single tokens\n");
+++        }
+++    }
+++
++     // every tag that opens must close: the full native tag set (xml, xml_typed, json call formats)
++     const std::vector<std::string> full = {
++         "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>", "</ifm|tool_call>", "<ifm|arg_key>", "</ifm|arg_key>",
++diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
++index 383b3a466..b0f3fb9e5 100644
++--- a/tools/server/server-common.cpp
+++++ b/tools/server/server-common.cpp
++@@ -1386,6 +1386,9 @@ json oaicompat_chat_params_parse(
++     if (!chat_params.no_empty_reply_hold.empty()) {
++         llama_params["no_empty_reply_hold"] = chat_params.no_empty_reply_hold;
++     }
+++    if (chat_params.no_empty_reply_open) {
+++        llama_params["no_empty_reply_open"] = true;
+++    }
++     if (!chat_params.parser.empty()) {
++         llama_params["chat_parser"] = chat_params.parser;
++     }
++diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
++index 724f8468c..40939c976 100644
++--- a/tools/server/server-schema.cpp
+++++ b/tools/server/server-schema.cpp
++@@ -540,6 +540,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
++             }
++         }));
++ 
+++    add((new field_json("no_empty_reply_open"))
+++        ->set_desc("The prompt ends inside an open reasoning block: with tools offered, end-of-generation tokens are masked until the block is closed or a tool call opens, capped. Set by the chat template handling")
+++        ->set_handler([&](field_eval_context & ctx, const json & data) {
+++            ctx.params.sampling.no_empty_reply_open = data.at("no_empty_reply_open").is_boolean() && data.at("no_empty_reply_open").get<bool>();
+++        }));
+++
++     add((new field_json("stop_after_reasoning"))
++         ->set_desc("Stopping strings that only count once one of them has already occurred (closed the reasoning). Set by the chat template handling for models that can emit a second reasoning close tag after the answer")
++         ->set_handler([&](field_eval_context & ctx, const json & data) {
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0149-K2-parser-surface-a-tool-call-only-once-its-argument.patch b/fleet-patches/0149-K2-parser-surface-a-tool-call-only-once-its-argument.patch
+new file mode 100644
+index 000000000..95a36998b
+--- /dev/null
++++ b/fleet-patches/0149-K2-parser-surface-a-tool-call-only-once-its-argument.patch
+@@ -0,0 +1,118 @@
++From d5812222ee16b483d2a5ed4e24aafb9624fd6932 Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Wed, 30 Sep 2026 09:24:25 -0500
++Subject: [PATCH] K2 parser: surface a tool call only once its arguments are
++ complete JSON
++
++A call cut off by EOG/max_tokens (arguments healed to '{') was surfaced as a call; with tools offered the
++K2 parser now hides it (streaming diffs stay monotonic) and, at the end of generation, falls back to
++reasoning/content.
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/chat.cpp     | 40 +++++++++++++++++++++++++++++-----------
++ tests/test-chat.cpp | 22 ++++++++++++++++++++++
++ 2 files changed, 51 insertions(+), 11 deletions(-)
++
++diff --git a/common/chat.cpp b/common/chat.cpp
++index 5abef9539..e49366b8e 100644
++--- a/common/chat.cpp
+++++ b/common/chat.cpp
++@@ -1519,6 +1519,20 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
++     common_peg_parse_context ctx(effective_input, flags);
++     auto result = parser.parse(ctx);
++ 
+++    // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
+++    auto lenient_fallback = [&]() {
+++        common_chat_msg msg;
+++        msg.role = "assistant";
+++        common_peg_parse_context fctx(effective_input, flags);
+++        auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
+++        if (!fres.fail()) {
+++            common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
+++        } else {
+++            msg.content = input;
+++        }
+++        return msg;
+++    };
+++
++     if (result.fail()) {
++         // During partial parsing, return partial results if any AST nodes were captured
++         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
++@@ -1544,17 +1558,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
++         }
++         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
++         if (src_parser.has_rule("lenient-fallback")) {
++-            // a parser that promises never to fail the turn (K2-Horizon): reasoning + the rest as content, else all text
++-            common_chat_msg msg;
++-            msg.role = "assistant";
++-            common_peg_parse_context fctx(effective_input, flags);
++-            auto fres = parser.parse(parser.get_rule("lenient-fallback"), fctx, 0);
++-            if (!fres.fail()) {
++-                common_chat_peg_mapper(msg).from_ast(fctx.ast, fres);
++-            } else {
++-                msg.content = input;
++-            }
++-            return msg;
+++            return lenient_fallback();
++         }
++         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
++         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
++@@ -1573,6 +1577,20 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
++     }
++     mapper->from_ast(ctx.ast, result);
++ 
+++    if (src_parser.has_rule("lenient-fallback") && !msg.tool_calls.empty()) {
+++        // K2-Horizon: a call is surfaced only once its arguments are complete JSON (the call block closed). A call cut
+++        // off by EOG/max_tokens would otherwise run a tool with `{`; while streaming it also stays hidden until whole
+++        // (the diffs only ever grow), at the end of generation the text falls back to reasoning/content.
+++        const size_t n_calls = msg.tool_calls.size();
+++        msg.tool_calls.erase(std::remove_if(msg.tool_calls.begin(), msg.tool_calls.end(),
+++                                            [](const common_chat_tool_call & c) { return json::parse_no_throw(c.arguments).is_discarded(); }),
+++                             msg.tool_calls.end());
+++        if (!is_partial && msg.tool_calls.empty()) {
+++            LOG_WRN("%s: dropped %zu tool call(s) with incomplete arguments\n", __func__, n_calls);
+++            return lenient_fallback();
+++        }
+++    }
+++
++     if (ctx.is_debug()) {
++         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
++         fflush(stderr);
++diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
++index ada762051..2388d6884 100644
++--- a/tests/test-chat.cpp
+++++ b/tests/test-chat.cpp
++@@ -5409,6 +5409,28 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
++             assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
++         }
++ 
+++        // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
+++        // generation (it would run a tool with `{`); a complete one is
+++        for (const char * effort : { "low", "high" }) {
+++            const std::string close = std::string(effort) == "low" ? "</ifm|think_faster>" : "</ifm|think>";
+++            const std::vector<std::string> cut = {
+++                R"(<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{)",
+++                R"(<|tool_call_begin|>bash<|sep|>{"command":"l)",
+++                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n<ifm|arg_value>ls",
+++                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>",
+++                "<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>",
+++                "<ifm|tool_calls>\n<ifm|tool_call>bash\n{",
+++                "<ifm|tool_calls>\n<ifm|tool_call>bash",
+++            };
+++            for (const auto & c : cut) {
+++                for (const auto & pre : { std::string("Thinking."), "Thinking." + close + "Ok.\n" }) {
+++                    auto m = stream_parse(make(effort, true), pre + c); // also: the streamed diffs stay valid
+++                    assert_equals((size_t) 0, m.tool_calls.size());
+++                    assert_equals(true, !trim_ws(m.reasoning_content + m.content).empty());
+++                }
+++            }
+++        }
+++
++         // 6b. the parser never throws: whatever the model emits parses to something (fuzz, fixed seed)
++         const std::vector<std::string> pieces = {
++             "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>",
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0150-K2-parser-accept-the-tool-arguments-in-any-order.patch b/fleet-patches/0150-K2-parser-accept-the-tool-arguments-in-any-order.patch
+new file mode 100644
+index 000000000..894e5e2d2
+--- /dev/null
++++ b/fleet-patches/0150-K2-parser-accept-the-tool-arguments-in-any-order.patch
+@@ -0,0 +1,94 @@
++From f893af14497708eb67ed0b6b11786b1c7a5f7461 Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Wed, 30 Sep 2026 09:50:39 -0500
++Subject: [PATCH] K2 parser: accept the tool arguments in any order
++
++The tagged-args parser required the schema's required arguments first, in definition order. K2-Horizon
++writes e.g. path before the required pattern; the call then failed to parse and the lenient path surfaced it
++with arguments '{' (Grafana F7 t3 FAIL_BADCALL). K2 (drop_tail) now takes any order of any argument.
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/chat-auto-parser-generator.cpp | 11 +++++++++++
++ tests/test-chat.cpp                   | 22 +++++++++++++++++++++-
++ 2 files changed, 32 insertions(+), 1 deletion(-)
++
++diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
++index deacebd65..f02a5d7ae 100644
++--- a/common/chat-auto-parser-generator.cpp
+++++ b/common/chat-auto-parser-generator.cpp
++@@ -530,12 +530,23 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
++ 
++         // Build required arg sequence in definition order
++         common_peg_parser args_seq = p.eps();
+++        if (format.drop_tail) {
+++            // K2-Horizon writes the arguments in whatever order it likes (`path` before the required `pattern`, seen
+++            // live in Grafana F7): a strict required-first order made the whole call fail to parse and surface as `{`.
+++            // Any order of any of the arguments; the client validates the required ones.
+++            common_peg_parser any_arg = p.choice();
+++            for (const auto & r : required_parsers) { any_arg |= r; }
+++            for (const auto & o : optional_parsers) { any_arg |= o; }
+++            args_seq = p.repeat(p.space() + any_arg, 0, -1);
+++            optional_parsers.clear();
+++        } else {
++         for (size_t i = 0; i < required_parsers.size(); i++) {
++             if (i > 0) {
++                 args_seq = args_seq + p.space();
++             }
++             args_seq = args_seq + required_parsers[i];
++         }
+++        }
++ 
++         // Build optional args with flexible ordering
++         if (!optional_parsers.empty()) {
++diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
++index 2388d6884..6598567a3 100644
++--- a/tests/test-chat.cpp
+++++ b/tests/test-chat.cpp
++@@ -5320,6 +5320,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
++         common_chat_templates_ptr tmpls = read_templates("models/templates/k2-horizon.jinja");
++         common_chat_tool bash{ "bash", "Executes a bash command",
++                                R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
+++        common_chat_tool grep{ "grep", "Searches file contents",
+++                               R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})" };
++         auto make = [&](const char * effort, bool with_tools, common_chat_tool_choice choice = COMMON_CHAT_TOOL_CHOICE_AUTO,
++                         bool parallel = false) {
++             common_chat_templates_inputs in;
++@@ -5330,7 +5332,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
++             in.parallel_tool_calls   = parallel;
++             in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
++             if (with_tools) {
++-                in.tools = { bash };
+++                in.tools = { bash, grep };
++             }
++             return make_peg_parser(tmpls.get(), in);
++         };
++@@ -5409,6 +5411,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
++             assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
++         }
++ 
+++        // 6a''. arguments in a different order than the schema's (optional before the required one, seen live in Grafana
+++        // F7, where the call surfaced as `{`) are still one whole call
+++        {
+++            const std::vector<std::pair<std::string, std::string>> variants = {
+++                { "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n", R"({"pattern":"Info"})" },
+++                { "<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n",
+++                  R"({"path":"/x","pattern":"Info"})" },
+++                { "<ifm|arg_key>include</ifm|arg_key>\n<ifm|arg_value>*.yaml</ifm|arg_value>\n<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n"
+++                  "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info|Watchdog</ifm|arg_value>\n",
+++                  R"({"include":"*.yaml","path":"/x","pattern":"Info|Watchdog"})" },
+++            };
+++            for (const auto & v : variants) {
+++                auto m = stream_parse(make("low", true), "Ok.<ifm|tool_calls>\n<ifm|tool_call>grep\n" + v.first + "</ifm|tool_call>\n</ifm|tool_calls>");
+++                assert_equals((size_t) 1, m.tool_calls.size());
+++                assert_equals(v.second, m.tool_calls[0].arguments);
+++            }
+++        }
+++
++         // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
++         // generation (it would run a tool with `{`); a complete one is
++         for (const char * effort : { "low", "high" }) {
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0151-K2-guard-turn-an-end-of-turn-inside-an-unclosed-reas.patch b/fleet-patches/0151-K2-guard-turn-an-end-of-turn-inside-an-unclosed-reas.patch
+new file mode 100644
+index 000000000..17a1b1978
+--- /dev/null
++++ b/fleet-patches/0151-K2-guard-turn-an-end-of-turn-inside-an-unclosed-reas.patch
+@@ -0,0 +1,237 @@
++From 59b910d753951a80165cb6227fdc7eac43eeef5a Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Wed, 30 Sep 2026 10:51:27 -0500
++Subject: [PATCH] K2 guard: turn an end of turn inside an unclosed reasoning
++ block into the block's close tag
++
++Masking EOG alone in an open reasoning block (previous commit) pushed some replayed turns into 4096-token
++repetition loops. The close tag now takes the best EOG logit while the block is open (capped), so the
++model's wish to stop becomes 'close the reasoning'.
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/chat-auto-parser-generator.cpp |  8 ++++----
++ common/chat.h                         |  6 +++---
++ common/common.h                       |  4 ++--
++ common/sampling.cpp                   | 29 +++++++++++++++++++++++++--
++ common/sampling.h                     |  2 +-
++ tests/test-empty-reply-guard.cpp      | 22 +++++++++++++++-----
++ tools/server/server-common.cpp        |  4 ++--
++ tools/server/server-schema.cpp        |  5 +++--
++ 8 files changed, 59 insertions(+), 21 deletions(-)
++
++diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
++index f02a5d7ae..6df4c21e3 100644
++--- a/common/chat-auto-parser-generator.cpp
+++++ b/common/chat-auto-parser-generator.cpp
++@@ -76,10 +76,10 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
++             data.no_empty_reply_hold = autoparser.no_empty_reply_hold;
++             std::string gp = data.generation_prompt;
++             gp.erase(gp.find_last_not_of(" \t\r\n") == std::string::npos ? 0 : gp.find_last_not_of(" \t\r\n") + 1);
++-            for (const auto & tag : autoparser.no_empty_reply_inert) {
++-                if (tag.compare(0, 2, "</") != 0 && gp.size() >= tag.size() &&
++-                    gp.compare(gp.size() - tag.size(), tag.size(), tag) == 0) {
++-                    data.no_empty_reply_open = true;
+++            const auto & inert = autoparser.no_empty_reply_inert; // (open, close) pairs
+++            for (size_t i = 0; i + 1 < inert.size(); i += 2) {
+++                if (gp.size() >= inert[i].size() && gp.compare(gp.size() - inert[i].size(), inert[i].size(), inert[i]) == 0) {
+++                    data.no_empty_reply_open = inert[i + 1];
++                 }
++             }
++         }
++diff --git a/common/chat.h b/common/chat.h
++index 80e027dfe..19b270ccb 100644
++--- a/common/chat.h
+++++ b/common/chat.h
++@@ -295,9 +295,9 @@ struct common_chat_params {
++     // tool-call tag pairs { section open, close, inner open, close, ... } when tools are offered: EOG is masked from
++     // an opener until the section is closed and the inner tags are balanced (capped)
++     std::vector<std::string>            no_empty_reply_hold;
++-    // the generation prompt ends inside an open reasoning block (tools offered): the reply starts in reasoning, and
++-    // EOG stays masked until that block is closed (or a call opens), capped
++-    bool                                no_empty_reply_open = false;
+++    // the generation prompt ends inside an open reasoning block (tools offered): the close tag of that block. The reply
+++    // starts in reasoning, and an end of turn there is turned into that close tag (capped), see the empty-reply guard
+++    std::string                         no_empty_reply_open;
++     std::string                         parser;
++     common_chat_msg_delimiters          message_delimiters;
++ };
++diff --git a/common/common.h b/common/common.h
++index b1ad5c59c..2ff1f4b69 100644
++--- a/common/common.h
+++++ b/common/common.h
++@@ -302,8 +302,8 @@ struct common_params_sampling {
++     // native tool-call tag pairs (tools offered), see common_chat_params::no_empty_reply_hold: EOG is also masked
++     // from an opener until the section is closed and its inner tags are balanced, capped
++     std::vector<std::string>  no_empty_reply_hold;
++-    // the prompt ends inside an open reasoning block: hold EOG until it closes (tools offered only), capped
++-    bool                      no_empty_reply_open = false;
+++    // the prompt ends inside an open reasoning block (tools offered only): its close tag; EOG there becomes that tag, capped
+++    std::string               no_empty_reply_open;
++ 
++     bool backend_sampling = false;
++ 
++diff --git a/common/sampling.cpp b/common/sampling.cpp
++index 40bc6feb8..cafb8c436 100644
++--- a/common/sampling.cpp
+++++ b/common/sampling.cpp
++@@ -159,6 +159,7 @@ struct common_empty_reply_guard {
++     // tag or a call opener, capped by k_hold_cap; r_open is the live state, open_initial what reset restores
++     bool                     open_initial = false;
++     bool                     r_open       = false;
+++    llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
++     int                      n_reason     = 0;
++     // per token id: 1 = EOG, 2 = tag (built at init)
++     std::vector<uint8_t>     flags;
++@@ -301,6 +302,26 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
++     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
++     const bool mask_eog  = common_empty_reply_guard_holds(ctx);
++     const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
+++    if (ctx->r_open && ctx->n_reason < k_hold_cap && ctx->close_id != LLAMA_TOKEN_NULL) {
+++        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
+++        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
+++        const auto find = [&](llama_token id) -> llama_token_data * {
+++            if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
+++                return &cur_p->data[id];
+++            }
+++            for (size_t i = 0; i < cur_p->size; ++i) {
+++                if (cur_p->data[i].id == id) { return &cur_p->data[i]; }
+++            }
+++            return nullptr;
+++        };
+++        float best = -INFINITY;
+++        for (llama_token id : ctx->eog) {
+++            if (const auto * d = find(id)) { best = std::max(best, d->logit); }
+++        }
+++        if (auto * c = find(ctx->close_id)) {
+++            c->logit = std::max(c->logit, best);
+++        }
+++    }
++     if (!mask_eog && !mask_tags) {
++         return;
++     }
++@@ -371,9 +392,13 @@ static struct llama_sampler * common_empty_reply_guard_clone(const struct llama_
++             new common_empty_reply_guard(*(const common_empty_reply_guard *) smpl->ctx));
++ }
++ 
++-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, bool reasoning_open) {
+++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold, const std::string & reasoning_close) {
++     auto * ctx = new common_empty_reply_guard { vocab, {}, inert, hold.size() >= 2 && hold.size() % 2 == 0 ? hold : std::vector<std::string>() };
++-    ctx->open_initial = ctx->r_open = reasoning_open && !ctx->hold.empty();
+++    ctx->open_initial = ctx->r_open = !reasoning_close.empty() && !ctx->hold.empty();
+++    if (ctx->open_initial) {
+++        const auto toks = common_tokenize(vocab, reasoning_close, false, true);
+++        ctx->close_id = toks.size() == 1 ? toks[0] : LLAMA_TOKEN_NULL;
+++    }
++     ctx->depth.assign(ctx->hold.size() / 2 > 0 ? ctx->hold.size() / 2 - 1 : 0, 0);
++     // the tags are single vocab tokens in K2; a tag that is not (other vocab) is simply not masked
++     for (size_t i = 1; i < ctx->hold.size(); ++i) {
++diff --git a/common/sampling.h b/common/sampling.h
++index f2ec7af2b..d16834aa4 100644
++--- a/common/sampling.h
+++++ b/common/sampling.h
++@@ -45,7 +45,7 @@ void common_sampler_free(struct common_sampler * gsmpl);
++ 
++ // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
++ // the empty-reply guard sampler (see sampling.cpp); a common_sampler owns one when params.no_empty_reply is set
++-struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {}, bool reasoning_open = false);
+++struct llama_sampler * common_sampler_init_empty_reply_guard(const struct llama_vocab * vocab, const std::vector<llama_token> & inert, const std::vector<std::string> & hold = {}, const std::string & reasoning_close = "");
++ 
++ void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
++ void                    common_sampler_reset (struct common_sampler * gsmpl);
++diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
++index abdb2b935..a00cc7d40 100644
++--- a/tests/test-empty-reply-guard.cpp
+++++ b/tests/test-empty-reply-guard.cpp
++@@ -170,38 +170,50 @@ int main(int argc, char ** argv) {
++         if (t_open.size() == 1 && t_close.size() == 1) {
++             const std::vector<llama_token> inert = { t_open[0], t_close[0] };
++             // the incident: reasoning text, no close, then EOG
++-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
++             CHECK(!eog_allowed(g));
++             feed(g, vocab, "Next I will run the tests");
++             CHECK(!eog_allowed(g));                 // unclosed reasoning: text does not release
+++            {   // the wish to end the turn inside the block becomes the close tag (masking alone caused repetition loops)
+++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+++                llama_token_data_array p = { d, 3, -1, false };
+++                llama_sampler_apply(g, &p);
+++                CHECK(std::isinf(d[0].logit) && d[2].logit == 2.0f && d[1].logit == 0.5f);
+++            }
++             llama_sampler * c3 = llama_sampler_clone(g);
++             llama_sampler_accept(g, t_close[0]);
++             CHECK(eog_allowed(g));                  // closed
+++            {
+++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+++                llama_token_data_array p = { d, 3, -1, false };
+++                llama_sampler_apply(g, &p);
+++                CHECK(d[0].logit == 2.0f && d[2].logit == 0.1f); // untouched once closed
+++            }
++             CHECK(!eog_allowed(c3));                // the clone kept the open block
++             llama_sampler_reset(c3);
++             CHECK(!eog_allowed(c3));
++             llama_sampler_free(c3);
++             llama_sampler_free(g);
++             // cap: released after k_hold_cap tokens
++-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, true);
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
++             for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
++             CHECK(!eog_allowed(g));
++             llama_sampler_accept(g, g_other);
++             CHECK(eog_allowed(g));
++             llama_sampler_free(g);
++             // a native call opener inside the block hands over to the call hold
++-            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, true); // (the stand-in tags would eat parts of the markers)
+++            g = common_sampler_init_empty_reply_guard(vocab, {}, hold, "</"); // (the stand-in tags would eat parts of the markers)
++             feed(g, vocab, "x<ifm|tool_calls>");
++             CHECK(!eog_allowed(g));
++             feed(g, vocab, "</ifm|tool_calls>");
++             CHECK(eog_allowed(g));
++             llama_sampler_free(g);
++             // no tools (no hold) or prompt not in reasoning: never held
++-            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, true);
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, {}, "</");
++             feed(g, vocab, "text");
++             CHECK(eog_allowed(g));
++             llama_sampler_free(g);
++-            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, false);
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold);
++             feed(g, vocab, "text");
++             CHECK(eog_allowed(g));
++             llama_sampler_free(g);
++diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
++index b0f3fb9e5..7917ed516 100644
++--- a/tools/server/server-common.cpp
+++++ b/tools/server/server-common.cpp
++@@ -1386,8 +1386,8 @@ json oaicompat_chat_params_parse(
++     if (!chat_params.no_empty_reply_hold.empty()) {
++         llama_params["no_empty_reply_hold"] = chat_params.no_empty_reply_hold;
++     }
++-    if (chat_params.no_empty_reply_open) {
++-        llama_params["no_empty_reply_open"] = true;
+++    if (!chat_params.no_empty_reply_open.empty()) {
+++        llama_params["no_empty_reply_open"] = chat_params.no_empty_reply_open;
++     }
++     if (!chat_params.parser.empty()) {
++         llama_params["chat_parser"] = chat_params.parser;
++diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
++index 40939c976..669410d5b 100644
++--- a/tools/server/server-schema.cpp
+++++ b/tools/server/server-schema.cpp
++@@ -541,9 +541,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
++         }));
++ 
++     add((new field_json("no_empty_reply_open"))
++-        ->set_desc("The prompt ends inside an open reasoning block: with tools offered, end-of-generation tokens are masked until the block is closed or a tool call opens, capped. Set by the chat template handling")
+++        ->set_desc("Close tag of the reasoning block the prompt ends inside (tools offered): an end-of-generation token there is turned into this tag, capped. Set by the chat template handling")
++         ->set_handler([&](field_eval_context & ctx, const json & data) {
++-            ctx.params.sampling.no_empty_reply_open = data.at("no_empty_reply_open").is_boolean() && data.at("no_empty_reply_open").get<bool>();
+++            const auto & tag = data.at("no_empty_reply_open");
+++            ctx.params.sampling.no_empty_reply_open = tag.is_string() ? tag.get<std::string>() : std::string();
++         }));
++ 
++     add((new field_json("stop_after_reasoning"))
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0152-K2-guard-repetition-breaker-for-an-open-reasoning-bl.patch b/fleet-patches/0152-K2-guard-repetition-breaker-for-an-open-reasoning-bl.patch
+new file mode 100644
+index 000000000..3211c0400
+--- /dev/null
++++ b/fleet-patches/0152-K2-guard-repetition-breaker-for-an-open-reasoning-bl.patch
+@@ -0,0 +1,149 @@
++From ed3ab13adea95e26d5884558574538d328a0fbc7 Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Wed, 30 Sep 2026 14:00:34 -0500
++Subject: [PATCH] K2 guard: repetition breaker for an open reasoning block
++
++A reasoning line (16+ chars) written three times in the block the prompt opened forces the close tag.
++R17 live seed 0 at max_tokens 1500 went into 'Let me check the GitHub releases...' loops from turn 31 and
++kept them alive by replaying them; the model then continues with content or a call.
++
++Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
++Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
++---
++ common/sampling.cpp              | 41 +++++++++++++++++++++++++++++---
++ tests/test-empty-reply-guard.cpp | 22 +++++++++++++++++
++ 2 files changed, 60 insertions(+), 3 deletions(-)
++
++diff --git a/common/sampling.cpp b/common/sampling.cpp
++index cafb8c436..b3c7075ec 100644
++--- a/common/sampling.cpp
+++++ b/common/sampling.cpp
++@@ -11,6 +11,7 @@
++ #include <cctype>
++ #include <climits>
++ #include <cmath>
+++#include <map>
++ #include <cstring>
++ #include <unordered_map>
++ #include <vector>
++@@ -132,6 +133,9 @@ static const int k_hold_cap = 2048;
++ // Kimi hold gets its own small cap, and a repeated unfinished opener releases it at once.
++ static const int k_kimi_hold_cap = 192;
++ 
+++// A reasoning line repeated this many times in an open block is a loop: force the close tag.
+++static const int k_rep_lines = 3;
+++
++ struct common_empty_reply_guard {
++     const llama_vocab *      vocab;
++     std::vector<llama_token> eog;
++@@ -161,6 +165,10 @@ struct common_empty_reply_guard {
++     bool                     r_open       = false;
++     llama_token              close_id     = LLAMA_TOKEN_NULL; // the block's close tag: an EOG inside the block becomes this
++     int                      n_reason     = 0;
+++    // repetition breaker for the open block: a line (16+ chars) written k_rep_lines times forces the close tag
+++    std::string              line;
+++    std::map<std::string, int> seen_lines;
+++    bool                     force_close  = false;
++     // per token id: 1 = EOG, 2 = tag (built at init)
++     std::vector<uint8_t>     flags;
++ };
++@@ -271,9 +279,24 @@ static void common_empty_reply_guard_accept(struct llama_sampler * smpl, llama_t
++             const std::string tag = common_token_to_piece(ctx->vocab, token, true);
++             ctx->r_open = tag.compare(0, 2, "</") != 0; // a close tag ends the block, an open tag (re)opens one
++             ctx->n_reason = 0;
+++            ctx->force_close = false;
+++            ctx->line.clear();
+++            ctx->seen_lines.clear();
++         }
++         return;
++     }
+++    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL) {
+++        // the model writes its next step in the reasoning, then repeats it to max_tokens ("Let me check ..." x 100)
+++        ctx->line += common_token_to_piece(ctx->vocab, token, false);
+++        for (size_t nl; (nl = ctx->line.find('\n')) != std::string::npos; ctx->line.erase(0, nl + 1)) {
+++            std::string l = ctx->line.substr(0, nl);
+++            l.erase(0, l.find_first_not_of(" \t\r"));
+++            if (l.size() >= 16 && ++ctx->seen_lines[l] >= k_rep_lines) {
+++                ctx->force_close = true;
+++                LOG_DBG("%s: empty-reply guard: a reasoning line repeated %d times, forcing the close tag\n", __func__, k_rep_lines);
+++            }
+++        }
+++    }
++     if (ctx->r_open && ++ctx->n_reason == k_hold_cap) {
++         LOG_DBG("%s: empty-reply guard: %d tokens inside an unclosed reasoning block, releasing EOG\n", __func__, k_hold_cap);
++     }
++@@ -302,9 +325,7 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
++     const auto * ctx = (const common_empty_reply_guard *) smpl->ctx;
++     const bool mask_eog  = common_empty_reply_guard_holds(ctx);
++     const bool mask_tags = !ctx->tag_ids.empty() && !ctx->n_open;
++-    if (ctx->r_open && ctx->n_reason < k_hold_cap && ctx->close_id != LLAMA_TOKEN_NULL) {
++-        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
++-        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
+++    if (ctx->r_open && ctx->close_id != LLAMA_TOKEN_NULL && (ctx->force_close || ctx->n_reason < k_hold_cap)) {
++         const auto find = [&](llama_token id) -> llama_token_data * {
++             if (id >= 0 && (size_t) id < cur_p->size && cur_p->data[id].id == id) {
++                 return &cur_p->data[id];
++@@ -314,6 +335,17 @@ static void common_empty_reply_guard_apply(struct llama_sampler * smpl, llama_to
++             }
++             return nullptr;
++         };
+++        if (ctx->force_close) {
+++            if (auto * c = find(ctx->close_id)) {
+++                for (size_t i = 0; i < cur_p->size; ++i) {
+++                    cur_p->data[i].logit = -INFINITY;
+++                }
+++                c->logit = 0.0f;
+++                return;
+++            }
+++        }
+++        // The model wants to end the turn inside an unclosed reasoning block: turn that into closing the block (masking
+++        // EOG alone pushed it into a repetition loop instead). The close tag takes the best EOG logit.
++         float best = -INFINITY;
++         for (llama_token id : ctx->eog) {
++             if (const auto * d = find(id)) { best = std::max(best, d->logit); }
++@@ -363,6 +395,9 @@ static void common_empty_reply_guard_reset(struct llama_sampler * smpl) {
++     ctx->in_section = ctx->in_call = false;
++     ctx->r_open = ctx->open_initial;
++     ctx->n_reason = 0;
+++    ctx->force_close = false;
+++    ctx->line.clear();
+++    ctx->seen_lines.clear();
++     common_empty_reply_guard_release(ctx);
++ }
++ 
++diff --git a/tests/test-empty-reply-guard.cpp b/tests/test-empty-reply-guard.cpp
++index a00cc7d40..9d8cd4315 100644
++--- a/tests/test-empty-reply-guard.cpp
+++++ b/tests/test-empty-reply-guard.cpp
++@@ -194,6 +194,28 @@ int main(int argc, char ** argv) {
++             CHECK(!eog_allowed(c3));
++             llama_sampler_free(c3);
++             llama_sampler_free(g);
+++            // repetition breaker: the same 16+ char line three times in the open block forces the close tag
+++            g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
+++            {
+++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+++                llama_token_data_array p = { d, 3, -1, false };
+++                feed(g, vocab, "Let me check the index again.\nLet me check the index again.\nsomething else entirely\n");
+++                llama_sampler_apply(g, &p);
+++                CHECK(d[1].logit == 0.5f && d[2].logit == 2.0f);                          // two repeats: only the EOG redirect
+++            }
+++            {
+++                llama_token_data d[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+++                llama_token_data_array p = { d, 3, -1, false };
+++                feed(g, vocab, "Let me check the index again.\n");
+++                llama_sampler_apply(g, &p);
+++                CHECK(std::isinf(d[0].logit) && std::isinf(d[1].logit) && !std::isinf(d[2].logit)); // forced
+++                llama_sampler_accept(g, t_close[0]);
+++                llama_token_data e[3] = { { g_eog, 2.0f, 0.0f }, { g_other, 0.5f, 0.0f }, { t_close[0], 0.1f, 0.0f } };
+++                llama_token_data_array q = { e, 3, -1, false };
+++                llama_sampler_apply(g, &q);
+++                CHECK(e[0].logit == 2.0f && e[1].logit == 0.5f); // released once closed
+++            }
+++            llama_sampler_free(g);
++             // cap: released after k_hold_cap tokens
++             g = common_sampler_init_empty_reply_guard(vocab, inert, hold, "</");
++             for (int i = 0; i < cap - 1; ++i) { llama_sampler_accept(g, g_other); }
++-- 
++2.43.0
++
+diff --git a/fleet-patches/README.md b/fleet-patches/README.md
+index 3c44c22f8..2788064eb 100644
+--- a/fleet-patches/README.md
++++ b/fleet-patches/README.md
+@@ -177,6 +177,13 @@ re-derive the equivalent change against the new upstream code, `git am
+ | 0143 | `5864976f9` | chat: K2-Horizon: render history reasoning with the generation tag, strip foreign markup, drop emptied turns |
+ | 0144 | `282ab87a9` | sampling: K2-Horizon: mask the structural tool-call tags while no native section is open |
+ | 0145 | `3b7d51c4d` | FLEET.md: K2 history-replay root cause and the tag mask |
++| 146 | `11e9b4b63` | sampling: empty-reply guard/tag mask: O(1) per-candidate masking |
++| 147 | `0088f823d` | chat: K2-Horizon parser gaps (all reasoning efforts, bare/Kimi calls, stray tags, never throw) |
++| 148 | `3449022c9` | K2: hold EOG inside an unclosed reasoning block (tools offered); strip only known K2/Kimi markup from replayed reasoning |
++| 149 | `d5812222e` | K2 parser: surface a tool call only once its arguments are complete JSON |
++| 150 | `f893af144` | K2 parser: accept the tool arguments in any order |
++| 151 | `59b910d75` | K2 guard: turn an end of turn inside an unclosed reasoning block into the block's close tag |
++| 152 | `ed3ab13ad` | K2 guard: repetition breaker for an open reasoning block |
+ 
+ 0046-0048 are cherry-picked from `MBZUAI-IFM/llama.cpp@model/K2Horizon`
+ (commits `69d3a4e82`/`a8104b553`/`e78bd9435` there), landed 3 commits ahead
+-- 
+2.43.0
+

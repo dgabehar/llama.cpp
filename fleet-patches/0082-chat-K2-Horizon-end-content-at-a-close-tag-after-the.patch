@@ -1,0 +1,96 @@
+From 3de07b36ff1ed6b0b164af0ba411581cdfe7fa00 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Fri, 25 Sep 2026 10:00:38 -0500
+Subject: [PATCH] chat : K2-Horizon: end content at a close tag after the
+ answer
+
+Fleet QA round 5: 4/120 K2-Horizon replies (all repeat-back prompts) closed
+the reasoning, answered, then emitted a second </ifm|think> and started over
+with a garbled copy ("ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry,
+..."). The tag and the restart went out in content.
+
+analyze_content gains stray_ends: content ends at the first of them and the
+rest of the output is dropped. The K2-Horizon workaround lists its three close
+tags. test-chat covers the double close.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/chat-auto-parser-generator.cpp | 3 +++
+ common/chat-auto-parser.h             | 4 ++++
+ common/chat-diff-analyzer.cpp         | 5 ++++-
+ tests/test-chat.cpp                   | 8 ++++++++
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index e4a877db6..b98957e36 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -175,6 +175,9 @@ common_peg_parser analyze_content::build_parser(parser_build_context & ctx) cons
+         }
+         return p.content(p.until(start)) + start + p.content(p.until(end)) + end + p.end();
+     }
++    if (!stray_ends.empty()) {
++        return ctx.reasoning_parser + p.content(p.until_one_of(stray_ends)) + p.optional(p.rest()) + p.end();
++    }
+     return ctx.reasoning_parser + p.content(p.rest()) + p.end();
+ }
+ 
+diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
+index 0b7cc67bb..d193a2253 100644
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -289,6 +289,10 @@ struct analyze_content : analyze_base {
+ 
+     bool requires_nonnull_content = false;
+ 
++    // tags the model may emit after its answer before derailing (e.g. a second reasoning close tag): content
++    // ends at the first of them and the rest of the output is dropped
++    std::vector<std::string> stray_ends;
++
+     analyze_content() = default;
+     analyze_content(const common_chat_template & tmpl, const analyze_reasoning & reasoning);
+ 
+diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
+index e03924b69..304382fd5 100644
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -224,13 +224,16 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
+       // The model does not always close with the tag it opened: at "low" it often ends
+       // its thinking with the "high" tag "</ifm|think>" (seen live, 2026-09-25), which left
+       // the whole reply in reasoning_content and content empty. Any of the three close
+-      // tags ends the reasoning.
++      // tags ends the reasoning. It also sometimes answers, emits a second close tag and
++      // starts over with a garbled copy of the answer (Dawn QA round 5: 4/120 replies, all
++      // repeat-back prompts), so a close tag after the reasoning ends the content.
+       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+           if (tmpl.src.find("ifm|think_faster") != std::string::npos) {
+               analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+               analysis.reasoning.start = "<ifm|think_faster>";
+               analysis.reasoning.end   = "</ifm|think_faster>";
+               analysis.reasoning.end_alts = { "</ifm|think>", "</ifm|think_fast>" };
++              analysis.content.stray_ends = { "</ifm|think_faster>", "</ifm|think>", "</ifm|think_fast>" };
+               analysis.preserved_tokens.push_back("<ifm|think_faster>");
+               analysis.preserved_tokens.push_back("</ifm|think_faster>");
+               // Not the registered start/end pair (see comment above), but still real
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 7642a059b..5ba89e625 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -4970,6 +4970,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+                 .expect_content("6:35 PM.")
+                 .run();
+         }
++
++        // a second close tag after the answer: the garbled restart after it is dropped
++        tst.test("Repeat it.</ifm|think>ghe.coxautoinc.com</ifm|think>ghe.coxautoin\nI'm sorry")
++            .template_kwarg("reasoning_effort", "\"low\"")
++            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
++            .expect_reasoning("Repeat it.")
++            .expect_content("ghe.coxautoinc.com")
++            .run();
+     }
+ 
+     // Kimi-K2-Thinking tests - custom parser
+-- 
+2.43.0
+

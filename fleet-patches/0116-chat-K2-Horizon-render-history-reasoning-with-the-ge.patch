@@ -1,0 +1,194 @@
+From 5864976f984f59776bfb88679225cbb749ab1400 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 29 Sep 2026 11:22:33 -0500
+Subject: [PATCH] chat: K2-Horizon: render history reasoning with the
+ generation tag, strip foreign markup, drop emptied turns
+
+Root cause of the Kimi-opener stalls (test plan K2-TESTPLAN.md H1+H2): the K2 template renders every past
+assistant turn's reasoning with <ifm|think> while the low-effort generation prompt opens <ifm|think_faster>,
+and clients (opencode) replay the stalled turns' junk reasoning ("<|tool_calls_section_begin|>...",
+"<|close|>") as reasoning_content, which the model then imitates. Replay of live session ses_f16214d2 with
+raw /completion sampling, 40 runs each (seed 1): as sent 10/40 Kimi openers; reasoning stripped 0/40;
+junk stripped 0/40; tags matched with junk kept 0/40 (vs 10/40 and 15/40 with empties dropped only).
+
+Fix (common/chat.cpp k2_history_reasoning, K2 templates only, effort low/medium): history reasoning goes to
+the template's per-message think_faster/think_fast field, <|...|> and <ifm|...> markup is stripped from it,
+and assistant turns left with no content, calls or reasoning are dropped. With the fix: 0/80 Kimi openers
+(2 EOG-first, no guard in raw mode). tests/test-chat.cpp test_k2_history_reasoning fails without the
+workaround (verified) and passes with it. ctest -L main 59/59, -R split-balance pass.
+Satisfies K2-TMPL-02, K2-TMPL-03, K2-REPLAY-05, K2-REPLAY-11 (design; Dawn executes). Answers D3.
+
+Assisted-by: Claude Sonnet 5
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat.cpp     | 51 +++++++++++++++++++++++++++++++++
+ tests/test-chat.cpp | 69 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 120 insertions(+)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index f4d704b51..d7e041466 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -25,6 +25,7 @@
+ #include <map>
+ 
+ #include <optional>
++#include <regex>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -1012,6 +1013,51 @@ static void map_developer_role_to_system(json & messages) {
+ }
+ 
+ 
++// K2-Horizon: the template renders every past assistant turn's reasoning with the `ifm|think` tag family, whatever
++// the effort, while the generation prompt opens `ifm|think_fast` (medium) / `ifm|think_faster` (low). The model then
++// sees a tag it was not asked to open, and a junk reasoning (a Kimi tool-call opener, `<|close|>`, ...) replayed by
++// the client from a stalled turn primes the next turn to repeat it (opencode session ses_f16214d2: 25 of 26 replayed
++// reasonings junk, 10/40 replay samples opened a Kimi call; 0/40 with the tags matched). So render the history
++// reasoning with the generation tag (the template's per-message `think_fast` / `think_faster` fields), strip foreign
++// `<|...|>` and `<ifm|...>` markup from it, and drop assistant turns that are left with nothing at all (an empty
++// past turn teaches ending the turn right after the reasoning).
++static void k2_history_reasoning(json & messages, const std::string & effort) {
++    const char * field = effort == "low" ? "think_faster" : effort == "medium" ? "think_fast" : nullptr;
++    if (!field) {
++        return; // high: history tag == generation tag already
++    }
++    static const std::regex foreign(R"(<\|[A-Za-z_]*(?:\|>)?|</?ifm\|[a-z_]+>)");
++    json out = json::array();
++    for (auto & m : messages) {
++        if (!m.is_object() || m.value("role", "") != "assistant") {
++            out.push_back(std::move(m));
++            continue;
++        }
++        const bool has_content = m.contains("content") && m["content"].is_string() && !m["content"].get<std::string>().empty();
++        const bool has_calls   = m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty();
++        if (has_content && m["content"].get<std::string>().find("</ifm|think") != std::string::npos) {
++            out.push_back(std::move(m)); // reasoning is embedded in the content: the template splits it itself
++            continue;
++        }
++        std::string reasoning;
++        for (const char * key : { "reasoning_content", "reasoning" }) {
++            if (m.contains(key) && m[key].is_string()) {
++                reasoning = m[key].get<std::string>();
++                m.erase(key);
++            }
++        }
++        reasoning = std::regex_replace(reasoning, foreign, "");
++        const size_t b = reasoning.find_first_not_of(" \t\r\n");
++        reasoning = b == std::string::npos ? "" : reasoning.substr(b, reasoning.find_last_not_of(" \t\r\n") - b + 1);
++        if (reasoning.empty() && !has_content && !has_calls) {
++            continue;
++        }
++        m[field] = reasoning;
++        out.push_back(std::move(m));
++    }
++    messages = std::move(out);
++}
++
+ // if first message is system and template does not support it, merge it with next message
+ static void system_message_not_supported(json & messages) {
+     if (!messages.empty() && messages.front().at("role") == "system") {
+@@ -1293,6 +1339,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+         params.extra_context[el.first] = json::parse(el.second);
+     }
+ 
++    if (src.find("ifm|think_faster") != std::string::npos && src.find("ifm|think_fast") != std::string::npos) {
++        const auto e = params.extra_context.value("reasoning_effort", json("high"));
++        workaround::k2_history_reasoning(params.messages, e.is_string() ? e.get<std::string>() : "high");
++    }
++
+     if (!inputs.json_schema.empty()) {
+         params.json_schema = json::parse(inputs.json_schema);
+     }
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index dec5c7bd7..891e51d16 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -7457,6 +7457,74 @@ static void test_developer_role_to_system_workaround() {
+     }
+ }
+ 
++// K2-Horizon history reasoning: rendered with the generation tag, foreign markup stripped, empty turns dropped.
++// The junk is real replayed reasoning (opencode session ses_f16214d2affecU4s4Zjhfkh9hS, 2026-09-29).
++static void test_k2_history_reasoning() {
++    LOG_DBG("%s\n", __func__);
++    auto tmpls = read_templates("models/templates/k2-horizon.jinja");
++
++    common_chat_msg user;
++    user.role = "user";
++    user.content = "check the version";
++    common_chat_msg junk_call;
++    junk_call.role = "assistant";
++    junk_call.reasoning_content = "\n<|tool_calls_section_begin|><|tool_call_begin|>\n\n\n<|tool_calls_section_begin|><|tool_call_begin|>";
++    junk_call.tool_calls.push_back({ "bash", R"({"command":"ls"})", "call1" });
++    common_chat_msg result;
++    result.role = "tool";
++    result.content = "a.txt";
++    result.tool_call_id = "call1";
++    common_chat_msg empty_turn;                 // a stalled turn: nothing at all
++    empty_turn.role = "assistant";
++    empty_turn.reasoning_content = "\n<|close|>";
++    common_chat_msg partial;                    // a truncated marker
++    partial.role = "assistant";
++    partial.reasoning_content = "\n<|tool_call_begin\n";
++    partial.content = "Done.";
++    common_chat_msg real;
++    real.role = "assistant";
++    real.reasoning_content = "Check the file.";
++    real.content = "Looks fine.";
++
++    common_chat_tool bash{ "bash", "Executes a bash command",
++                           R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
++    for (const char * effort : { "low", "medium" }) {
++        common_chat_templates_inputs inputs;
++        inputs.messages              = { user, junk_call, result, empty_turn, partial, real, user };
++        inputs.tools                 = { bash };
++        inputs.add_generation_prompt = true;
++        inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
++        const std::string tag = std::string("ifm|think_") + (std::string(effort) == "low" ? "faster" : "fast");
++        const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
++        assert_contains(prompt, "<" + tag + ">\nCheck the file.\n</" + tag + ">\nLooks fine.");
++        if (prompt.find("<ifm|think>") != std::string::npos || prompt.find("</ifm|think>") != std::string::npos) {
++            throw std::runtime_error("K2 history still rendered with the high-effort tag at effort " + std::string(effort));
++        }
++        for (const char * bad : { "<|tool_call", "<|close" }) {
++            if (prompt.find(bad) != std::string::npos) {
++                throw std::runtime_error(std::string("K2 history kept foreign markup ") + bad);
++            }
++        }
++        // the emptied stalled turn is gone: 3 assistant turns from the history + the generation prompt
++        size_t n = 0;
++        for (size_t p = prompt.find("<|ifm|im_start|>assistant"); p != std::string::npos; p = prompt.find("<|ifm|im_start|>assistant", p + 1)) {
++            n++;
++        }
++        if (n != 4) {
++            throw std::runtime_error("K2 history: expected 4 assistant turns, got " + std::to_string(n));
++        }
++    }
++    // high effort: history tag and generation tag are both ifm|think, nothing is rewritten
++    {
++        common_chat_templates_inputs inputs;
++        inputs.messages              = { user, real, user };
++        inputs.add_generation_prompt = true;
++        inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
++        assert_contains(common_chat_templates_apply(tmpls.get(), inputs).prompt, "<ifm|think>\nCheck the file.\n</ifm|think>\nLooks fine.");
++    }
++    LOG_ERR("%s passed\n", __func__);
++}
++
+ // Verify reasoning-trace retention rules in the DeepSeek-V4 template:
+ // all traces are retained unless drop_thinking is true AND the conversation
+ // has no tool calls, in which case only the last (after-final-user) trace is
+@@ -7869,6 +7937,7 @@ int main(int argc, char ** argv) {
+         test_tools_oaicompat_json_conversion();
+         test_convert_responses_to_chatcmpl();
+         test_developer_role_to_system_workaround();
++        test_k2_history_reasoning();
+         test_deepseek_v4_thinking_retention();
+         test_deepseek_v4_tool_result_ordering();
+         test_template_generation_prompt();
+-- 
+2.43.0
+

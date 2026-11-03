@@ -1,0 +1,94 @@
+From f893af14497708eb67ed0b6b11786b1c7a5f7461 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Wed, 30 Sep 2026 09:50:39 -0500
+Subject: [PATCH] K2 parser: accept the tool arguments in any order
+
+The tagged-args parser required the schema's required arguments first, in definition order. K2-Horizon
+writes e.g. path before the required pattern; the call then failed to parse and the lenient path surfaced it
+with arguments '{' (Grafana F7 t3 FAIL_BADCALL). K2 (drop_tail) now takes any order of any argument.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BidfYiPxg2nUvGVowCgTPK
+---
+ common/chat-auto-parser-generator.cpp | 11 +++++++++++
+ tests/test-chat.cpp                   | 22 +++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index deacebd65..f02a5d7ae 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -530,12 +530,23 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+ 
+         // Build required arg sequence in definition order
+         common_peg_parser args_seq = p.eps();
++        if (format.drop_tail) {
++            // K2-Horizon writes the arguments in whatever order it likes (`path` before the required `pattern`, seen
++            // live in Grafana F7): a strict required-first order made the whole call fail to parse and surface as `{`.
++            // Any order of any of the arguments; the client validates the required ones.
++            common_peg_parser any_arg = p.choice();
++            for (const auto & r : required_parsers) { any_arg |= r; }
++            for (const auto & o : optional_parsers) { any_arg |= o; }
++            args_seq = p.repeat(p.space() + any_arg, 0, -1);
++            optional_parsers.clear();
++        } else {
+         for (size_t i = 0; i < required_parsers.size(); i++) {
+             if (i > 0) {
+                 args_seq = args_seq + p.space();
+             }
+             args_seq = args_seq + required_parsers[i];
+         }
++        }
+ 
+         // Build optional args with flexible ordering
+         if (!optional_parsers.empty()) {
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 2388d6884..6598567a3 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -5320,6 +5320,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+         common_chat_templates_ptr tmpls = read_templates("models/templates/k2-horizon.jinja");
+         common_chat_tool bash{ "bash", "Executes a bash command",
+                                R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})" };
++        common_chat_tool grep{ "grep", "Searches file contents",
++                               R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]})" };
+         auto make = [&](const char * effort, bool with_tools, common_chat_tool_choice choice = COMMON_CHAT_TOOL_CHOICE_AUTO,
+                         bool parallel = false) {
+             common_chat_templates_inputs in;
+@@ -5330,7 +5332,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             in.parallel_tool_calls   = parallel;
+             in.chat_template_kwargs["reasoning_effort"] = std::string("\"") + effort + "\"";
+             if (with_tools) {
+-                in.tools = { bash };
++                in.tools = { bash, grep };
+             }
+             return make_peg_parser(tmpls.get(), in);
+         };
+@@ -5409,6 +5411,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             assert_equals(true, m.content.find("<ifm|tool_call>{\"name\":\"bash\"}") != std::string::npos);
+         }
+ 
++        // 6a''. arguments in a different order than the schema's (optional before the required one, seen live in Grafana
++        // F7, where the call surfaced as `{`) are still one whole call
++        {
++            const std::vector<std::pair<std::string, std::string>> variants = {
++                { "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n", R"({"pattern":"Info"})" },
++                { "<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info</ifm|arg_value>\n",
++                  R"({"path":"/x","pattern":"Info"})" },
++                { "<ifm|arg_key>include</ifm|arg_key>\n<ifm|arg_value>*.yaml</ifm|arg_value>\n<ifm|arg_key>path</ifm|arg_key>\n<ifm|arg_value>/x</ifm|arg_value>\n"
++                  "<ifm|arg_key>pattern</ifm|arg_key>\n<ifm|arg_value>Info|Watchdog</ifm|arg_value>\n",
++                  R"({"include":"*.yaml","path":"/x","pattern":"Info|Watchdog"})" },
++            };
++            for (const auto & v : variants) {
++                auto m = stream_parse(make("low", true), "Ok.<ifm|tool_calls>\n<ifm|tool_call>grep\n" + v.first + "</ifm|tool_call>\n</ifm|tool_calls>");
++                assert_equals((size_t) 1, m.tool_calls.size());
++                assert_equals(v.second, m.tool_calls[0].arguments);
++            }
++        }
++
+         // 6a'. a call cut off before its arguments are complete JSON is not surfaced as a call at the end of
+         // generation (it would run a tool with `{`); a complete one is
+         for (const char * effort : { "low", "high" }) {
+-- 
+2.43.0
+
