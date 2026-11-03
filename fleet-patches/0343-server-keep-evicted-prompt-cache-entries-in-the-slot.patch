@@ -1,0 +1,1132 @@
+From 3d5f8253c218d66d4171e56b7dd24a8db027ba4b Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 3 Nov 2026 12:17:33 -0600
+Subject: [PATCH] server: keep evicted prompt cache entries in the slot dir and
+ restore them on a miss
+
+The RAM prompt cache (--cache-ram) frees an entry it evicts, and skips an
+entry larger than its whole limit. On models that cannot shift or partially
+reuse their memory (hybrid/recurrent such as qwen35, SWA), the next request
+for that conversation then re-processes the whole prompt.
+
+Seen in production (Loki, 36h): gabesrv06 qwen38-27b (--parallel 1) and
+gabesrv10 qwen38-flash (--parallel 2), both --cache-ram 8192, hold entries of
+3.2-7.6 GiB each, so a second conversation evicts the first. The 27B had 6+
+full re-prefills of 50K-120K tokens (8-47 minutes each); flash had 60
+evictions in 424 requests, with re-prefills up to 170,527 tokens (13.7
+minutes) right after "making room for prompt cache entry, removing oldest
+entry".
+
+With --slot-save-path set, an evicted entry (and an entry too large for the
+cache) is now written to the slot dir as an ordinary slot save file,
+prompt-cache-<16 hex>.bin. When a request misses the RAM cache, the server
+scans the slot dir and restores the file whose token list shares the longest
+prefix with the request.
+
+- The file is the slot save format with no changes: ggsq header and
+  LLAMA_STATE_SEQ_VERSION, serialized tokens, state, SCKP checkpoints, SDFT
+  draft state. The RAM entry holds llama_state_seq_get_data_ext output, which
+  is io_magic + seq_id (8 bytes) followed by the payload that
+  llama_state_seq_save_file writes after its header, so the spill writes the
+  header and tokens and then the entry without those 8 bytes. The slot-dir gc,
+  the cross-node sync and kvrepl_nstream_convert.py need no change: the
+  converter validates a spilled qwen35 file and converts it to 2 streams.
+- The atomic temp+fsync+rename write of action=save and the restore of
+  action=restore are factored into slot_file_save/slot_file_restore, and the
+  spill and the lookup use them. A disk hit therefore restores the checkpoint
+  appendix exactly as an explicit restore does, and the checkpoint-based reuse
+  fix (patch 0002 / PR #26004) applies.
+- Prompts under 4096 tokens are not spilled or looked up. The disk is looked
+  up before the RAM cache loads anything, and a disk hit must beat both what
+  the slot holds and the best RAM entry by 4096 tokens and keep a quarter of
+  the file (server_prompt_cache::MIN_KEEP_RATIO, shared with the RAM cache).
+  If the restore fails, the RAM cache load runs as if the disk had not been
+  tried (the slot's state went to the RAM cache first), so a bad file never
+  costs a request its RAM hit. A prompt that a slot file already contains
+  whole is not written again. A file that fails to restore is skipped until
+  its mtime changes and forgotten once it is gone. The file name is a hash of
+  the token list; a name held by a file with other tokens is never
+  overwritten, a -<n> suffix is used instead. One prompt cache pass scans the
+  slot dir once for all its spills and its lookup. The lookup also matches
+  the LiteLLM hook's session saves and files pulled from peers, since they
+  use the same format.
+- All three RAM eviction paths spill: the size limit in alloc() and update(),
+  and the token limit (n_ctx by default) in update().
+- Disk use stays under the slot-cache gc (age cap, size cap, free-space
+  floor). Nothing else deletes these files.
+
+The spill write (with fsync) and the lookup run synchronously on the server
+loop. While a multi-GiB state is written or read, every slot stalls (live:
+~170 MiB written in 0.16-0.25 s, so ~5 GiB in a few seconds; that measurement
+is the ceiling, not a test of production disk). This is deliberate: a writer
+thread would have to hold the evicted buffer beyond --cache-ram until the
+write finished, and the pods' memory limits are sized to --cache-ram. Marked
+as a ponytail ceiling in the code.
+
+Tests: test_slot_save.py::test_prompt_cache_disk_restores_evicted_prompt
+(tinygemma3 with a 64-token SWA window, which cannot partially reuse its
+memory either; covers an evicted entry, an oversized entry, a draft-model
+entry with the SDFT appendix, and a no-slot-dir control that re-processes
+everything, plus a no-size-limit case where only the token limit evicts),
+test_prompt_cache_disk_skips_short_prompts,
+test_prompt_cache_disk_failed_restore_keeps_ram_hit (a truncated slot file
+that beats the RAM entry is tried, fails, and the request still reuses the
+RAM entry: cache_n 5201, was 0) and
+test_prompt_cache_disk_name_taken_by_other_prompt (a spill name held by
+another prompt's file is left alone, the spill goes to <name>-1.bin). The
+last three fail without their fixes.
+
+Live on a real hybrid model (Qwen3.5-0.8B Q4_0, CPU, 12 threads). Prompt A
+is sent, then three other conversations evict it, then A is sent again:
+- --parallel 1, --cache-ram 150 (one ~110 MiB entry fits), 4.8K-token A:
+  without this patch, the second A re-processes 4817 tokens (11.5 s, wall
+  11.7 s). With it: 4 tokens, cache_n 4813, wall 0.37 s, of which the 114 MiB
+  restore takes 25 ms.
+- --parallel 2, same flags: 4 tokens, cache_n 4813, wall 0.34 s.
+- --cache-ram 1 (every entry larger than the cache), 9.6K-token A: cold
+  38.1 s; second A 4 tokens, cache_n 9629, wall 0.66 s.
+- Cross-node: a --parallel 1 spill converted to 2 streams with
+  kvrepl_nstream_convert.py and dropped into the slot dir of a fresh
+  --parallel 2 server is restored by the very first request: 4 tokens,
+  cache_n 9629, wall 0.38 s.
+Not measured: production-size states (3-8 GiB) on the fleet's disks and
+Vulkan nodes, so the stall per spill there is an estimate.
+
+Assisted-by: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ FLEET.md                                  |  50 ++
+ tools/server/server-context.cpp           | 558 ++++++++++++++++++----
+ tools/server/server-task.cpp              |  22 +-
+ tools/server/server-task.h                |  16 +
+ tools/server/tests/unit/test_slot_save.py | 143 ++++++
+ 5 files changed, 685 insertions(+), 104 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index f7ffbc05d..c052606f7 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -284,6 +284,15 @@ home-infrastructure artifact must change in the same series.
+    appendix (`SLOT_CKPT_VERSION`, `save_slot_checkpoints`) and the `/slots`,
+    `/slots/<id>?action=save|restore` and `/props` JSON keys
+    (`id_slot`, `is_processing`, `n_saved`, `n_restored`, `filename`, `n_ctx`).
++   Also the file-local `io_magic` (`0xaf143cd8`) in `src/llama-context.cpp`, which
++   `llama_state_seq_get_data_ext` writes ahead of the seq_id: our
++   `LLAMA_STATE_SEQ_IO_MAGIC` in `server-context.cpp` duplicates it, and the prompt
++   cache spill (`prompt_cache_disk_evict`) refuses every entry whose first 4 bytes
++   differ, so a change upstream turns the spill of evicted entries off with only a
++   warning in the log (`unexpected state layout`); only the pytest
++   `test_prompt_cache_disk_restores_evicted_prompt` catches it, and only when it runs.
++   `git diff OLD..NEW -- src/llama-context.cpp | rg io_magic`, and check the
++   `get_data_ext` output still starts with magic + seq_id (8 bytes) before the payload.
+ 5. Flags the fleet uses (values-*.yaml `extraArgs`, chart templates): extract with
+    `rg -oN -h -- '--?[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
+    in home-infrastructure (non-comment lines), then confirm every
+@@ -872,6 +881,47 @@ written any more (the draft state lives in the SDFT appendix), so there is no se
+ no fsync, the rename alone. Test: `test_slot_save.py::test_slot_save_failure_keeps_previous_file` (a directory at
+ `<dir>/.<file>.tmp` makes the second save fail; the first file must be unchanged and restorable), fails before the fix.
+ 
++## Prompt cache spills to the slot dir (added 2026-11-03)
++
++With `--slot-save-path` set and `--cache-ram` on, the RAM prompt cache no longer just frees an entry it evicts. The
++entry is written to the slot dir as an ordinary slot save file, `prompt-cache-<16 hex>.bin`. The same happens to an
++entry the cache skips because it is larger than the whole `--cache-ram` limit. When a request then misses the RAM
++cache, the server scans the slot dir and restores the file whose token list shares the longest prefix with the
++request. The scan covers every `*.bin` there, including the LiteLLM hook's session saves and files pulled from peers.
++Why: Loki on gabesrv06 (qwen38-27b, `--parallel 1`) and gabesrv10 (qwen38-flash, `--parallel 2`), both with
++`--cache-ram 8192`, showed entries of 3.2-7.6 GiB, so a second conversation evicts the first. Both models are
++hybrid-recurrent, so a miss is a full re-prefill: 50K-170K tokens, 8-47 minutes on the 27B, 13.7 minutes on flash
++right after a "making room for prompt cache entry" line.
++
++- Format: the slot save format, unchanged: the `ggsq` header with `LLAMA_STATE_SEQ_VERSION` (4), the serialized
++  token list, the state, then the SCKP checkpoints and the SDFT draft appendix. The RAM entry holds
++  `llama_state_seq_get_data_ext` output, which is `io_magic` + `seq_id` (8 bytes) followed by the same payload
++  `llama_state_seq_save_file` writes, so the spill writes the header and tokens and then the entry minus those 8
++  bytes. The draft context goes to SDFT with an empty speculative state, because the RAM cache keeps none. The save
++  goes through the atomic-save path above, shared with `action=save` (`slot_file_save`). The restore is the
++  `action=restore` path (`slot_file_restore`), so checkpoint-based reuse (patch 0002) works the same on a disk hit.
++  `kvrepl_nstream_convert.py`, the slot-cache gc and the sync treat these files like any other save.
++- Thresholds: prompts under 4096 tokens are neither spilled nor looked up. The disk is looked up before the RAM cache
++  loads anything, and a disk hit must beat both what the slot holds and the best RAM cache entry by 4096 tokens, and
++  must keep at least a quarter of the file (`server_prompt_cache::MIN_KEEP_RATIO`, the RAM cache's own rule). If the
++  restore fails, the RAM cache load runs as if the disk had not been tried (the slot's own state was saved to the RAM
++  cache first). A prompt that a slot file already contains whole is not written again. A file that fails to restore
++  is skipped until its mtime changes, and forgotten once it is deleted. The file name is a hash of the token list; a
++  name taken by a file with other tokens is never overwritten (a `-<n>` suffix is added). One prompt cache pass (slot
++  selection, idle or child slot save) scans the slot dir once, shared by its spills and its lookup.
++- Disk: nothing deletes these files except the slot-cache gc (age cap, size cap, free-space floor). Each spill is as
++  large as the RAM entry (GiBs on the 27B). With `slotCacheReplication` on (gabesrv06 and the gabesrv10 router),
++  spills replicate to the peer like any save.
++- Known ceiling: the spill write (with fsync) and the lookup run synchronously on the server loop, so every slot
++  stalls while a multi-GiB state is written or read. A writer thread would lift this, at the cost of holding one
++  more entry in RAM above `--cache-ram` until the write finishes.
++- Tests: `test_slot_save.py::test_prompt_cache_disk_restores_evicted_prompt` (evicted, oversized and draft-model
++  cases plus a no-disk control; it asserts on `prompt_n`/`cache_n`/`prompt_ms`) and
++  `test_prompt_cache_disk_skips_short_prompts`. Live on Qwen3.5-0.8B (CPU): an evicted 4.8K-token prompt came back
++  as 4 processed tokens in 0.37 s, against 4817 tokens and 11.7 s without the patch. A spill converted to 2 streams
++  by kvrepl was restored by the first request on a fresh `--parallel 2` server. Not yet measured on
++  production-size states (3-8 GiB) or on the fleet's own disks.
++
+ ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+ 
+ - **gpt-oss-20b writes `<|channel|>commentary (analysis)<|message|>`** (2026-09-26):
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d0c63ff5d..2307fe709 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -29,6 +29,10 @@
+ #include <exception>
+ #include <memory>
+ #include <filesystem>
++#include <functional>
++#include <map>
++#include <optional>
++#include <string_view>
+ #include <random>
+ #include <utility>
+ #include <fstream>
+@@ -1731,6 +1735,14 @@ private:
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++
++            if (prompt_cache_disk()) {
++                prompt_cache->on_evict = [this](const server_prompt_cache_state & state) {
++                    prompt_cache_disk_evict(state);
++                };
++                SRV_INF("prompt cache entries of %zu+ tokens evicted from RAM are kept in '%s'\n",
++                        PROMPT_CACHE_DISK_MIN_TOKENS, params_base.slot_save_path.c_str());
++            }
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+@@ -2022,9 +2034,11 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+-                ret->prompt_save(*prompt_cache);
++                const slot_files_pass pass(*this);
+ 
+-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                prompt_cache_save(*ret);
++
++                if (!prompt_cache_disk_load(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+                 }
+ 
+@@ -2800,9 +2814,10 @@ private:
+         // launch all child tasks first
+         size_t idx = 0;
+         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
++        const slot_files_pass pass(*this);
+         for (auto * slot : child_slots) {
+             // keep the state that the child task is about to overwrite
+-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
++            if (prompt_cache && prompt_cache_save(*slot)) {
+                 prompt_cache->update();
+             }
+ 
+@@ -2938,24 +2953,28 @@ private:
+         }
+     }
+ 
+-    // returns false if the appendix could not be written completely
+-    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
++    // the slot-prefixed log line when a helper runs for a live slot, the server form when it has none (a prompt cache spill)
++#define SLT_OR_SRV(lvl, slot, fmt, ...) \
++    do { if ((slot) != nullptr) { SLT_##lvl(*(slot), fmt, __VA_ARGS__); } else { SRV_##lvl(fmt, __VA_ARGS__); } } while (0)
++
++    // returns false if the appendix could not be written completely; slot is only used for logging, may be null
++    bool save_slot_checkpoints(const std::string & filepath, const std::list<common_prompt_checkpoint> & checkpoints, const server_slot * slot, size_t & n_written) const {
+         n_written = 0;
+-        if (slot.prompt.checkpoints.empty()) {
++        if (checkpoints.empty()) {
+             return true;
+         }
+         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+         if (!ofs) {
+-            SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
++            SLT_OR_SRV(WRN, slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
+             return false;
+         }
+         const uint32_t magic   = SLOT_CKPT_MAGIC;
+         const uint32_t version = SLOT_CKPT_VERSION;
+-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
++        const uint32_t count   = (uint32_t) checkpoints.size();
+         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+         ckpt_write(ofs, &version, sizeof(version), n_written);
+         ckpt_write(ofs, &count,   sizeof(count),   n_written);
+-        for (const auto & cur : slot.prompt.checkpoints) {
++        for (const auto & cur : checkpoints) {
+             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
+             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
+             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
+@@ -2965,10 +2984,10 @@ private:
+         }
+         ofs.flush();
+         if (!ofs) {
+-            SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
++            SLT_OR_SRV(WRN, slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+             return false;
+         }
+-        SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
++        SLT_OR_SRV(INF, slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
+                 count, (float) n_written / 1024 / 1024, filepath.c_str());
+         return true;
+     }
+@@ -3037,22 +3056,26 @@ private:
+     static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
+     static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
+ 
+-    // returns false if the draft state could not be written completely
+-    bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+-        n_written = 0;
+-        std::vector<uint8_t> data_dft;
+-        std::vector<uint8_t> data_spec;
++    // the live draft state of a slot: the full draft context and the speculative state
++    void capture_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
++        data_dft.clear();
++        data_spec.clear();
+         if (ctx_dft != nullptr) {
+             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
+         common_speculative_get_state(spec.get(), slot.id, data_spec);
++    }
++
++    // returns false if the draft state could not be written completely; slot is only used for logging, may be null
++    bool save_slot_draft(const std::string & filepath, const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
++        n_written = 0;
+         if (data_dft.empty() && data_spec.empty()) {
+             return true;
+         }
+         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+         if (!ofs) {
+-            SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
++            SLT_OR_SRV(WRN, slot, "failed to append the draft state to '%s'\n", filepath.c_str());
+             return false;
+         }
+         const uint32_t magic   = SLOT_DRAFT_MAGIC;
+@@ -3063,10 +3086,10 @@ private:
+         ckpt_write_buf(ofs, data_spec, n_written);
+         ofs.flush();
+         if (!ofs) {
+-            SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
++            SLT_OR_SRV(WRN, slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
+             return false;
+         }
+-        SLT_INF(slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
++        SLT_OR_SRV(INF, slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
+         return true;
+     }
+ 
+@@ -3113,6 +3136,400 @@ private:
+         return n_read;
+     }
+ 
++    // writes a slot save file: the llama state payload (write_state writes it, header and token list included, to the
++    // path it is given and returns its size, 0 on failure), then the checkpoint and draft appendices
++    // all of it goes to a temp file that is renamed over filepath only once it is on disk, so a failed or interrupted
++    // save keeps the old file; the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
++    // returns the file size, 0 on failure (err says why); slot is only used for logging, null for a prompt cache spill
++    size_t slot_file_save(
++            const std::string & filepath,
++            const server_slot * slot,
++            const std::function<size_t(const std::string &)> & write_state,
++            const std::list<common_prompt_checkpoint> & checkpoints,
++            const std::vector<uint8_t> & data_dft,
++            const std::vector<uint8_t> & data_spec,
++            std::string & err) const {
++        const std::filesystem::path fspath = std::filesystem::u8path(filepath);
++        const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
++        const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
++        const auto fail = [&](const char * msg) -> size_t {
++            std::error_code ec;
++            std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
++            err = msg;
++            return 0;
++        };
++
++        const size_t nwrite = write_state(tmppath);
++        if (nwrite == 0) {
++            return fail("Unable to save slot");
++        }
++
++        size_t nwrite_ckpt = 0;
++        if (!save_slot_checkpoints(tmppath, checkpoints, slot, nwrite_ckpt)) {
++            return fail("Unable to save slot: incomplete context checkpoints");
++        }
++
++        size_t nwrite_dft = 0;
++        if (!save_slot_draft(tmppath, data_dft, data_spec, slot, nwrite_dft)) {
++            return fail("Unable to save slot: incomplete draft state");
++        }
++
++        if (!fsync_path(tmppath)) {
++            SLT_OR_SRV(WRN, slot, "failed to sync '%s'\n", tmppath.c_str());
++            return fail("Unable to save slot: sync failed");
++        }
++        {
++            std::error_code ec;
++            std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
++            if (ec) {
++                SLT_OR_SRV(WRN, slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
++                return fail("Unable to save slot: rename failed");
++            }
++        }
++        // persist the rename itself; the new file is already in place, so a failure is only logged
++        if (!fsync_path(dirpath)) {
++            SLT_OR_SRV(WRN, slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
++        }
++
++        return nwrite + nwrite_ckpt + nwrite_dft;
++    }
++
++    // restores a slot save file into the slot: the llama state, then the checkpoint and draft appendices
++    // returns the bytes read, 0 on failure (err says why, the slot is cleared)
++    size_t slot_file_restore(server_slot & slot, const std::string & filepath, std::string & err) {
++        size_t nread = 0;
++        try {
++            size_t n_packed = 0;
++            llama_tokens packed;
++            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
++            if (nread != 0) {
++                packed.resize(std::max<size_t>(1, n_packed));
++                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
++            }
++            if (nread == 0) {
++                throw std::runtime_error("No available space in KV cache or invalid slot save file");
++            }
++            packed.resize(n_packed);
++
++            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
++
++            if (restored.size() > (size_t) slot.n_ctx) {
++                throw std::runtime_error("Restored prompt does not fit in the slot context");
++            }
++
++            if (!restored.validate(ctx_tgt)) {
++                throw std::runtime_error("Invalid tokens in slot save file");
++            }
++
++            slot.prompt.clear();
++            slot.prompt.tokens = std::move(restored);
++        } catch (const std::exception & e) {
++            slot.prompt_clear();
++            err = e.what();
++            return 0;
++        }
++
++        // nread is the end offset of the llama state payload within the file
++        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
++        const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
++
++        return nread + nread_ckpt + nread_dft;
++    }
++
++    //
++    // prompt cache on disk
++    //
++    // with --slot-save-path, an entry that the RAM prompt cache evicts (or skips as larger than its whole limit) is
++    // written to the slot dir as an ordinary slot save file, and a prompt the RAM cache cannot serve is looked up among
++    // the slot files there. Models that cannot shift or partially reuse their memory (hybrid/recurrent, SWA) re-prefill
++    // the whole prompt on every miss, so one disk round trip of the state is far cheaper than the miss it avoids.
++    // The files use the slot save format and naming of the explicit /slots save, so the slot-dir GC and the cross-node
++    // sync treat them like any other save.
++    //
++    // ponytail: both the write and the lookup run synchronously on the server loop (a multi-GiB state stalls every slot
++    //           for a few seconds); a writer thread that owns the evicted buffer would lift it, at the cost of holding
++    //           one extra entry in RAM above --cache-ram while it writes
++    // ponytail: fixed size threshold; weigh the state bytes against an estimated prefill time if small prompts with
++    //           large states (many checkpoints) turn out to churn the disk
++    static constexpr size_t   PROMPT_CACHE_DISK_MIN_TOKENS = 4096;
++    // must equal the file-local io_magic in src/llama-context.cpp (see FLEET.md, upstream-sync checklist)
++    static constexpr uint32_t LLAMA_STATE_SEQ_IO_MAGIC     = 0xaf143cd8;
++
++    // slot files that failed to restore, with their mtime at the time, so a bad file is not read again on every miss
++    // pruned on every slot dir scan: an entry whose file is gone or was rewritten is dropped
++    std::map<std::string, std::filesystem::file_time_type> prompt_cache_disk_bad;
++
++    bool prompt_cache_disk() const {
++        return prompt_cache && !params_base.slot_save_path.empty();
++    }
++
++    bool prompt_cache_disk_is_bad(const std::string & path) const {
++        return prompt_cache_disk_bad.count(path) > 0;
++    }
++
++    struct slot_file {
++        std::string   path;
++        server_tokens tokens;
++    };
++
++    // the path and the token list of each slot save file in the slot dir (*.bin, no dot-files)
++    // reads only the file header and the token list
++    std::vector<slot_file> slot_files_scan() const {
++        std::vector<slot_file> res;
++        try {
++            for (const auto & ent : std::filesystem::directory_iterator(std::filesystem::u8path(params_base.slot_save_path))) {
++                const std::string name = ent.path().filename().u8string();
++                if (name.empty() || name[0] == '.' || ent.path().extension() != ".bin" || !ent.is_regular_file()) {
++                    continue;
++                }
++                std::ifstream ifs(ent.path(), std::ios::binary | std::ios::ate);
++                const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
++                uint32_t hdr[3] = { 0, 0, 0 }; // magic, version, token count
++                if (file_size < sizeof(hdr) || !ifs.seekg(0) || !ifs.read((char *) hdr, sizeof(hdr)) ||
++                    hdr[0] != LLAMA_STATE_SEQ_MAGIC || hdr[1] != LLAMA_STATE_SEQ_VERSION ||
++                    (size_t) hdr[2] > (file_size - sizeof(hdr)) / sizeof(llama_token)) {
++                    continue;
++                }
++                llama_tokens packed(hdr[2]);
++                if (!ifs.read((char *) packed.data(), packed.size() * sizeof(llama_token))) {
++                    continue;
++                }
++                try {
++                    res.push_back({ ent.path().u8string(), server_tokens::deserialize(packed, mctx != nullptr) });
++                } catch (const std::exception &) {
++                    continue;
++                }
++            }
++        } catch (const std::exception & e) {
++            SRV_WRN("failed to list the slot dir '%s': %s\n", params_base.slot_save_path.c_str(), e.what());
++        }
++        return res;
++    }
++
++    // one prompt cache pass (slot selection, or saving an idle or a child slot) scans the slot dir once: the disk save
++    // checks of every entry it evicts and the disk lookup share that scan; outside a pass every call scans
++    bool                                  slot_files_pass_open = false;
++    std::optional<std::vector<slot_file>> slot_files_cache;
++
++    struct slot_files_pass {
++        server_context_impl & ctx;
++        explicit slot_files_pass(server_context_impl & ctx) : ctx(ctx) {
++            ctx.slot_files_pass_open = true;
++            ctx.slot_files_cache.reset();
++        }
++        ~slot_files_pass() {
++            ctx.slot_files_pass_open = false;
++            ctx.slot_files_cache.reset();
++        }
++    };
++
++    std::vector<slot_file> & slot_files() {
++        if (!slot_files_pass_open || !slot_files_cache) {
++            slot_files_cache = slot_files_scan();
++
++            // forget bad files that were deleted (slot-dir gc) or rewritten since they failed
++            for (auto it = prompt_cache_disk_bad.begin(); it != prompt_cache_disk_bad.end();) {
++                std::error_code ec;
++                const auto mtime = std::filesystem::last_write_time(std::filesystem::u8path(it->first), ec);
++                if (ec || mtime != it->second) {
++                    it = prompt_cache_disk_bad.erase(it);
++                } else {
++                    ++it;
++                }
++            }
++        }
++        return *slot_files_cache;
++    }
++
++    // writes a prompt cache entry to the slot dir, unless a slot file there already holds the whole prompt
++    void prompt_cache_disk_save(
++            const server_tokens & tokens,
++            const std::list<common_prompt_checkpoint> & checkpoints,
++            const std::function<size_t(const std::string &, const std::vector<char> &)> & write_state,
++            const std::vector<uint8_t> & data_dft,
++            const std::vector<uint8_t> & data_spec) {
++        const int64_t t_start = ggml_time_us();
++
++        std::vector<char> packed;
++        try {
++            packed = tokens.serialize();
++        } catch (const std::exception & e) {
++            SRV_WRN("prompt cache: not saved to disk: %s\n", e.what());
++            return;
++        }
++        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
++
++        auto & files = slot_files();
++
++        // a file that failed to restore does not count: the prompt is written again, over it if it has the same name
++        for (const auto & f : files) {
++            if (!prompt_cache_disk_is_bad(f.path) && f.tokens.get_common_prefix(tokens) == tokens.size()) {
++                SRV_INF("prompt cache: '%s' already holds this prompt (%zu tokens), not saved to disk\n", f.path.c_str(), tokens.size());
++                return;
++            }
++        }
++
++        // the name comes from a hash of the token list; a name already taken by a file with other tokens
++        // (a hash collision, or a file not readable as a slot file) is never overwritten, a suffix is added instead
++        const uint64_t hash = std::hash<std::string_view>{}(std::string_view(packed.data(), packed.size()));
++        std::string filepath;
++        for (int i = 0; i < 8 && filepath.empty(); ++i) {
++            char name[64];
++            if (i == 0) {
++                snprintf(name, sizeof(name), "prompt-cache-%016" PRIx64 ".bin", hash);
++            } else {
++                snprintf(name, sizeof(name), "prompt-cache-%016" PRIx64 "-%d.bin", hash, i);
++            }
++            const std::string cand = params_base.slot_save_path + name;
++            std::error_code ec;
++            if (!std::filesystem::exists(std::filesystem::u8path(cand), ec) && !ec) {
++                filepath = cand;
++                break;
++            }
++            for (const auto & f : files) {
++                if (f.path == cand && f.tokens.size() == tokens.size() && f.tokens.get_common_prefix(tokens) == tokens.size()) {
++                    filepath = cand;
++                    break;
++                }
++            }
++        }
++        if (filepath.empty()) {
++            SRV_WRN("prompt cache: no free file name for %zu tokens in '%s', not saved to disk\n", tokens.size(), params_base.slot_save_path.c_str());
++            return;
++        }
++
++        std::string err;
++        const size_t n_bytes = slot_file_save(filepath, nullptr, [&](const std::string & path) { return write_state(path, packed); },
++                checkpoints, data_dft, data_spec, err);
++        if (n_bytes == 0) {
++            SRV_WRN("prompt cache: failed to save %zu tokens to '%s': %s\n", tokens.size(), filepath.c_str(), err.c_str());
++            return;
++        }
++
++        // keep the shared scan current: the next save check or the lookup of this pass sees the new file
++        const auto it = std::find_if(files.begin(), files.end(), [&](const slot_file & f) { return f.path == filepath; });
++        if (it != files.end()) {
++            it->tokens = tokens.clone();
++        } else {
++            files.push_back({ filepath, tokens.clone() });
++        }
++        prompt_cache_disk_bad.erase(filepath);
++
++        SRV_INF("prompt cache: saved %zu tokens to '%s' (%.3f MiB, %.2f ms)\n",
++                tokens.size(), filepath.c_str(), n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
++    }
++
++    // an entry the RAM prompt cache evicts
++    void prompt_cache_disk_evict(const server_prompt_cache_state & state) {
++        const auto & main = state.data.main;
++        if (state.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS || main.size() <= 8) {
++            return;
++        }
++
++        // the entry holds llama_state_seq_get_data_ext output: io_magic(u32) seq_id(i32), then the same payload
++        // llama_state_seq_save_file writes after its own header and token list
++        uint32_t magic = 0;
++        memcpy(&magic, main.data(), sizeof(magic));
++        if (magic != LLAMA_STATE_SEQ_IO_MAGIC) {
++            SRV_WRN("prompt cache: unexpected state layout (magic %08x), not saved to disk\n", magic);
++            return;
++        }
++
++        const auto write_state = [&](const std::string & path, const std::vector<char> & packed) -> size_t {
++            const uint32_t hdr[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) (packed.size() / sizeof(llama_token)) };
++            std::ofstream ofs(std::filesystem::u8path(path), std::ios::binary | std::ios::trunc);
++            ofs.write((const char *) hdr, sizeof(hdr));
++            ofs.write(packed.data(), packed.size());
++            ofs.write((const char *) main.data() + 8, main.size() - 8);
++            ofs.flush();
++            return ofs ? sizeof(hdr) + packed.size() + main.size() - 8 : 0;
++        };
++
++        // the RAM cache keeps no speculative state, only the draft context
++        prompt_cache_disk_save(state.prompt.tokens, state.prompt.checkpoints, write_state, state.data.drft, {});
++    }
++
++    // saves the slot to the RAM prompt cache; a state the cache skips as larger than its whole limit goes to disk instead
++    bool prompt_cache_save(server_slot & slot) {
++        if (slot.prompt_save(*prompt_cache)) {
++            return true;
++        }
++
++        if (!prompt_cache_disk() || prompt_cache->limit_size == 0 || slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
++            return false;
++        }
++
++        size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        if (ctx_dft != nullptr) {
++            size += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        }
++        for (const auto & ckpt : slot.prompt.checkpoints) {
++            size += ckpt.size();
++        }
++        if (size <= prompt_cache->limit_size) {
++            return false; // skipped for another reason, e.g. already in the cache
++        }
++
++        std::vector<uint8_t> data_dft;
++        std::vector<uint8_t> data_spec;
++        capture_slot_draft(slot, data_dft, data_spec);
++
++        prompt_cache_disk_save(slot.prompt.tokens, slot.prompt.checkpoints, [&](const std::string & path, const std::vector<char> & packed) {
++            GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
++            return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot.id,
++                    reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
++        }, data_dft, data_spec);
++
++        return false;
++    }
++
++    // before the RAM prompt cache loads anything: restore the slot file that shares the longest prefix with the new
++    // prompt, when it beats both what the slot holds and the best RAM cache entry by PROMPT_CACHE_DISK_MIN_TOKENS
++    // returns true if the slot now holds the file; on false the slot and the RAM cache are untouched, except that a
++    // failed restore leaves the slot empty - its state is in the RAM cache (prompt_cache_save ran first), so the
++    // caller's RAM cache load gives the same result as if the disk had not been tried
++    bool prompt_cache_disk_load(server_slot & slot, const server_tokens & tokens) {
++        if (!prompt_cache_disk() || tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
++            return false;
++        }
++
++        const int64_t t_start = ggml_time_us();
++
++        const size_t lcp_slot = slot.prompt.tokens.get_common_prefix(tokens);
++        const size_t lcp_ram  = std::max(lcp_slot, prompt_cache->lcp_best(tokens));
++
++        std::string path_best;
++        size_t lcp_best   = 0;
++        size_t n_tok_best = 0;
++        for (const auto & f : slot_files()) {
++            const size_t lcp = f.tokens.get_common_prefix(tokens);
++            if (lcp < lcp_ram + PROMPT_CACHE_DISK_MIN_TOKENS || lcp <= lcp_best ||
++                !server_prompt_cache::keeps_enough(lcp, f.tokens.size()) || prompt_cache_disk_is_bad(f.path)) {
++                continue;
++            }
++            path_best  = f.path;
++            lcp_best   = lcp;
++            n_tok_best = f.tokens.size();
++        }
++
++        if (path_best.empty()) {
++            return false;
++        }
++
++        std::string err;
++        const size_t n_bytes = slot_file_restore(slot, path_best, err);
++        if (n_bytes == 0) {
++            std::error_code ec;
++            prompt_cache_disk_bad[path_best] = std::filesystem::last_write_time(std::filesystem::u8path(path_best), ec);
++            SLT_WRN(slot, "prompt cache: failed to restore '%s', skipped from now on: %s\n", path_best.c_str(), err.c_str());
++            return false;
++        }
++
++        SLT_INF(slot, "prompt cache: restored %zu tokens from '%s' (%zu of %zu prompt tokens reusable, slot and RAM cache had %zu; %.3f MiB, %.2f ms)\n",
++                n_tok_best, path_best.c_str(), lcp_best, tokens.size(), lcp_ram, n_bytes / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
++        return true;
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -3184,11 +3601,12 @@ private:
+                     }
+ 
+                     if (params_base.cache_idle_slots) {
++                        const slot_files_pass pass(*this);
+                         for (auto & slot : slots) {
+                             if (!slot.is_processing()) {
+                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+ 
+-                                if (slot.prompt_save(*prompt_cache)) {
++                                if (prompt_cache_save(slot)) {
+                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                     prompt_cache->update();
+                                 }
+@@ -3340,57 +3758,21 @@ private:
+                         break;
+                     }
+ 
+-                    // write the state, the checkpoints and the draft state to a temp file and rename it over
+-                    // filepath only once all of it is on disk, so a failed or interrupted save keeps the old file
+-                    // the temp is a dot-file (<dir>/.<name>.tmp), so tools that list or sync the slot dir skip it
+-                    const std::filesystem::path fspath = std::filesystem::u8path(filepath);
+-                    const std::string dirpath = fspath.has_parent_path() ? fspath.parent_path().u8string() : std::string(".");
+-                    const std::string tmppath = (fspath.parent_path() / std::filesystem::u8path("." + fspath.filename().u8string() + ".tmp")).u8string();
+-                    const auto fail = [&](const char * msg) {
+-                        std::error_code ec;
+-                        std::filesystem::remove(std::filesystem::u8path(tmppath), ec);
+-                        send_error(task, msg, ERROR_TYPE_SERVER);
+-                    };
+-
+                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+-                    const size_t nwrite = llama_state_seq_save_file(
+-                        ctx_tgt, tmppath.c_str(), slot->id,
+-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+-                    if (nwrite == 0) {
+-                        fail("Unable to save slot");
+-                        break;
+-                    }
+-
+-                    size_t nwrite_ckpt = 0;
+-                    if (!save_slot_checkpoints(tmppath, *slot, nwrite_ckpt)) {
+-                        fail("Unable to save slot: incomplete context checkpoints");
+-                        break;
+-                    }
+-
+-                    size_t nwrite_dft = 0;
+-                    if (!save_slot_draft(tmppath, *slot, nwrite_dft)) {
+-                        fail("Unable to save slot: incomplete draft state");
+-                        break;
+-                    }
+ 
+-                    if (!fsync_path(tmppath)) {
+-                        SLT_WRN(*slot, "failed to sync '%s'\n", tmppath.c_str());
+-                        fail("Unable to save slot: sync failed");
++                    std::vector<uint8_t> data_dft;
++                    std::vector<uint8_t> data_spec;
++                    capture_slot_draft(*slot, data_dft, data_spec);
++
++                    std::string err;
++                    const size_t n_bytes = slot_file_save(filepath, slot, [&](const std::string & path) {
++                        return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot->id,
++                                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
++                    }, slot->prompt.checkpoints, data_dft, data_spec, err);
++                    if (n_bytes == 0) {
++                        send_error(task, err, ERROR_TYPE_SERVER);
+                         break;
+                     }
+-                    {
+-                        std::error_code ec;
+-                        std::filesystem::rename(std::filesystem::u8path(tmppath), std::filesystem::u8path(filepath), ec);
+-                        if (ec) {
+-                            SLT_WRN(*slot, "failed to rename '%s' to '%s': %s\n", tmppath.c_str(), filepath.c_str(), ec.message().c_str());
+-                            fail("Unable to save slot: rename failed");
+-                            break;
+-                        }
+-                    }
+-                    // persist the rename itself; the new file is already in place, so a failure is only logged
+-                    if (!fsync_path(dirpath)) {
+-                        SLT_WRN(*slot, "failed to sync directory '%s' after saving '%s'\n", dirpath.c_str(), filepath.c_str());
+-                    }
+ 
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+@@ -3401,7 +3783,7 @@ private:
+                     res->filename = filename;
+                     res->is_save  = true;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
++                    res->n_bytes  = n_bytes;
+                     res->t_ms     = t_save_ms;
+ 
+                     // Make an otherwise-indistinguishable empty save legible: a slot whose
+@@ -3442,43 +3824,13 @@ private:
+                     std::string filename = task.slot_action.filename;
+                     std::string filepath = task.slot_action.filepath;
+ 
+-                    size_t nread = 0;
+-                    try {
+-                        size_t n_packed = 0;
+-                        llama_tokens packed;
+-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+-                        if (nread != 0) {
+-                            packed.resize(std::max<size_t>(1, n_packed));
+-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+-                        }
+-                        if (nread == 0) {
+-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
+-                        }
+-                        packed.resize(n_packed);
+-
+-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+-
+-                        if (restored.size() > (size_t) slot->n_ctx) {
+-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+-                        }
+-
+-                        if (!restored.validate(ctx_tgt)) {
+-                            throw std::runtime_error("Invalid tokens in slot save file");
+-                        }
+-
+-                        slot->prompt.clear();
+-                        slot->prompt.tokens = std::move(restored);
+-
+-                    } catch (const std::exception & err) {
+-                        slot->prompt_clear();
+-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
++                    std::string err;
++                    const size_t n_bytes = slot_file_restore(*slot, filepath, err);
++                    if (n_bytes == 0) {
++                        send_error(task, "Unable to restore slot: " + err, ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
+ 
+-                    // nread is the end offset of the llama state payload within the file
+-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
+-
+                     const int64_t t_end = ggml_time_us();
+                     const double t_restore_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -3488,7 +3840,7 @@ private:
+                     res->filename = filename;
+                     res->is_save  = false;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
++                    res->n_bytes  = n_bytes;
+                     res->t_ms     = t_restore_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index fff31e4d5..98f0d02a5 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1839,6 +1839,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
++            if (on_evict) {
++                on_evict(states.front());
++            }
+             states.pop_front();
+         }
+     }
+@@ -1896,7 +1899,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+ 
+         // don't trash large prompts
+-        if (f_keep_cur < 0.25f) {
++        if (!keeps_enough(lcp_cur, it->prompt.tokens.size())) {
+             continue;
+         }
+ 
+@@ -1953,11 +1956,25 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+     return true;
+ }
+ 
++size_t server_prompt_cache::lcp_best(const server_tokens & tokens_new) const {
++    size_t res = 0;
++    for (const auto & state : states) {
++        const size_t lcp = state.prompt.tokens.get_common_prefix(tokens_new);
++        if (keeps_enough(lcp, state.prompt.tokens.size())) {
++            res = std::max(res, lcp);
++        }
++    }
++    return res;
++}
++
+ void server_prompt_cache::update() {
+     if (limit_size > 0) {
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
++            if (on_evict) {
++                on_evict(states.front());
++            }
+             states.pop_front();
+         }
+     }
+@@ -1973,6 +1990,9 @@ void server_prompt_cache::update() {
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
++            if (on_evict) {
++                on_evict(states.front());
++            }
+             states.pop_front();
+         }
+     }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index a95bf1fd4..e89cb9335 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -3,6 +3,7 @@
+ #include "common.h"
+ #include "llama.h"
+ 
++#include <functional>
+ #include <string>
+ #include <unordered_set>
+ #include <list>
+@@ -729,6 +730,18 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // (optional) called with each entry the size or token limit evicts, right before it is freed
++    std::function<void(const server_prompt_cache_state &)> on_evict;
++
++    // a cached prompt is only loaded if the new prompt keeps at least this share of it (don't trash large prompts);
++    // the slot-dir lookup in server-context.cpp applies the same rule
++    static constexpr float MIN_KEEP_RATIO = 0.25f;
++
++    // true if the new prompt keeps enough of a cached prompt with n_cached tokens, of which lcp are common
++    static bool keeps_enough(size_t lcp, size_t n_cached) {
++        return n_cached > 0 && float(lcp) >= MIN_KEEP_RATIO * float(n_cached);
++    }
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
+@@ -737,6 +750,9 @@ struct server_prompt_cache {
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
++    // the longest common prefix with tokens_new among the entries load() would consider, 0 if none
++    size_t lcp_best(const server_tokens & tokens_new) const;
++
+     void update();
+ };
+ 
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 4830887fd..dbcdffde0 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -2,6 +2,7 @@ import pytest
+ from utils import *
+ import base64
+ import requests
++import shutil
+ import struct
+ import threading
+ 
+@@ -1189,3 +1190,145 @@ def test_prompt_cache_swa_window(swa_window_server):
+ 
+     assert cached["cache_n"]  == direct["cache_n"]
+     assert cached["prompt_n"] == direct["prompt_n"]
++
++
++# the RAM prompt cache spills an evicted entry to the slot dir, and a later miss restores it from there
++# instead of re-processing the whole prompt. tinygemma3 with a small SWA window stands in for the fleet's
++# hybrid/recurrent models: it cannot reuse a partial memory either, so a miss is a full re-prefill
++PROMPT_CACHE_DISK_MIN_TOKENS = 4096  # server-context.cpp
++
++
++def disk_cache_server(slot_save_path, cache_ram=20):
++    srv = ServerPreset.tinygemma3()
++    srv.override_kv = "gemma3.attention.sliding_window=int:64"
++    srv.slot_save_path = slot_save_path
++    srv.temperature = 0.0
++    srv.n_predict = 4
++    srv.n_slots = 1
++    srv.n_ctx = 8192
++    # an entry for long_prompt() is ~13 MiB: 20 MiB holds one, so the next one evicts it;
++    # 1 MiB holds none, so the RAM cache skips every entry as too large
++    srv.cache_ram = cache_ram
++    return srv
++
++
++def long_prompt(i):
++    return f"Story {i}. " + f"The quick brown fox number {i} jumps over the lazy dog. " * 400
++
++
++def timed_completion(srv, prompt):
++    t0 = time.perf_counter()
++    res = srv.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True})
++    assert res.status_code == 200
++    return res.body["timings"], time.perf_counter() - t0
++
++
++def spill_files(path):
++    return sorted(f for f in os.listdir(path) if f.startswith("prompt-cache-") and f.endswith(".bin"))
++
++
++# cache_ram=-1: no size limit, so only the token limit (n_ctx) evicts
++@pytest.mark.parametrize("with_disk,cache_ram,draft", [(True, 20, False), (True, 1, False), (True, -1, False), (True, 40, True), (False, 20, False)])
++def test_prompt_cache_disk_restores_evicted_prompt(tmp_path, with_disk, cache_ram, draft):
++    srv = disk_cache_server(str(tmp_path) if with_disk else None, cache_ram)
++    if draft:
++        # the entry then also holds the draft context, written as the draft appendix
++        srv.model_draft_hf_repo = srv.model_hf_repo
++        srv.spec_type = "draft-simple"
++    srv.start()
++
++    cold, cold_s = timed_completion(srv, long_prompt(0))
++    assert cold["prompt_n"] >= PROMPT_CACHE_DISK_MIN_TOKENS
++    # other prompts, so the RAM cache evicts the first one
++    for i in range(1, 4):
++        timed_completion(srv, long_prompt(i))
++
++    again, again_s = timed_completion(srv, long_prompt(0))
++    print(f"with_disk={with_disk} cache_ram={cache_ram}: cold prompt_n={cold['prompt_n']} prompt_ms={cold['prompt_ms']:.1f} wall={cold_s:.3f}s; "
++          f"again prompt_n={again['prompt_n']} cache_n={again['cache_n']} prompt_ms={again['prompt_ms']:.1f} wall={again_s:.3f}s")
++
++    if not with_disk:
++        # evicted and gone: the whole prompt is processed again
++        assert again["prompt_n"] >= cold["prompt_n"] - 64
++        return
++
++    # restored from disk: only the tail of the prompt is processed
++    assert again["cache_n"] >= cold["prompt_n"] - 64
++    assert again["prompt_n"] <= 64
++    assert again["prompt_ms"] < cold["prompt_ms"] / 4
++
++    # the spilled files are ordinary slot save files: the explicit restore endpoint reads them too
++    files = spill_files(tmp_path)
++    assert len(files) >= 3
++    for f in files:
++        res = srv.make_request("POST", "/slots/0?action=restore", data={"filename": f})
++        assert res.status_code == 200
++        assert res.body["n_read"] == os.path.getsize(tmp_path / f)
++
++
++# a short prompt is not worth a disk round trip
++def test_prompt_cache_disk_skips_short_prompts(tmp_path):
++    srv = disk_cache_server(str(tmp_path))
++    srv.start()
++    for i in range(6):
++        res = srv.make_request("POST", "/completion", data={"prompt": f"Story {i}. " + "Once upon a time " * 20, "cache_prompt": True})
++        assert res.status_code == 200
++    assert spill_files(tmp_path) == []
++
++
++# a disk file that fails to restore must not cost the request what the RAM cache would have given it
++def test_prompt_cache_disk_failed_restore_keeps_ram_hit(tmp_path):
++    srv = disk_cache_server(str(tmp_path))
++    srv.n_ctx = 16384
++    srv.start()
++
++    short = long_prompt(0)
++    full  = short + "Chapter two. " + "A slow green turtle number 7 walks under the busy bridge. " * 400
++
++    # a slot file for the full prompt, with its token list intact and its state cut short
++    res = timed_completion(srv, full)[0]
++    assert res["prompt_n"] - len(srv.make_request("POST", "/tokenize", data={"content": short}).body["tokens"]) > PROMPT_CACHE_DISK_MIN_TOKENS + 64
++    res = srv.make_request("POST", "/slots/0?action=save", data={"filename": "broken.bin"})
++    assert res.status_code == 200
++    broken = tmp_path / "broken.bin"
++    size = os.path.getsize(broken)
++    with open(broken, "r+b") as f:
++        f.truncate(size // 2)
++
++    # the RAM cache then holds the short prompt (a ~13 MiB entry; the full one does not fit in 20 MiB)
++    short_res = timed_completion(srv, short)[0]
++    timed_completion(srv, "Once upon a time " * 20)
++
++    # the broken file beats the RAM entry by more than PROMPT_CACHE_DISK_MIN_TOKENS, so it is tried first and fails;
++    # the request must still reuse the RAM entry, not start from an empty slot
++    again = timed_completion(srv, full)[0]
++    print(f"short prompt_n={short_res['prompt_n']} cache_n={short_res['cache_n']}; again prompt_n={again['prompt_n']} cache_n={again['cache_n']}")
++    assert again["cache_n"] >= short_res["prompt_n"] + short_res["cache_n"] - 64
++
++    # a later request does not try the broken file again
++    again2 = timed_completion(srv, full)[0]
++    assert again2["cache_n"] >= again["prompt_n"] + again["cache_n"] - 64
++
++
++# a spill never overwrites a file that holds another prompt under the name it would use
++def test_prompt_cache_disk_name_taken_by_other_prompt(tmp_path):
++    srv = disk_cache_server(str(tmp_path))
++    srv.start()
++    for i in range(4):
++        timed_completion(srv, long_prompt(i))
++    # prompts 0 and 1 were evicted and spilled, in that order
++    files = sorted(spill_files(tmp_path), key=lambda f: os.path.getmtime(tmp_path / f))
++    assert len(files) == 2
++    name_0, name_1 = files
++    # the name of prompt 0 now holds prompt 1
++    shutil.copyfile(tmp_path / name_1, tmp_path / name_0)
++    with open(tmp_path / name_0, "rb") as f:
++        taken = f.read()
++
++    # prompt 0 is not on disk any more: it is processed again, then evicted and spilled again
++    for i in [0, 4, 5]:
++        timed_completion(srv, long_prompt(i))
++
++    with open(tmp_path / name_0, "rb") as f:
++        assert f.read() == taken
++    assert name_0.removesuffix(".bin") + "-1.bin" in spill_files(tmp_path)
+-- 
+2.43.0
+

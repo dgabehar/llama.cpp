@@ -374,12 +374,14 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0340 | `90f0e772f` | k2-horizon: end the reasoning only at a real call start, not a bare call tag |
 | 0341 | `a6a56f6a9` | server: add --spec-grammar to draft for grammar-constrained requests |
 | 0342 | `ae33b89b0` | server: draft for grammar-constrained requests by default (--spec-grammar on) |
+| 0343 | `3d5f8253c` | server: keep evicted prompt cache entries in the slot dir and restore them on a miss |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
-This mirror was regenerated on 2026-11-03 (342 patches; no manual upstream merge yet --
+This mirror was regenerated on 2026-11-03 (343 patches, extended the same day with the
+disk-backed prompt-cache spill/restore fix, PR #32; no manual upstream merge yet --
 that is tracked separately, fleet-patches is 999 commits behind `upstream/master` as of
 this regen). Patch numbers changed from the previous table; refer to patches by subject.
 
