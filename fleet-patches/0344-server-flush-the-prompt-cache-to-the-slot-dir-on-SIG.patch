@@ -1,0 +1,170 @@
+From 5c97dad6eb8d4059ff5b695b18d7382046bb77e1 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 3 Nov 2026 18:52:33 -0600
+Subject: [PATCH] server: flush the prompt cache to the slot dir on
+ SIGTERM/SIGINT
+
+A restart only unblocked start_loop(), it never saved anything: the disk
+spill added in 3d5f8253c only writes an entry the RAM cache evicts while
+the process is still running, so a process kill (deploy, canary, crash)
+lost every slot's prompt and every un-evicted RAM cache entry outright.
+Confirmed live on Flash: two back-to-back restarts for a fleet bump wiped
+an in-flight session, and the next request did a full cold prefill despite
+the spill/restore feature already being deployed.
+
+flush_prompt_cache_to_disk() runs once, in the main thread, right after
+start_loop() unblocks and before clean_up() frees the llama_context: it
+writes every slot's current prompt unconditionally (prompt_cache_save()
+alone skips a slot that still fits the RAM cache limit, which is wrong on
+a shutdown where the RAM cache is about to disappear too) and every
+RAM-only server_prompt_cache::states entry, reusing the existing
+prompt_cache_disk_save/prompt_cache_disk_evict machinery.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017sSZuR9eJNhevyxfnUgkAf
+---
+ FLEET.md                                  | 12 ++++++++
+ tools/server/server-context.cpp           | 34 +++++++++++++++++++++++
+ tools/server/server-context.h             |  5 ++++
+ tools/server/server.cpp                   |  5 ++++
+ tools/server/tests/unit/test_slot_save.py | 20 +++++++++++++
+ 5 files changed, 76 insertions(+)
+
+diff --git a/FLEET.md b/FLEET.md
+index c052606f7..46c9be3fd 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -921,6 +921,18 @@ right after a "making room for prompt cache entry" line.
+   as 4 processed tokens in 0.37 s, against 4817 tokens and 11.7 s without the patch. A spill converted to 2 streams
+   by kvrepl was restored by the first request on a fresh `--parallel 2` server. Not yet measured on
+   production-size states (3-8 GiB) or on the fleet's own disks.
++- SIGTERM flush (added 2026-11-03): without it, a restart (deploy, canary, crash) lost whatever the RAM cache had
++  not yet evicted, since eviction is the only thing that spilled to disk and a process kill saves nothing. Flash
++  hit this live: two back-to-back restarts for a fleet bump wiped an in-flight OpenCode session's RAM entry, and
++  the next request did a full cold prefill despite the spill/restore feature being deployed. `server_context::flush_prompt_cache_to_disk()`
++  (`server-context.h`/`.cpp`) runs once, in the main thread, right after `start_loop()` unblocks and before
++  `clean_up()` frees the llama_context (`server.cpp`): it writes every slot's current prompt (>=4096 tokens,
++  unconditionally, unlike `prompt_cache_save()` which skips a slot that still fits the RAM cache limit) and every
++  RAM-only `server_prompt_cache::states` entry (already serialized, no live context needed) to the slot dir, reusing
++  `prompt_cache_disk_save`/`prompt_cache_disk_evict`. SIGKILL (double Ctrl-C, OOM kill) still loses everything; only
++  SIGTERM/SIGINT run the main thread far enough to reach this. Test: `test_slot_save.py::test_prompt_cache_disk_flushes_on_sigterm`
++  (cache_ram=-1 so the RAM cache never evicts on its own; asserts no spill file exists before `srv.stop()` and
++  exactly one exists after, then that a restart restores it from disk).
+ 
+ ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2307fe709..1c6971812 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3483,6 +3483,36 @@ private:
+         return false;
+     }
+ 
++    // on shutdown: a slot's prompt is only in the RAM cache or in llama_context, both gone once the process
++    // exits, so write every slot's current prompt and every RAM cache entry to disk now, unconditionally
++    // (prompt_cache_save() above skips a slot that still fits the RAM cache limit; that is wrong here)
++    void flush_prompt_cache_to_disk() {
++        if (!prompt_cache_disk()) {
++            return;
++        }
++
++        for (auto & slot : slots) {
++            if (slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
++                continue;
++            }
++
++            std::vector<uint8_t> data_dft;
++            std::vector<uint8_t> data_spec;
++            capture_slot_draft(slot, data_dft, data_spec);
++
++            prompt_cache_disk_save(slot.prompt.tokens, slot.prompt.checkpoints, [&](const std::string & path, const std::vector<char> & packed) {
++                GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
++                return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot.id,
++                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
++            }, data_dft, data_spec);
++        }
++
++        // the RAM cache already holds each entry as serialized state (no live context needed to write it)
++        for (auto & state : prompt_cache->states) {
++            prompt_cache_disk_evict(state);
++        }
++    }
++
+     // before the RAM prompt cache loads anything: restore the slot file that shares the longest prefix with the new
+     // prompt, when it beats both what the slot holds and the best RAM cache entry by PROMPT_CACHE_DISK_MIN_TOKENS
+     // returns true if the slot now holds the file; on false the slot and the RAM cache are untouched, except that a
+@@ -5836,6 +5866,10 @@ void server_context::terminate() {
+     impl->queue_tasks.terminate();
+ }
+ 
++void server_context::flush_prompt_cache_to_disk() {
++    impl->flush_prompt_cache_to_disk();
++}
++
+ llama_context * server_context::get_llama_context() const {
+     return impl->ctx_tgt;
+ }
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 4a8e327fc..e8dba94c9 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -101,6 +101,11 @@ struct server_context {
+     // terminate main loop (will unblock start_loop)
+     void terminate();
+ 
++    // write every active slot's prompt, and every RAM-only prompt cache entry, to the slot dir
++    // call after start_loop() returns and before the llama_context is freed, so a restart does not
++    // lose what the RAM cache would otherwise keep in memory until it is evicted
++    void flush_prompt_cache_to_disk();
++
+     // get the underlaying llama_context, can return nullptr if sleeping
+     // not thread-safe, should only be used from the main thread
+     llama_context * get_llama_context() const;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index ce44405b8..c7de55322 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -579,6 +579,11 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+         // this call blocks the main thread until queue_tasks.terminate() is called
+         ctx_server.start_loop();
+ 
++        // the main thread, before the llama_context goes away with clean_up(): a SIGTERM only unblocked
++        // start_loop(), it did not save anything, so without this a restart loses every active slot's
++        // prompt that the RAM cache has not evicted yet
++        ctx_server.flush_prompt_cache_to_disk();
++
+         clean_up();
+         ctx_http.join();
+         if (monitor_thread.joinable()) {
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index dbcdffde0..1ca022d8f 100644
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -1332,3 +1332,23 @@ def test_prompt_cache_disk_name_taken_by_other_prompt(tmp_path):
+     with open(tmp_path / name_0, "rb") as f:
+         assert f.read() == taken
+     assert name_0.removesuffix(".bin") + "-1.bin" in spill_files(tmp_path)
++
++
++# SIGTERM must flush the RAM-only prompt cache to disk, not just an entry the cache already evicted: with no size
++# limit the RAM cache never evicts, so without the flush a restart would lose this prompt entirely
++def test_prompt_cache_disk_flushes_on_sigterm(tmp_path):
++    srv = disk_cache_server(str(tmp_path), cache_ram=-1)
++    srv.start()
++
++    cold = timed_completion(srv, long_prompt(0))[0]
++    assert cold["prompt_n"] >= PROMPT_CACHE_DISK_MIN_TOKENS
++    assert spill_files(tmp_path) == []  # still only in RAM, not evicted
++
++    srv.stop()
++    files = spill_files(tmp_path)
++    assert len(files) == 1
++
++    srv.start()
++    again = timed_completion(srv, long_prompt(0))[0]
++    assert again["cache_n"] >= cold["prompt_n"] - 64
++    assert again["prompt_n"] <= 64
+-- 
+2.43.0
+
