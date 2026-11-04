@@ -101,6 +101,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // write every active slot's prompt, and every RAM-only prompt cache entry, to the slot dir
+    // call after start_loop() returns and before the llama_context is freed, so a restart does not
+    // lose what the RAM cache would otherwise keep in memory until it is evicted
+    void flush_prompt_cache_to_disk();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

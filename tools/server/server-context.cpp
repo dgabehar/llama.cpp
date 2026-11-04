@@ -3483,6 +3483,45 @@ private:
         return false;
     }
 
+    // on shutdown: a slot's prompt is only in the RAM cache or in llama_context, both gone once the process
+    // exits, so write every slot's current prompt and every RAM cache entry to disk now, unconditionally
+    // (prompt_cache_save() above skips a slot that still fits the RAM cache limit; that is wrong here)
+    void flush_prompt_cache_to_disk() {
+        // sleeping (--sleep-idle-seconds) frees ctx_tgt and the model but leaves stale tokens on the slots;
+        // nothing here is safe to call without a live context, and nothing needs saving while asleep anyway
+        // (a wake-up re-processes from the slot's own leftover tokens the same way a restart would, so the
+        // cache miss cost is already accepted for this path)
+        if (!prompt_cache_disk() || ctx_tgt == nullptr) {
+            return;
+        }
+
+        // one scan of the slot dir for every save below, like every other multi-save call site
+        const slot_files_pass pass(*this);
+
+        for (auto & slot : slots) {
+            // a slot mid-generation or mid-chunked-prefill is never touched elsewhere either (TAG_IDLE_SLOT_CLEAR,
+            // the update_cache guard above): its prompt is incomplete and its own next request will redo it
+            if (slot.is_processing() || slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
+                continue;
+            }
+
+            std::vector<uint8_t> data_dft;
+            std::vector<uint8_t> data_spec;
+            capture_slot_draft(slot, data_dft, data_spec);
+
+            prompt_cache_disk_save(slot.prompt.tokens, slot.prompt.checkpoints, [&](const std::string & path, const std::vector<char> & packed) {
+                GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                return llama_state_seq_save_file(ctx_tgt, path.c_str(), slot.id,
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+            }, data_dft, data_spec);
+        }
+
+        // the RAM cache already holds each entry as serialized state (no live context needed to write it)
+        for (auto & state : prompt_cache->states) {
+            prompt_cache_disk_evict(state);
+        }
+    }
+
     // before the RAM prompt cache loads anything: restore the slot file that shares the longest prefix with the new
     // prompt, when it beats both what the slot holds and the best RAM cache entry by PROMPT_CACHE_DISK_MIN_TOKENS
     // returns true if the slot now holds the file; on false the slot and the RAM cache are untouched, except that a
@@ -5834,6 +5873,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_prompt_cache_to_disk() {
+    impl->flush_prompt_cache_to_disk();
 }
 
 llama_context * server_context::get_llama_context() const {

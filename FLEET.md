@@ -921,6 +921,23 @@ right after a "making room for prompt cache entry" line.
   as 4 processed tokens in 0.37 s, against 4817 tokens and 11.7 s without the patch. A spill converted to 2 streams
   by kvrepl was restored by the first request on a fresh `--parallel 2` server. Not yet measured on
   production-size states (3-8 GiB) or on the fleet's own disks.
+- SIGTERM flush (added 2026-11-03): without it, a restart (deploy, canary, crash) lost whatever the RAM cache had
+  not yet evicted, since eviction is the only thing that spilled to disk and a process kill saves nothing. Flash
+  hit this live: two back-to-back restarts for a fleet bump wiped an in-flight OpenCode session's RAM entry, and
+  the next request did a full cold prefill despite the spill/restore feature being deployed. `server_context::flush_prompt_cache_to_disk()`
+  (`server-context.h`/`.cpp`) runs once, in the main thread, right after `start_loop()` unblocks and before
+  `clean_up()` frees the llama_context (`server.cpp`): it writes every slot's current prompt (>=4096 tokens,
+  unconditionally, unlike `prompt_cache_save()` which skips a slot that still fits the RAM cache limit) and every
+  RAM-only `server_prompt_cache::states` entry (already serialized, no live context needed) to the slot dir, reusing
+  `prompt_cache_disk_save`/`prompt_cache_disk_evict`. SIGKILL (double Ctrl-C, OOM kill) still loses everything; only
+  SIGTERM/SIGINT run the main thread far enough to reach this. Test: `test_slot_save.py::test_prompt_cache_disk_flushes_on_sigterm`
+  (cache_ram=-1 so the RAM cache never evicts on its own; asserts no spill file exists before `srv.stop()` and
+  exactly one exists after, then that a restart restores it from disk). Skips a slot that is `is_processing()`
+  (mid-generation or mid-chunked-prefill, same as the `update_cache` guard elsewhere: its prompt is incomplete and
+  its own next request redoes it) and skips entirely when `ctx_tgt == nullptr` (`--sleep-idle-seconds`: sleeping
+  frees the context and the model but leaves stale tokens on the slots; `llama_state_seq_save_file` would otherwise
+  be called on a null context). Wrapped in one `slot_files_pass` so the multi-save does one directory scan, not one
+  per slot/state.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 

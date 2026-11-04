@@ -579,6 +579,11 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
+        // the main thread, before the llama_context goes away with clean_up(): a SIGTERM only unblocked
+        // start_loop(), it did not save anything, so without this a restart loses every active slot's
+        // prompt that the RAM cache has not evicted yet
+        ctx_server.flush_prompt_cache_to_disk();
+
         clean_up();
         ctx_http.join();
         if (monitor_thread.joinable()) {
