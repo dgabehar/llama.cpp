@@ -1332,3 +1332,23 @@ def test_prompt_cache_disk_name_taken_by_other_prompt(tmp_path):
     with open(tmp_path / name_0, "rb") as f:
         assert f.read() == taken
     assert name_0.removesuffix(".bin") + "-1.bin" in spill_files(tmp_path)
+
+
+# SIGTERM must flush the RAM-only prompt cache to disk, not just an entry the cache already evicted: with no size
+# limit the RAM cache never evicts, so without the flush a restart would lose this prompt entirely
+def test_prompt_cache_disk_flushes_on_sigterm(tmp_path):
+    srv = disk_cache_server(str(tmp_path), cache_ram=-1)
+    srv.start()
+
+    cold = timed_completion(srv, long_prompt(0))[0]
+    assert cold["prompt_n"] >= PROMPT_CACHE_DISK_MIN_TOKENS
+    assert spill_files(tmp_path) == []  # still only in RAM, not evicted
+
+    srv.stop()
+    files = spill_files(tmp_path)
+    assert len(files) == 1
+
+    srv.start()
+    again = timed_completion(srv, long_prompt(0))[0]
+    assert again["cache_n"] >= cold["prompt_n"] - 64
+    assert again["prompt_n"] <= 64
