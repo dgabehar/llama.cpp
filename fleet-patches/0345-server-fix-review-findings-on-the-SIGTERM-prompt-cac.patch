@@ -1,0 +1,72 @@
+From 2f7d95d15c05109edb0ebe1054e6ce9ca3ce3da9 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 3 Nov 2026 19:01:34 -0600
+Subject: [PATCH] server: fix review findings on the SIGTERM prompt-cache flush
+
+Addressed an independent review of the prior commit:
+- crash: skip the flush entirely when ctx_tgt == nullptr (sleeping via
+  --sleep-idle-seconds frees the context and model but leaves stale
+  tokens on the slots; llama_state_seq_save_file would otherwise be
+  called on a null context)
+- invariant violation: skip a slot that is_processing() (mid-generation
+  or mid-chunked-prefill), matching the update_cache guard used
+  elsewhere for the same reason
+- perf: wrap the multi-save loop in a slot_files_pass so it scans the
+  slot dir once instead of once per slot/state
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017sSZuR9eJNhevyxfnUgkAf
+---
+ FLEET.md                        |  7 ++++++-
+ tools/server/server-context.cpp | 13 +++++++++++--
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index 46c9be3fd..00bdf5345 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -932,7 +932,12 @@ right after a "making room for prompt cache entry" line.
+   `prompt_cache_disk_save`/`prompt_cache_disk_evict`. SIGKILL (double Ctrl-C, OOM kill) still loses everything; only
+   SIGTERM/SIGINT run the main thread far enough to reach this. Test: `test_slot_save.py::test_prompt_cache_disk_flushes_on_sigterm`
+   (cache_ram=-1 so the RAM cache never evicts on its own; asserts no spill file exists before `srv.stop()` and
+-  exactly one exists after, then that a restart restores it from disk).
++  exactly one exists after, then that a restart restores it from disk). Skips a slot that is `is_processing()`
++  (mid-generation or mid-chunked-prefill, same as the `update_cache` guard elsewhere: its prompt is incomplete and
++  its own next request redoes it) and skips entirely when `ctx_tgt == nullptr` (`--sleep-idle-seconds`: sleeping
++  frees the context and the model but leaves stale tokens on the slots; `llama_state_seq_save_file` would otherwise
++  be called on a null context). Wrapped in one `slot_files_pass` so the multi-save does one directory scan, not one
++  per slot/state.
+ 
+ ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1c6971812..73e25ff47 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3487,12 +3487,21 @@ private:
+     // exits, so write every slot's current prompt and every RAM cache entry to disk now, unconditionally
+     // (prompt_cache_save() above skips a slot that still fits the RAM cache limit; that is wrong here)
+     void flush_prompt_cache_to_disk() {
+-        if (!prompt_cache_disk()) {
++        // sleeping (--sleep-idle-seconds) frees ctx_tgt and the model but leaves stale tokens on the slots;
++        // nothing here is safe to call without a live context, and nothing needs saving while asleep anyway
++        // (a wake-up re-processes from the slot's own leftover tokens the same way a restart would, so the
++        // cache miss cost is already accepted for this path)
++        if (!prompt_cache_disk() || ctx_tgt == nullptr) {
+             return;
+         }
+ 
++        // one scan of the slot dir for every save below, like every other multi-save call site
++        const slot_files_pass pass(*this);
++
+         for (auto & slot : slots) {
+-            if (slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
++            // a slot mid-generation or mid-chunked-prefill is never touched elsewhere either (TAG_IDLE_SLOT_CLEAR,
++            // the update_cache guard above): its prompt is incomplete and its own next request will redo it
++            if (slot.is_processing() || slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
+                 continue;
+             }
+ 
+-- 
+2.43.0
+

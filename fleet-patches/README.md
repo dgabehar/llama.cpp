@@ -375,15 +375,17 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0341 | `a6a56f6a9` | server: add --spec-grammar to draft for grammar-constrained requests |
 | 0342 | `ae33b89b0` | server: draft for grammar-constrained requests by default (--spec-grammar on) |
 | 0343 | `3d5f8253c` | server: keep evicted prompt cache entries in the slot dir and restore them on a miss |
+| 0344 | `5c97dad6e` | server: flush the prompt cache to the slot dir on SIGTERM/SIGINT |
+| 0345 | `2f7d95d15` | server: fix review findings on the SIGTERM prompt-cache flush |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
-This mirror was regenerated on 2026-11-03 (343 patches, extended the same day with the
-disk-backed prompt-cache spill/restore fix, PR #32; no manual upstream merge yet --
-that is tracked separately, fleet-patches is 999 commits behind `upstream/master` as of
-this regen). Patch numbers changed from the previous table; refer to patches by subject.
+This mirror was regenerated on 2026-11-04 (345 patches, extended with the shutdown-flush
+fix for the disk-backed prompt-cache feature, PR #34; no manual upstream merge yet --
+that is tracked separately, fleet-patches is behind `upstream/master` as of this regen).
+Patch numbers changed from the previous table; refer to patches by subject.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
 full workflow this fits into (when to add a new patch vs. amend an existing one; upstream syncs are manual merges since the
