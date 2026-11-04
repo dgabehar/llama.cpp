@@ -3487,12 +3487,21 @@ private:
     // exits, so write every slot's current prompt and every RAM cache entry to disk now, unconditionally
     // (prompt_cache_save() above skips a slot that still fits the RAM cache limit; that is wrong here)
     void flush_prompt_cache_to_disk() {
-        if (!prompt_cache_disk()) {
+        // sleeping (--sleep-idle-seconds) frees ctx_tgt and the model but leaves stale tokens on the slots;
+        // nothing here is safe to call without a live context, and nothing needs saving while asleep anyway
+        // (a wake-up re-processes from the slot's own leftover tokens the same way a restart would, so the
+        // cache miss cost is already accepted for this path)
+        if (!prompt_cache_disk() || ctx_tgt == nullptr) {
             return;
         }
 
+        // one scan of the slot dir for every save below, like every other multi-save call site
+        const slot_files_pass pass(*this);
+
         for (auto & slot : slots) {
-            if (slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
+            // a slot mid-generation or mid-chunked-prefill is never touched elsewhere either (TAG_IDLE_SLOT_CLEAR,
+            // the update_cache guard above): its prompt is incomplete and its own next request will redo it
+            if (slot.is_processing() || slot.prompt.tokens.size() < PROMPT_CACHE_DISK_MIN_TOKENS) {
                 continue;
             }
 

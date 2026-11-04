@@ -932,7 +932,12 @@ right after a "making room for prompt cache entry" line.
   `prompt_cache_disk_save`/`prompt_cache_disk_evict`. SIGKILL (double Ctrl-C, OOM kill) still loses everything; only
   SIGTERM/SIGINT run the main thread far enough to reach this. Test: `test_slot_save.py::test_prompt_cache_disk_flushes_on_sigterm`
   (cache_ram=-1 so the RAM cache never evicts on its own; asserts no spill file exists before `srv.stop()` and
-  exactly one exists after, then that a restart restores it from disk).
+  exactly one exists after, then that a restart restores it from disk). Skips a slot that is `is_processing()`
+  (mid-generation or mid-chunked-prefill, same as the `update_cache` guard elsewhere: its prompt is incomplete and
+  its own next request redoes it) and skips entirely when `ctx_tgt == nullptr` (`--sleep-idle-seconds`: sleeping
+  frees the context and the model but leaves stale tokens on the slots; `llama_state_seq_save_file` would otherwise
+  be called on a null context). Wrapped in one `slot_files_pass` so the multi-save does one directory scan, not one
+  per slot/state.
 
 ## Known-fragile areas (real bugs found here, not upstream-tracked until filed)
 
