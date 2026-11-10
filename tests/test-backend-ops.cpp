@@ -4906,8 +4906,9 @@ struct test_ssm_conv_split_graph : public test_case {
         ggml_tensor * nt = ggml_transpose(ctx, qkv);
 
         // tail = last dm1 tokens of nt, made contiguous (n_t >= dm1)
-        ggml_tensor * tv = ggml_view_3d(ctx, nt, dm1, channels, 1, nt->nb[1], nt->nb[2], (n_t - dm1) * nt->nb[0]);
-        tv->nb[0] = nt->nb[0];
+        // (cut from the untransposed rows, which are contiguous along dim 0: ggml_view_3d requires that of its source)
+        ggml_tensor * tv = ggml_view_3d(ctx, qkv, channels, dm1, 1, qkv->nb[1], qkv->nb[2], (n_t - dm1) * qkv->nb[1]);
+        tv = ggml_transpose(ctx, tv);
         ggml_tensor * dst = ggml_view_2d(ctx, state_all, dm1 * channels, 1, state_all->nb[1], 0);
         ggml_tensor * cp  = ggml_cpy(ctx, ggml_cont(ctx, tv), dst);
 

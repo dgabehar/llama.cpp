@@ -443,6 +443,67 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
+// Build the width-(conv_kernel_size - 1) window starting at logical column
+// `s_idx` of what used to be the materialized concat(prefix, new_tokens)
+// buffer, without materializing that full buffer. The window either falls
+// entirely inside `prefix` (s_idx == 0), entirely inside `new_tokens`
+// (s_idx >= dm1), or straddles the boundary between them (0 < s_idx < dm1) --
+// s_idx < dm1 only happens when n_t < dm1, i.e. during single/small-token
+// decode steps, since prefill's n_t is normally far larger than the conv
+// kernel width. The straddling case is the one the old concat-based code got
+// "for free"; here it costs a small (at most dm1-wide) concat instead of one
+// sized by the full n_t.
+//
+// new_tokens is a transposed view: its dim 0 (tokens) has a row-sized stride.
+// ggml_view_* always gives a view a unit dim-0 stride, so a token range is cut
+// from the untransposed [conv_channels, n_t, n_seqs] layout and transposed back.
+static ggml_tensor * build_token_cols(
+        ggml_context * ctx0,
+        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], transposed view
+        int64_t        start,
+        int64_t        count,
+        int64_t        conv_channels,
+        int64_t        n_seqs) {
+    ggml_tensor * rows = ggml_transpose(ctx0, new_tokens);
+    GGML_ASSERT(rows->nb[0] == ggml_type_size(rows->type));
+
+    rows = ggml_view_3d(ctx0, rows,
+            conv_channels, count, n_seqs,
+            rows->nb[1], rows->nb[2],
+            start * rows->nb[1]);
+
+    return ggml_transpose(ctx0, rows);
+}
+
+ggml_tensor * build_conv_window(
+        ggml_context * ctx0,
+        ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
+        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], possibly non-contiguous
+        int64_t        dm1,
+        int64_t        conv_channels,
+        int64_t        n_seqs,
+        int64_t        s_idx) {
+    GGML_ASSERT(s_idx >= 0 && s_idx <= new_tokens->ne[0]);
+
+    if (s_idx == 0) {
+        return prefix;
+    }
+
+    if (s_idx >= dm1) {
+        return build_token_cols(ctx0, new_tokens, s_idx - dm1, dm1, conv_channels, n_seqs);
+    }
+
+    ggml_tensor * prefix_part =
+        ggml_view_3d(ctx0, prefix,
+                dm1 - s_idx, conv_channels, n_seqs,
+                prefix->nb[1], prefix->nb[2],
+                s_idx * prefix->nb[0]);
+
+    ggml_tensor * new_tokens_part = build_token_cols(ctx0, new_tokens, 0, s_idx, conv_channels, n_seqs);
+
+    return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
@@ -450,6 +511,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_sta
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
         int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const auto kv_head  = mctx_cur->get_head();
+    const auto mem_size = mctx_cur->get_size();
+
     const int64_t n_seqs = ubatch.n_seqs;
     const int64_t dm1    = conv_kernel_size - 1;
 
@@ -462,11 +528,48 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_sta
     ggml_tensor * new_tokens = ggml_transpose(ctx0, qkv_mixed);
     cb(new_tokens, "qkv_mixed_transposed", il);
 
-    // build_conv_state_store() (llama-graph.cpp) handles both branches below generically: a direct
-    // copy when cparams.n_rs_seq == 0, and the [TAG_RECURRENT_ROLLBACK_SPLITS] vectorized ggml_set_rows
-    // scatter otherwise. It reads conv_x's own tail n_cols columns as the window to store, so it needs
-    // the raw conv_states_all storage (not the locally reshaped conv_states) and the new tokens only.
-    build_conv_state_store(inp, conv_states_all, new_tokens, dm1, 0);
+    const int64_t n_t = new_tokens->ne[0];
+
+    const int64_t row_count = dm1 * conv_channels;
+
+    const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+
+    if (cparams.n_rs_seq == 0) {
+        const int64_t s_idx  = n_t;
+        const int64_t s_slot = 0;
+
+        ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+        cb(conv_state_last, "conv_state_last", il);
+
+        ggml_tensor * conv_state_update =
+            ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs, conv_states_all->nb[1],
+                    (s_slot * mem_size + kv_head) * row_size);
+        cb(conv_state_update, "conv_state_update", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+    } else {
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, n_t - K + t);
+            const int64_t s_slot = K - t;
+
+            ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+
+            ggml_tensor * conv_state_update =
+                ggml_view_2d(ctx0,
+                        conv_states_all, row_count, n_seqs,
+                        conv_states_all->nb[1],
+                        (s_slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        }
+    }
 
     return { conv_states, new_tokens };
 }

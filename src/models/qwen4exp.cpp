@@ -1380,6 +1380,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_conv_
         int64_t              state_cols,
         int64_t              channels,
         int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const auto kv_head = mctx_cur->get_head();
+
     const int64_t n_seqs    = ubatch.n_seqs;
     const int64_t row_total = conv_states_all->ne[0];
 
@@ -1397,10 +1401,29 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_conv_
 
     ggml_tensor * new_tokens = ggml_transpose(ctx0, x);
 
-    // build_conv_state_store() (llama-graph.cpp) covers the same [TAG_RECURRENT_ROLLBACK_SPLITS]
-    // rollback-slot storage generically now (vectorized ggml_set_rows); the two-row subtlety this
-    // function's docstring warns about is on the gather side above (rs_rows), not the store below.
-    build_conv_state_store(inp, conv_states_all, new_tokens, state_cols, 0);
+    const int64_t n_t = new_tokens->ne[0];
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
+    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
+    // (upstream's build_conv_state_store() needs the materialized concat(history, tokens), which this
+    // function exists to avoid: it reads across the split instead, so the windows are cut by hand)
+    const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
+
+    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+
+    for (int64_t slot = 0; slot < n_slots; ++slot) {
+        const int64_t s_idx = std::max<int64_t>(0, n_t - slot);
+
+        ggml_tensor * tail = build_conv_window(ctx0, state, new_tokens, state_cols, channels, n_seqs, s_idx);
+
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    }
 
     return { state, new_tokens };
 }

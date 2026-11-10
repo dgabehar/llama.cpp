@@ -362,6 +362,9 @@ int main(int argc, char ** argv) {
     //   that points to the stack of the thread doing the fit, which is only safe while no other
     //   thread is inside llama - and the models of this test are far too small to need it
     params.fit_params = false;
+    // --split-balance (fork) measures the device memory the same way, so its default (auto) swaps the
+    //   same callback from every model thread; the split of a model this small does not matter
+    params.split_balance = 0; // COMMON_SPLIT_BALANCE_MEMORY
 
     const std::vector<const ctx_test *> cases = select_cases(test_filter);
     if (cases.empty()) {

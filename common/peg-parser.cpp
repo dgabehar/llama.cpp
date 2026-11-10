@@ -760,6 +760,12 @@ struct parser_executor {
     }
 
     common_peg_parse_result operator()(const common_peg_rule_parser & p) {
+        // the root parse() sizes rule_depth for the whole arena; a context that starts at a rule instead
+        // (the K2-Horizon lenient-fallback parse in chat.cpp) never went through it
+        if (ctx.rule_depth.size() <= (size_t) p.child) {
+            ctx.rule_depth.resize((size_t) p.child + 1, 0);
+        }
+
         // only rules recurse, a recursive rule is entered once per input level
         if (ctx.rule_depth[p.child] >= RULE_RECURSIVE_LIMIT) {
             throw common_peg_recursion_error("input is nested more than " + std::to_string(RULE_RECURSIVE_LIMIT) + " levels deep");

@@ -17,6 +17,16 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// width-(conv_kernel_size - 1) window of concat(prefix, new_tokens) without materializing it (delta-net-base.cpp)
+ggml_tensor * build_conv_window(
+        ggml_context * ctx0,
+        ggml_tensor  * prefix,
+        ggml_tensor  * new_tokens,
+        int64_t        dm1,
+        int64_t        conv_channels,
+        int64_t        n_seqs,
+        int64_t        s_idx);
+
 //
 // base classes
 //
