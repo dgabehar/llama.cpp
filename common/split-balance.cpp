@@ -1435,7 +1435,7 @@ void common_split_balance_apply(
     llama_model_params mp = mparams;
     common_device_memory_data_vec mem;
     try {
-        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+        mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
     } catch (const std::exception & e) {
         LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
         return;
@@ -1473,7 +1473,7 @@ void common_split_balance_apply(
     set_split(probe_split, probe);
     mp.tensor_split = probe_split;
     try {
-        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+        mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
     } catch (const std::exception & e) {
         LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
         return;
@@ -1522,7 +1522,7 @@ void common_split_balance_apply(
         }
         set_split(probe_split, n);
         try {
-            mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+            mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
         } catch (const std::exception & e) {
             LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
             return;

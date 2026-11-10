@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
 re-derive the equivalent change against the new upstream code, `git am
 --continue`).
 
-## Current patches (regenerated 2026-11-03; fleet-patches last merged with upstream at `36e36e63a` on 2026-10-23, 999 commits behind `upstream/master`'s current tip `20a51f24a` as of this regen -- no new upstream merge in this regen, see note below)
+## Current patches (regenerated 2026-11-10; fleet-patches merged with upstream `202c1a229` on 2026-11-10, see FLEET.md "Upstream sync 2026-11-10")
 
 | # | Commit | Summary |
 |---|---|---|
@@ -377,14 +377,20 @@ re-derive the equivalent change against the new upstream code, `git am
 | 0343 | `3d5f8253c` | server: keep evicted prompt cache entries in the slot dir and restore them on a miss |
 | 0344 | `5c97dad6e` | server: flush the prompt cache to the slot dir on SIGTERM/SIGINT |
 | 0345 | `2f7d95d15` | server: fix review findings on the SIGTERM prompt-cache flush |
+| 0346 | `ea3f2dc9a` | Fix compile breaks the 2026-11-10 upstream merge left outside conflict markers |
+| 0347 | `7571530fa` | Restore the fork's concat-free conv-state store, fix three more merge regressions |
+| 0348 | `842d35e4f` | FLEET: Upstream sync 2026-11-10 entry, regenerated patch mirror, refreshed flag checklist |
+| 0349 | `d54e7fdd0` | FLEET: correct the 2026-11-10 sync's wrong grammar-regression attribution |
 
 The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
 split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
 fixes"). Fork-only, not submitted upstream.
 
-This mirror was regenerated on 2026-11-04 (345 patches, extended with the shutdown-flush
-fix for the disk-backed prompt-cache feature, PR #34; no manual upstream merge yet --
-that is tracked separately, fleet-patches is behind `upstream/master` as of this regen).
+This mirror was regenerated on 2026-11-10 (349 patches: the 347 of the previous mirror, plus the FLEET.md doc
+commit that mirror regen itself did not yet cover, plus the same-day correction of that doc's wrong grammar-regression
+attribution; `BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0 TIP=HEAD`, no `EXCLUDE`, as for the 347-patch mirror).
+The merge commit itself carries no patch; its conflict resolutions are listed in FLEET.md. The CPU strided-concat
+hunk of 0334 is now covered by upstream's concat row kernel (only the test part of that patch is still live).
 Patch numbers changed from the previous table; refer to patches by subject.
 
 See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the

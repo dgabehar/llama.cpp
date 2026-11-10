@@ -1,0 +1,142 @@
+From d54e7fdd01684ba2eeb402e501bf7f10e43eee3b Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 10 Nov 2026 16:09:00 -0600
+Subject: [PATCH] FLEET: correct the 2026-11-10 sync's wrong grammar-regression
+ attribution
+
+test_speculative.py::test_grammar_drafts_unless_no_spec_grammar's write-up blamed
+src/llama-grammar.cpp (zero fork code, zero conflicts) and upstream's 48c9f08b7
+grammar-candidate-rejection rewrite. That was never verified, and is wrong:
+checking out llama-grammar.cpp + its header from pre-merge-2026-11-10 onto the
+post-merge tree still reproduces the exact same divergence. common/sampling.cpp
+(the fork's grammar-first/resample drafting logic) also has zero diff across
+the merge, ruling out the fork's own drafting path too.
+
+Root-caused instead to Vulkan's NVIDIA coopmat1 matmul path specifically:
+CPU never reproduces it; GGML_VK_VISIBLE_DEVICES=0 (Intel iGPU) passes, =1
+(NVIDIA RTX 3080 Ti Mobile) fails; on NVIDIA, GGML_VK_DISABLE_COOPMAT=1 alone
+fixes it, GGML_VK_DISABLE_COOPMAT2=1 alone does not. Also ruled out: the fork's
+own flop-based Vulkan submit-batching (forcing flops_per_submit=0 still fails)
+and the KQ attention matmul's explicit precision request in build_attn_mha
+(d6be06557's F32->BF16 change has no effect -- both map to the same
+ggml_vk_prec_allows_f16acc()==false result). 459a1ba54's small-matmul-tile
+rederivation is also ruled out: its formula reduces to the exact same tile
+value on a 32-wide-subgroup device, which this NVIDIA GPU is (the commit
+targets 8/16-wide Mali/mobile subgroups). Likeliest remaining, unpinned
+candidate: 8e5a58df8 ("vulkan: ggml src1 precision support", #30656), which
+reworked coopmat1 accumulator-precision/kernel selection across many matmuls.
+
+This is the same already-documented near-tied-logit/batch-size-numerics
+category this file's "Known-fragile areas" already names for the
+SSM_CONV_SPLIT/qwen3-coder case, not a new logic bug in the grammar engine or
+the drafting path. No fleet impact: production runs AMD UMA nodes only, no
+NVIDIA, so it was reported and documented rather than mitigated (no coopmat1
+disable, no revert of 8e5a58df8, which also fixes real production fp16-overflow
+bugs). Not fixed upstream: only 4 trivial commits exist past 202c1a229, none
+touching llama-grammar.cpp, ggml-vulkan/, or llama-graph.cpp.
+
+Full tools/server/tests -m "not slow" rerun (clean venv, openai+jiter
+importable) reconfirms baseline exactly: 483 passed, 5 skipped, 2 failed
+(test_n_probs_post_backend_sampling, test_grammar_drafts_unless_no_spec_grammar)
+-- no new regressions from this correction.
+
+Assisted-by: Claude Sonnet
+---
+ FLEET.md | 70 ++++++++++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/FLEET.md b/FLEET.md
+index 6999a1071..b249bf1e4 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -215,19 +215,27 @@ parser: guard inert=6 hold=10` (no specialized parser pre-empts the fork's K2 ha
+ **Verified (Vulkan `GGML_VULKAN=ON GGML_RPC=ON` build, tests on; NVIDIA RTX 3080 Ti Laptop + Intel UHD iGPU):**
+ `ctest` 81/83 (the 2 failures are `test-conversion-fp8`/`test-kv-cache-scales`, both `ModuleNotFoundError: torch` in
+ this environment, not a merge regression). `test-backend-ops -o "CONCAT|SSM_CONV"` 587/587 on Vulkan0, Vulkan1 and
+-CPU. `tools/server/tests` pytest `-m "not slow"`: 483 passed, 5 skipped, 2 failed. One failure
++CPU. `tools/server/tests` pytest `-m "not slow"`: 483 passed, 5 skipped, 2 failed (reconfirmed in a clean rerun after
++fixing this write-up below; same two tests, same counts). One failure
+ (`test_n_probs_post_backend_sampling`) reproduces identically on the pre-merge tip `8cc736031` -- pre-existing, not a
+ merge regression. The other (`test_speculative.py::test_grammar_drafts_unless_no_spec_grammar`) is new: with
+ `--spec-grammar` on (the fork's default), the greedy completion under a grammar now differs, token-for-token, from
+ plain (no-draft) greedy decode on the same prompt/seed -- both outputs are still grammar-valid, but speculative
+-decoding with grammar no longer reproduces what plain decode would have produced, which is the whole correctness
+-contract `--spec-grammar` depends on. `src/llama-grammar.cpp` had zero fork code and zero merge conflicts; upstream
+-rewrote `llama_grammar_reject_candidates_for_stack` as a non-recursive, index-based walk in `48c9f08b7` ("grammar:
+-reject candidates in a loop, without a depth limit", landed to fix long-token tokenizers always-rejecting under
+-depth 256). The regression is in that rewrite, not in anything this sync's conflict resolutions touched -- see
+-"Decisions for the operator" in the 2026-11-10 session report for the root-cause investigation and why it was
+-reported rather than patched here. Not yet: production-image build, canary, Dawn QA pass (out of scope for this
+-sync per the task that requested it).
++decoding with grammar no longer reproduces what plain decode would have produced.
++
++**CORRECTED 2026-11-10 (same-day follow-up investigation):** the first write-up above blamed `src/llama-grammar.cpp`
++having zero fork code/conflicts and upstream's `48c9f08b7` rewrite of `llama_grammar_reject_candidates_for_stack`.
++That attribution was wrong, disproven empirically: checking out `src/llama-grammar.cpp` *and* `src/llama-grammar.h`
++from `pre-merge-2026-11-10` onto the post-merge tree (rebuild, rerun) still reproduces the exact same divergence.
++`common/sampling.cpp`/`.h` (the fork's grammar-first/resample drafting logic) have zero diff between
++`pre-merge-2026-11-10` and this merge's `HEAD` -- also ruled out. See "Known-fragile areas" below for the real
++(verified) cause: it does not reproduce on CPU at all, and on Vulkan it is isolated to the NVIDIA coopmat1 matmul
++path specifically (passes with `GGML_VK_VISIBLE_DEVICES=0` / Intel UHD iGPU, or with `GGML_VK_DISABLE_COOPMAT=1` on
++the NVIDIA device; `GGML_VK_DISABLE_COOPMAT2=1` alone does not help). No fleet production node runs NVIDIA (AMD UMA
++nodes only; the RTX 3080 Ti Mobile this was reproduced on is Doug's workstation GPU), so this has no known
++production impact and was not mitigated (no coopmat1 disable, no upstream revert -- see "Known-fragile areas").
++Not yet: production-image build, canary, Dawn QA pass, AMD-path verification (out of scope for this sync per the
++task that requested it; the fleet's actual backend was not available to test against here).
+ 
+ ## Upstream sync 2026-10-23 (merged upstream `36e36e63a`, added 2026-10-23)
+ 
+@@ -1401,6 +1409,50 @@ right after a "making room for prompt cache entry" line.
+   argument (`{% set ... %}` lines), with no template tags, in both arms;
+   the reasoning-end fix holds (the thinking closed normally).
+ 
++- **`--spec-grammar` is not bit-exact on near-tied logits on NVIDIA's Vulkan coopmat1 path (found 2026-11-10,
++  not fixed, no fleet impact known).** `tools/server/tests` `test_speculative.py::test_grammar_drafts_unless_no_spec_grammar`
++  fails deterministically on this workstation's Vulkan build (`GGML_VULKAN=ON GGML_RPC=ON`, NVIDIA RTX 3080 Ti Mobile +
++  Intel UHD 770 iGPU) since the 2026-11-10 upstream sync (`202c1a229`): with `--spec-grammar` on, the greedy
++  completion under `grammar: "root ::= [a-z]+ (\" \" [a-z]+)*"` diverges from plain (no-draft) greedy decode at token
++  index 1 (`322` vs `297` in one capture) -- both outputs stay grammar-valid, only the token sequence differs.
++  Repro: `GGML_VK_VISIBLE_DEVICES=1 LLAMA_SERVER_BIN_PATH=<path>/llama-server python3 -m pytest
++  unit/test_speculative.py::test_grammar_drafts_unless_no_spec_grammar -x` from `tools/server/tests`, with a Vulkan
++  build (CPU-only never reproduces it).
++  - **Ruled out (verified, not hypothesis):** `src/llama-grammar.cpp`/`.h` (checked out from `pre-merge-2026-11-10`
++    onto the post-merge tree, still fails identically); `common/sampling.cpp`/`.h` (zero diff across the merge); the
++    fork's own flop-based Vulkan submit-batching/graph-splitting in `ggml_vk_graph_compute`, `ggml-vulkan.cpp` (forced
++    `flops_per_submit = 0`, still fails -- not a scheduling/sync bug in the fork's own merge-conflict resolution); the
++    KQ attention matmul's explicit accumulation-precision request in `src/llama-graph.cpp`'s `build_attn_mha`
++    (upstream `d6be06557` changed it `GGML_PREC_F32` -> `GGML_PREC_BF16`; reverting that one line back to F32 has no
++    effect, and reading `ggml_vk_prec_allows_f16acc()` in `ggml-vulkan.cpp` shows F32 and BF16 both map to
++    `return false` there, so the two values are equivalent for this path); and `459a1ba54`'s small-matmul-tile
++    rederivation specifically (`s_warptile_wm_8 = 32 * subgroup_size_8 / subgroup_size_32` reduces to the old
++    `device->subgroup_size == 8 ? 8 : 32` formula's value exactly on a 32-wide-subgroup device, which the NVIDIA GPU
++    here is -- the commit targets Mali/mobile 8/16-wide subgroups, not NVIDIA).
++  - **Isolated (verified):** `GGML_VK_VISIBLE_DEVICES=0` (Intel UHD iGPU) passes; `=1` (NVIDIA) fails. On the NVIDIA
++    device, `GGML_VK_DISABLE_COOPMAT=1` alone makes it pass; `GGML_VK_DISABLE_COOPMAT2=1` alone does not. So the cause
++    is specifically in the `VK_KHR_cooperative_matrix` (coopmat1) matmul path on NVIDIA, not coopmat2, not a generic
++    GPU-vs-CPU numeric difference, and not the fork's own code anywhere in the merge's conflict resolutions.
++  - **Not pinned down further (reported, not verified):** which exact upstream commit inside the coopmat1 path is
++    responsible was not isolated past the point above -- the likeliest remaining candidate in the merge's commit set
++    is `8e5a58df8` ("vulkan: ggml src1 precision support", #30656), which reworked the coopmat1
++    accumulator-precision/kernel-selection logic (`ggml_vk_get_mul_mat_mat_f16acc` and friends) for *many* matmuls
++    throughout the graph, not just KQ; `70c5f2632` ("vulkan: rms norm optimization using subgroup reductions", #29882)
++    is a second, weaker candidate (changes RMS-norm summation order, not matmul, and isn't obviously coopmat-gated).
++    Neither was reverted, and no fleet-impact bisection beyond this was run.
++  - **Why this was reported rather than patched:** this reads as the *same* category this section already documents
++    above for SSM_CONV_SPLIT/qwen3-coder -- near-tied logit margins tipped by batch-size-dependent GPU matmul
++    numerics (plain decode is M=1, speculative verify is M>1, and different M routes through different
++    Vulkan/coopmat kernel variants) -- not a new logic bug in the grammar engine or in the fork's drafting path.
++    `8e5a58df8`'s own commit message describes fixing real fp16-overflow correctness bugs for production models
++    ("handle fp32 overflows through scaling", "handle overflows in copy-to-fp16 activations"); reverting it (or
++    disabling coopmat1) to chase a tie-flip in a tiny test model is not a safe minimal fix, and the production fleet
++    runs AMD UMA nodes only -- no NVIDIA in production, so this has no known fleet impact and was deliberately left
++    unmitigated rather than traded against that upstream fix. The AMD/coopmat path was not available to test here.
++    Confirmed not fixed upstream as of this sync: only 4 commits exist between `202c1a229` and `upstream/master`
++    (`582eab718`, `7c2653acc`, `7592b61d3`, `cd4ed902e`), none touching `src/llama-grammar.cpp`,
++    `ggml/src/ggml-vulkan/`, or `src/llama-graph.cpp`.
++
+ - **CPU locality-domain split ("Track A") caused a real production outage
+   on first rollout (2026-09-18) -- crash-looped BOTH gabesrv06 and
+   gabesrv10 on model load, `GGML_ASSERT(ggml_backend_supports_buft(
+-- 
+2.43.0
+
