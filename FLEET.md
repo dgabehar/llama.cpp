@@ -21,7 +21,7 @@ below). The old `.github/workflows/sync-with-upstream.yml` (weekly rebase + forc
 `sync-fleet-patches.yml` was removed on 2026-10-08 (mirror patch 0090) -- a rebase + force-push would
 clobber the merge history. `fleet-patches/regenerate.sh` needs `BASE=<last merged upstream sha>
 TIP=origin/fleet-patches EXCLUDE=<old pre-landing tip>` on this branch (see the script header):
-`BASE=36e36e63a54fc8f85b95e9c499a022b597e478dd EXCLUDE=38773736370e66abffbdb1af4805612055e87953` (BASE = the upstream commit last merged; 2026-10-23 sync).
+`BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0` (BASE = the upstream commit last merged; 2026-11-10 sync). The 2026-11-04 and 2026-11-10 mirrors (345 and 347 patches) were generated *without* `EXCLUDE`; with `EXCLUDE=38773736370e66abffbdb1af4805612055e87953` the old pre-landing lineage is left out and the mirror shrinks to ~120 patches.
 
 ## K2 fixes after the adoption (added 2026-10-08)
 
@@ -105,6 +105,129 @@ rule for this repo. Regenerate the mirror afterward.
 applies to this fork too, not just upstream contributions (`AGENTS.md`'s
 push/PR restriction is written for upstream, but this fork follows the same
 discipline by standing convention).
+
+## Upstream sync 2026-11-10 (merged upstream `202c1a229`, added 2026-11-10)
+
+Branch `upstream-sync-2026-11-10` (worktree `.worktrees/2026-11-10-d5271ec7-upstream-sync`): `git merge upstream/master`
+into `fleet-patches` @ `d50c868ea` (merge commit, no rebase, no force-push; 433 upstream commits since the 2026-10-23
+merge `36e36e63a`, 1231 files changed). Rollback anchor: tag `pre-merge-2026-11-10`. Mirror = 347 patches (two new:
+0346, 0347; regenerated with `BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0 TIP=HEAD`, no `EXCLUDE`).
+
+**Conflicts (15 files, resolved against upstream's new structure):**
+- `ggml/include/ggml-rpc.h` / `ggml/src/ggml-rpc/ggml-rpc.cpp`: `RPC_PROTO_MAJOR_VERSION` -> 9 (upstream's "RPC: Improve
+  loading times"), `RPC_PROTO_PATCH_VERSION` -> 1 (upstream's new patch base 0 + 1 for the fork's extra
+  `GGML_OP_SSM_CONV_SPLIT`). `set_tensor` re-derived on upstream's new streamed-recv body with the fork's atomic
+  cache-write kept. `comm_init`'s bound check took upstream's generalized N-way form. A stale duplicate `comm_allreduce`
+  definition on the fork's conflict side (referencing a removed `state.peer` field) was deleted outright; the real,
+  already-auto-merged definition using `state.allreduce_fn`/`state.backend_comm_ctx` was the only one kept.
+- `ggml/src/ggml-vulkan/ggml-vulkan-types.h`, `ggml-vulkan.cpp`, `vulkan-shaders-gen.cpp`: additive, both concat
+  pipeline families kept (upstream's `concat_transpose_*`, 2D-only, tried first; the fork's `concat_tiled_*`, for
+  `ne[2]`/`ne[3]` > 1, as fallback). Submit-batching sizes from the current graph's flops (the fork's own fix, since
+  upstream's conflicting side still referenced `last_total_flops`, a field the fork had already deleted) fed into
+  upstream's new small-graph-skip optimization.
+- `tests/CMakeLists.txt`: upstream moved `test-llama-archs`/`test-generate-models`/`test-llama-context`/`test-fusion`
+  out of the Windows-shared-lib conditional (a TODO the fork's own pre-merge text already named); re-inserted the
+  fork's `test-state-capture` registrations into the new unconditional location.
+- `tools/rpc/CMakeLists.txt`: additive, fork's `test-rpc-server-multiclient`/`test-rpc-client-timeout` kept alongside
+  upstream's new `test-rpc-unreachable`.
+- `common/fit.cpp`: upstream renamed `path_model` (`const char *`) to `paths_model` (`const std::vector<std::string> &`)
+  and added an `hp_nsk` (skipped-layer) parameter throughout; re-applied the fork's UMA proactive-clamp block
+  (`common_fit_clamp_ctx_to_free_memory`, [mem0:e511296e]) over the new signature, dropped upstream's now-superseded
+  pre-fork `n_streams > 1` re-measure block, and fixed a silent (unmarked) stale `path_model` call in the fork's own
+  retry loop found by grepping the file after the marked conflicts.
+- `common/common.cpp`: upstream extracted the inline fit+split-balance block into `common_fit_apply()` (also called
+  by `common_measure_memory()`, which must not trigger split-balance); re-derived the fit call plus a separate
+  split-balance block, and updated `common_fit_extra_model`'s field and the final model-load call to the new
+  paths-based API.
+- `common/peg-parser.cpp`: upstream added a `COMMON_PEG_PARSE_FLAG_COMPLETE`/`is_complete()` gate around the
+  until_one_of partial-match branch; nested the fork's existing "don't prematurely close on an ambiguous partial
+  delimiter" lenient-check inside it.
+- `common/parsers/qwen3-coder.cpp`: upstream extracted a shared `reasoning_extracted` local keyed on a bare
+  `<tool_call>` boundary; kept the fork's `REASONING_CALL_END` ("don't end reasoning only at a real call opener") fix
+  instead, folding in upstream's added `\n</think>` alternative, and removed the now-unused `reasoning_extracted`.
+- `common/chat.cpp`: additive, upstream's new `tts` template load and the fork's K2-Horizon startup self-check kept
+  in sequence.
+- `ggml/src/ggml-cpu/ops.cpp`: upstream's "rewrite concat as one row kernel for all types" (#31179) already handles a
+  non-contiguous/transposed source row generically; **dropped** the fork's own inline strided-copy patch to
+  `ggml_compute_forward_concat_any` as fully superseded.
+- `src/llama-mmap.cpp`: upstream's conflict side was a textual-alignment artifact (empty); kept the fork's direct-I/O
+  bounce-buffer fix verbatim.
+- `src/models/delta-net-base.cpp`, `src/models/qwen4exp.cpp`: upstream added a generic
+  `llm_graph_context::build_conv_state_store()` ([TAG_RECURRENT_ROLLBACK_SPLITS] via `ggml_set_rows`); the merge
+  initially switched both files to it, but **that regresses them** (see "Post-merge regressions" below) because
+  `build_conv_state_store()` needs the materialized concat(prefix, tokens) the fork's own `ggml_ssm_conv_split`
+  design deliberately avoids. Reverted both to `build_conv_window()`/`build_token_cols()`.
+- `tools/server/server.cpp`: textual-alignment artifact around the `start_loop()`/`clean_up()` shutdown sequence
+  (present exactly once on every side); inserted the fork's `flush_prompt_cache_to_disk()` call ahead of upstream's
+  trailing memory-breakdown print.
+- `tools/server/server-context.cpp` (3 conflicts): upstream moved `slot.prompt.checkpoints` from
+  `std::list<common_prompt_checkpoint>` (by value) to `std::list<std::shared_ptr<const common_prompt_checkpoint>>`;
+  `save_slot_checkpoints`/`slot_file_save`/`prompt_cache_disk_save` kept the fork's nullable-slot, explicit-checkpoints
+  signature (load-bearing for the prompt-cache-disk-spill feature, where no live `server_slot` exists) with their
+  parameter and loop types updated to the shared-ptr list. The fork's `mark_captures_decoded`/`create_captured_checkpoints`
+  (in-batch checkpoint capture) and upstream's new `process_realtime_slots()` sat at the same spot; kept both. The
+  fork's in-batch-capture extension to the "break at last user message" checkpoint logic is a strict superset of
+  upstream's simpler unconditional-break version (reduces to it when `ckpt_capture` is off); kept the fork's.
+- `tests/test-backend-ops.cpp`, `tests/test-chat.cpp`: both additive (fork's `test_concat_transposed`/
+  `test_qwen3_coder_arg_tags` alongside upstream's `test_concat`/`test_chat_json_depth`); kept both.
+
+**Post-merge regressions found by `ctest` (none were flagged as conflicts):**
+- `src/models/clover-moe.cpp` (upstream's new Clover MoE model) called the fork's `build_conv_state()` expecting the
+  old concatenated-tensor return; ported it to `{prefix, new_tokens}` + `ggml_ssm_conv_split`, like qwen35/qwen3next
+  (compile error).
+- `common_prompt_checkpoint::data_tgt`/`data_dft` became `common_state_data` (a no-init-allocator vector) upstream;
+  the server's captured-checkpoint, slot-save and prompt-cache-spill paths still used `std::vector<uint8_t>` in several
+  places outside any conflict marker (compile error).
+- `common_get_device_memory_data_with_extra` (split-balance's probe) still took a single `path_model`; ported to
+  `paths_model`/`hp_nsk` like the rest of `fit.cpp` (compile error).
+- `build_conv_state_store()`'s generic store assumes a materialized concat buffer; `build_conv_state`/`build_conv_state_split`
+  deliberately never build one (that's the point of `ggml_ssm_conv_split`), so the initial merge resolution crashed
+  `test-state-capture` on `GGML_ASSERT(a->nb[0] == ggml_type_size(a->type))` inside `ggml_view_impl` the first time a
+  qwen35-dense graph ran. Reverted to the fork's own per-slot `build_conv_window()` loop (see conflict list above).
+- `common/peg-parser.cpp`'s new recursion-depth check indexes `ctx.rule_depth`, which only the root `arena.parse()`
+  sizes; the K2-Horizon lenient-fallback parse in `chat.cpp` starts at a rule on a fresh context, so `rule_depth` was
+  empty and `test-chat` segfaulted. The rule-parser branch now grows `rule_depth` on demand.
+- `tests/test-backend-ops.cpp`'s `test_ssm_conv_split_graph` cut a view from a transposed tensor and hand-patched its
+  `nb[0]`; upstream's new view-bounds assert (#31584, `ggml_view_impl`) rejects that. Now cuts from the contiguous rows
+  and transposes, like `build_token_cols`.
+- `tests/test-llama-context.cpp` runs four model threads in one process with `fit_params = false` to avoid swapping a
+  stack-local log callback from a non-owning thread; `--split-balance`'s default (`auto`) memory probe does the same
+  swap and crashed the run. The test now also sets `split_balance = 0` (`COMMON_SPLIT_BALANCE_MEMORY`).
+
+Fixed in commits `ea3f2dc9a` and `7571530fa` on top of the merge commit `d50c868ea`.
+
+**Checklist item 5 (fleet flag list) also updated in this same edit** -- see item 5 below; re-extracted from
+home-infrastructure's values*.yaml/templates with the corrected `rg` invocation (the previous command used `-h`,
+which in ripgrep 14 means "show help," not "no filename" -- it had been printing ripgrep's own usage text, not any
+real flags, so the list below is the first one actually drawn from the fleet's files rather than carried over by
+hand). Every extracted flag confirmed present in the new `llama-server --help`.
+
+**Checks:** `LLAMA_STATE_SEQ_VERSION`/`LLAMA_SESSION_VERSION`/`*_FLAGS_*` unchanged in `include/llama.h`. KV-cache
+`state_write`/`state_write_meta`/`state_write_data`/`state_read*` bodies in `llama-kv-cache.cpp` are byte-identical
+between `36e36e63a` and `upstream/master` (diffed function-by-function). `llama-memory-recurrent.cpp`/
+`llama-memory-hybrid*.cpp`/`llama-kv-cache-iswa.cpp` changed only constructor plumbing for a new `no_alloc` parameter
+and an `rs_max`-bounded rollback window, not wire format. `llama-context.cpp`'s `io_magic` (`0xaf143cd8`) and the
+`/slots`/`/props` JSON keys the fork's SCKP appendix and `litellm_custom_callbacks.py` depend on are unchanged.
+`ggml.h`'s `GGML_OP_COUNT` is unchanged (both fork ops already counted from the 2026-10-23 sync); no new RPC op
+`static_assert` bump needed. K2: `test-chat`'s K2 blocks and `test_k2_guard_fields` pass, startup log `K2-Horizon
+parser: guard inert=6 hold=10` (no specialized parser pre-empts the fork's K2 handling).
+
+**Verified (Vulkan `GGML_VULKAN=ON GGML_RPC=ON` build, tests on; NVIDIA RTX 3080 Ti Laptop + Intel UHD iGPU):**
+`ctest` 81/83 (the 2 failures are `test-conversion-fp8`/`test-kv-cache-scales`, both `ModuleNotFoundError: torch` in
+this environment, not a merge regression). `test-backend-ops -o "CONCAT|SSM_CONV"` 587/587 on Vulkan0, Vulkan1 and
+CPU. `tools/server/tests` pytest `-m "not slow"`: 483 passed, 5 skipped, 2 failed. One failure
+(`test_n_probs_post_backend_sampling`) reproduces identically on the pre-merge tip `8cc736031` -- pre-existing, not a
+merge regression. The other (`test_speculative.py::test_grammar_drafts_unless_no_spec_grammar`) is new: with
+`--spec-grammar` on (the fork's default), the greedy completion under a grammar now differs, token-for-token, from
+plain (no-draft) greedy decode on the same prompt/seed -- both outputs are still grammar-valid, but speculative
+decoding with grammar no longer reproduces what plain decode would have produced, which is the whole correctness
+contract `--spec-grammar` depends on. `src/llama-grammar.cpp` had zero fork code and zero merge conflicts; upstream
+rewrote `llama_grammar_reject_candidates_for_stack` as a non-recursive, index-based walk in `48c9f08b7` ("grammar:
+reject candidates in a loop, without a depth limit", landed to fix long-token tokenizers always-rejecting under
+depth 256). The regression is in that rewrite, not in anything this sync's conflict resolutions touched -- see
+"Decisions for the operator" in the 2026-11-10 session report for the root-cause investigation and why it was
+reported rather than patched here. Not yet: production-image build, canary, Dawn QA pass (out of scope for this
+sync per the task that requested it).
 
 ## Upstream sync 2026-10-23 (merged upstream `36e36e63a`, added 2026-10-23)
 
@@ -294,14 +417,20 @@ home-infrastructure artifact must change in the same series.
    `git diff OLD..NEW -- src/llama-context.cpp | rg io_magic`, and check the
    `get_data_ext` output still starts with magic + seq_id (8 bytes) before the payload.
 5. Flags the fleet uses (values-*.yaml `extraArgs`, chart templates): extract with
-   `rg -oN -h -- '--?[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
-   in home-infrastructure (non-comment lines), then confirm every
-   flag appears in the new `llama-server --help` (current set: `--parallel/-np`,
-   `--batch-size`, `--ubatch-size`, `--spec-type {ngram-mod,draft-dflash}`,
-   `--spec-draft-n-max`, `--model-draft`, `--chat-template-kwargs`, `--cache-ram`,
-   `--no-cache-idle-slots`, `--slot-save-path`, `--cpu-split`, `--split-balance`,
-   `--split-workload`, `--split-calibrate`, `--cache-type-k/v`, `-fa`, `-ngl`,
-   `--n-cpu-moe`, `-ts`, `--rpc`, `--fit`, `--reasoning-format`, `--embeddings`).
+   `rg -oNI -- '(^|[\s"=,\[])-{1,2}[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
+   in home-infrastructure (`-I`, not `-h`: in ripgrep 14 `-h` prints the help, so the previous form of this command
+   printed ripgrep's own usage; the output also holds shell flags from the CronJobs, `-exec`, `-mmin`, `-type`, ...: ignore those),
+   then confirm every `llama-server` flag appears in the new `llama-server --help`. Current set (extracted 2026-11-10 from
+   the values files and chart templates, every one present in `--help` after the 2026-11-10 sync): `--parallel/-np`,
+   `--batch-size`, `--ubatch-size`, `--ctx-size/-c` (built by the chart from `ctxSize`), `--model`, `--model-draft`,
+   `--mmproj`, `-hf/--hf-repo`, `--models-preset`, `--models-dir`, `--host`, `--port`, `--api-key`, `--metrics`,
+   `--embeddings`, `--pooling`, `--spec-type {ngram-mod,draft-mtp,draft-dflash}`, `--spec-draft-n-max`, `--spec-grammar`,
+   `--chat-template-kwargs`, `--reasoning`, `--reasoning-format`, `--cache-ram`, `--cache-reuse` (chart default 256),
+   `--slot-prompt-similarity` (chart default 0.5), `--ctx-checkpoints`, `--no-cache-idle-slots`, `--slot-save-path`,
+   `--load-mode`, `--cpu-split`, `--split-balance`, `--split-workload`, `--cache-type-k/v` (`-ctk/-ctv`), `-fa`, `-ngl`,
+   `--n-cpu-moe/-ncmoe`, `-ts`, `--rpc`, `--fit`, `--rope-scaling`, `--rope-scale`, `--yarn-orig-ctx`, and the sampling
+   defaults `--temp`, `--top-k`, `--top-p`, `--presence-penalty`. (`--split-calibrate`, listed here before, is no
+   longer passed by any values file or template.)
 6. Buffer-type / backend interface (`ggml/src/ggml-backend-impl.h`), batch API
    (`llama_batch_ext`) and `common/` helper signatures: these produce compile breaks
    in our out-of-tree initialisers and tests; a clean `git merge`/rebase is not proof.
