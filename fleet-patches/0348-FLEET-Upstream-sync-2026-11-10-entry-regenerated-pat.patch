@@ -1,0 +1,756 @@
+From 842d35e4fbc05a32fe08375305e2da6c47625bd5 Mon Sep 17 00:00:00 2001
+From: dgabehar <dgabehar@gmail.com>
+Date: Tue, 10 Nov 2026 14:01:41 -0600
+Subject: [PATCH] FLEET: Upstream sync 2026-11-10 entry, regenerated patch
+ mirror, refreshed flag checklist
+
+Writes up the 36e36e63a..202c1a229 merge (433 upstream commits), every conflict resolution and
+the three post-merge regressions ctest caught outside any conflict marker. Regenerates
+fleet-patches/*.patch (345 -> 347, BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0, no EXCLUDE, same
+convention as the 2026-11-04 mirror) and the BASE/EXCLUDE note in the "Fleet patch maintenance"
+section.
+
+Also replaces the Upstream-sync compatibility checklist's item 5 flag list with one actually
+extracted from home-infrastructure's values*.yaml/templates: the command recorded there used
+`rg -h`, which in ripgrep 14 means "show help" (not "no filename" as in older rg/grep), so the
+previous list was never drawn from the fleet's real files. Re-extracted with `rg -oNI` and
+confirmed every flag against the new llama-server --help.
+
+Assisted-by: Claude Sonnet
+---
+ FLEET.md                                      | 147 ++++++++-
+ ...ks-the-2026-11-10-upstream-merge-lef.patch | 225 ++++++++++++++
+ ...-s-concat-free-conv-state-store-fix-.patch | 281 ++++++++++++++++++
+ fleet-patches/README.md                       |  12 +-
+ 4 files changed, 652 insertions(+), 13 deletions(-)
+ create mode 100644 fleet-patches/0346-Fix-compile-breaks-the-2026-11-10-upstream-merge-lef.patch
+ create mode 100644 fleet-patches/0347-Restore-the-fork-s-concat-free-conv-state-store-fix-.patch
+
+diff --git a/FLEET.md b/FLEET.md
+index 00bdf5345..6999a1071 100644
+--- a/FLEET.md
++++ b/FLEET.md
+@@ -21,7 +21,7 @@ below). The old `.github/workflows/sync-with-upstream.yml` (weekly rebase + forc
+ `sync-fleet-patches.yml` was removed on 2026-10-08 (mirror patch 0090) -- a rebase + force-push would
+ clobber the merge history. `fleet-patches/regenerate.sh` needs `BASE=<last merged upstream sha>
+ TIP=origin/fleet-patches EXCLUDE=<old pre-landing tip>` on this branch (see the script header):
+-`BASE=36e36e63a54fc8f85b95e9c499a022b597e478dd EXCLUDE=38773736370e66abffbdb1af4805612055e87953` (BASE = the upstream commit last merged; 2026-10-23 sync).
++`BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0` (BASE = the upstream commit last merged; 2026-11-10 sync). The 2026-11-04 and 2026-11-10 mirrors (345 and 347 patches) were generated *without* `EXCLUDE`; with `EXCLUDE=38773736370e66abffbdb1af4805612055e87953` the old pre-landing lineage is left out and the mirror shrinks to ~120 patches.
+ 
+ ## K2 fixes after the adoption (added 2026-10-08)
+ 
+@@ -106,6 +106,129 @@ applies to this fork too, not just upstream contributions (`AGENTS.md`'s
+ push/PR restriction is written for upstream, but this fork follows the same
+ discipline by standing convention).
+ 
++## Upstream sync 2026-11-10 (merged upstream `202c1a229`, added 2026-11-10)
++
++Branch `upstream-sync-2026-11-10` (worktree `.worktrees/2026-11-10-d5271ec7-upstream-sync`): `git merge upstream/master`
++into `fleet-patches` @ `d50c868ea` (merge commit, no rebase, no force-push; 433 upstream commits since the 2026-10-23
++merge `36e36e63a`, 1231 files changed). Rollback anchor: tag `pre-merge-2026-11-10`. Mirror = 347 patches (two new:
++0346, 0347; regenerated with `BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0 TIP=HEAD`, no `EXCLUDE`).
++
++**Conflicts (15 files, resolved against upstream's new structure):**
++- `ggml/include/ggml-rpc.h` / `ggml/src/ggml-rpc/ggml-rpc.cpp`: `RPC_PROTO_MAJOR_VERSION` -> 9 (upstream's "RPC: Improve
++  loading times"), `RPC_PROTO_PATCH_VERSION` -> 1 (upstream's new patch base 0 + 1 for the fork's extra
++  `GGML_OP_SSM_CONV_SPLIT`). `set_tensor` re-derived on upstream's new streamed-recv body with the fork's atomic
++  cache-write kept. `comm_init`'s bound check took upstream's generalized N-way form. A stale duplicate `comm_allreduce`
++  definition on the fork's conflict side (referencing a removed `state.peer` field) was deleted outright; the real,
++  already-auto-merged definition using `state.allreduce_fn`/`state.backend_comm_ctx` was the only one kept.
++- `ggml/src/ggml-vulkan/ggml-vulkan-types.h`, `ggml-vulkan.cpp`, `vulkan-shaders-gen.cpp`: additive, both concat
++  pipeline families kept (upstream's `concat_transpose_*`, 2D-only, tried first; the fork's `concat_tiled_*`, for
++  `ne[2]`/`ne[3]` > 1, as fallback). Submit-batching sizes from the current graph's flops (the fork's own fix, since
++  upstream's conflicting side still referenced `last_total_flops`, a field the fork had already deleted) fed into
++  upstream's new small-graph-skip optimization.
++- `tests/CMakeLists.txt`: upstream moved `test-llama-archs`/`test-generate-models`/`test-llama-context`/`test-fusion`
++  out of the Windows-shared-lib conditional (a TODO the fork's own pre-merge text already named); re-inserted the
++  fork's `test-state-capture` registrations into the new unconditional location.
++- `tools/rpc/CMakeLists.txt`: additive, fork's `test-rpc-server-multiclient`/`test-rpc-client-timeout` kept alongside
++  upstream's new `test-rpc-unreachable`.
++- `common/fit.cpp`: upstream renamed `path_model` (`const char *`) to `paths_model` (`const std::vector<std::string> &`)
++  and added an `hp_nsk` (skipped-layer) parameter throughout; re-applied the fork's UMA proactive-clamp block
++  (`common_fit_clamp_ctx_to_free_memory`, [mem0:e511296e]) over the new signature, dropped upstream's now-superseded
++  pre-fork `n_streams > 1` re-measure block, and fixed a silent (unmarked) stale `path_model` call in the fork's own
++  retry loop found by grepping the file after the marked conflicts.
++- `common/common.cpp`: upstream extracted the inline fit+split-balance block into `common_fit_apply()` (also called
++  by `common_measure_memory()`, which must not trigger split-balance); re-derived the fit call plus a separate
++  split-balance block, and updated `common_fit_extra_model`'s field and the final model-load call to the new
++  paths-based API.
++- `common/peg-parser.cpp`: upstream added a `COMMON_PEG_PARSE_FLAG_COMPLETE`/`is_complete()` gate around the
++  until_one_of partial-match branch; nested the fork's existing "don't prematurely close on an ambiguous partial
++  delimiter" lenient-check inside it.
++- `common/parsers/qwen3-coder.cpp`: upstream extracted a shared `reasoning_extracted` local keyed on a bare
++  `<tool_call>` boundary; kept the fork's `REASONING_CALL_END` ("don't end reasoning only at a real call opener") fix
++  instead, folding in upstream's added `\n</think>` alternative, and removed the now-unused `reasoning_extracted`.
++- `common/chat.cpp`: additive, upstream's new `tts` template load and the fork's K2-Horizon startup self-check kept
++  in sequence.
++- `ggml/src/ggml-cpu/ops.cpp`: upstream's "rewrite concat as one row kernel for all types" (#31179) already handles a
++  non-contiguous/transposed source row generically; **dropped** the fork's own inline strided-copy patch to
++  `ggml_compute_forward_concat_any` as fully superseded.
++- `src/llama-mmap.cpp`: upstream's conflict side was a textual-alignment artifact (empty); kept the fork's direct-I/O
++  bounce-buffer fix verbatim.
++- `src/models/delta-net-base.cpp`, `src/models/qwen4exp.cpp`: upstream added a generic
++  `llm_graph_context::build_conv_state_store()` ([TAG_RECURRENT_ROLLBACK_SPLITS] via `ggml_set_rows`); the merge
++  initially switched both files to it, but **that regresses them** (see "Post-merge regressions" below) because
++  `build_conv_state_store()` needs the materialized concat(prefix, tokens) the fork's own `ggml_ssm_conv_split`
++  design deliberately avoids. Reverted both to `build_conv_window()`/`build_token_cols()`.
++- `tools/server/server.cpp`: textual-alignment artifact around the `start_loop()`/`clean_up()` shutdown sequence
++  (present exactly once on every side); inserted the fork's `flush_prompt_cache_to_disk()` call ahead of upstream's
++  trailing memory-breakdown print.
++- `tools/server/server-context.cpp` (3 conflicts): upstream moved `slot.prompt.checkpoints` from
++  `std::list<common_prompt_checkpoint>` (by value) to `std::list<std::shared_ptr<const common_prompt_checkpoint>>`;
++  `save_slot_checkpoints`/`slot_file_save`/`prompt_cache_disk_save` kept the fork's nullable-slot, explicit-checkpoints
++  signature (load-bearing for the prompt-cache-disk-spill feature, where no live `server_slot` exists) with their
++  parameter and loop types updated to the shared-ptr list. The fork's `mark_captures_decoded`/`create_captured_checkpoints`
++  (in-batch checkpoint capture) and upstream's new `process_realtime_slots()` sat at the same spot; kept both. The
++  fork's in-batch-capture extension to the "break at last user message" checkpoint logic is a strict superset of
++  upstream's simpler unconditional-break version (reduces to it when `ckpt_capture` is off); kept the fork's.
++- `tests/test-backend-ops.cpp`, `tests/test-chat.cpp`: both additive (fork's `test_concat_transposed`/
++  `test_qwen3_coder_arg_tags` alongside upstream's `test_concat`/`test_chat_json_depth`); kept both.
++
++**Post-merge regressions found by `ctest` (none were flagged as conflicts):**
++- `src/models/clover-moe.cpp` (upstream's new Clover MoE model) called the fork's `build_conv_state()` expecting the
++  old concatenated-tensor return; ported it to `{prefix, new_tokens}` + `ggml_ssm_conv_split`, like qwen35/qwen3next
++  (compile error).
++- `common_prompt_checkpoint::data_tgt`/`data_dft` became `common_state_data` (a no-init-allocator vector) upstream;
++  the server's captured-checkpoint, slot-save and prompt-cache-spill paths still used `std::vector<uint8_t>` in several
++  places outside any conflict marker (compile error).
++- `common_get_device_memory_data_with_extra` (split-balance's probe) still took a single `path_model`; ported to
++  `paths_model`/`hp_nsk` like the rest of `fit.cpp` (compile error).
++- `build_conv_state_store()`'s generic store assumes a materialized concat buffer; `build_conv_state`/`build_conv_state_split`
++  deliberately never build one (that's the point of `ggml_ssm_conv_split`), so the initial merge resolution crashed
++  `test-state-capture` on `GGML_ASSERT(a->nb[0] == ggml_type_size(a->type))` inside `ggml_view_impl` the first time a
++  qwen35-dense graph ran. Reverted to the fork's own per-slot `build_conv_window()` loop (see conflict list above).
++- `common/peg-parser.cpp`'s new recursion-depth check indexes `ctx.rule_depth`, which only the root `arena.parse()`
++  sizes; the K2-Horizon lenient-fallback parse in `chat.cpp` starts at a rule on a fresh context, so `rule_depth` was
++  empty and `test-chat` segfaulted. The rule-parser branch now grows `rule_depth` on demand.
++- `tests/test-backend-ops.cpp`'s `test_ssm_conv_split_graph` cut a view from a transposed tensor and hand-patched its
++  `nb[0]`; upstream's new view-bounds assert (#31584, `ggml_view_impl`) rejects that. Now cuts from the contiguous rows
++  and transposes, like `build_token_cols`.
++- `tests/test-llama-context.cpp` runs four model threads in one process with `fit_params = false` to avoid swapping a
++  stack-local log callback from a non-owning thread; `--split-balance`'s default (`auto`) memory probe does the same
++  swap and crashed the run. The test now also sets `split_balance = 0` (`COMMON_SPLIT_BALANCE_MEMORY`).
++
++Fixed in commits `ea3f2dc9a` and `7571530fa` on top of the merge commit `d50c868ea`.
++
++**Checklist item 5 (fleet flag list) also updated in this same edit** -- see item 5 below; re-extracted from
++home-infrastructure's values*.yaml/templates with the corrected `rg` invocation (the previous command used `-h`,
++which in ripgrep 14 means "show help," not "no filename" -- it had been printing ripgrep's own usage text, not any
++real flags, so the list below is the first one actually drawn from the fleet's files rather than carried over by
++hand). Every extracted flag confirmed present in the new `llama-server --help`.
++
++**Checks:** `LLAMA_STATE_SEQ_VERSION`/`LLAMA_SESSION_VERSION`/`*_FLAGS_*` unchanged in `include/llama.h`. KV-cache
++`state_write`/`state_write_meta`/`state_write_data`/`state_read*` bodies in `llama-kv-cache.cpp` are byte-identical
++between `36e36e63a` and `upstream/master` (diffed function-by-function). `llama-memory-recurrent.cpp`/
++`llama-memory-hybrid*.cpp`/`llama-kv-cache-iswa.cpp` changed only constructor plumbing for a new `no_alloc` parameter
++and an `rs_max`-bounded rollback window, not wire format. `llama-context.cpp`'s `io_magic` (`0xaf143cd8`) and the
++`/slots`/`/props` JSON keys the fork's SCKP appendix and `litellm_custom_callbacks.py` depend on are unchanged.
++`ggml.h`'s `GGML_OP_COUNT` is unchanged (both fork ops already counted from the 2026-10-23 sync); no new RPC op
++`static_assert` bump needed. K2: `test-chat`'s K2 blocks and `test_k2_guard_fields` pass, startup log `K2-Horizon
++parser: guard inert=6 hold=10` (no specialized parser pre-empts the fork's K2 handling).
++
++**Verified (Vulkan `GGML_VULKAN=ON GGML_RPC=ON` build, tests on; NVIDIA RTX 3080 Ti Laptop + Intel UHD iGPU):**
++`ctest` 81/83 (the 2 failures are `test-conversion-fp8`/`test-kv-cache-scales`, both `ModuleNotFoundError: torch` in
++this environment, not a merge regression). `test-backend-ops -o "CONCAT|SSM_CONV"` 587/587 on Vulkan0, Vulkan1 and
++CPU. `tools/server/tests` pytest `-m "not slow"`: 483 passed, 5 skipped, 2 failed. One failure
++(`test_n_probs_post_backend_sampling`) reproduces identically on the pre-merge tip `8cc736031` -- pre-existing, not a
++merge regression. The other (`test_speculative.py::test_grammar_drafts_unless_no_spec_grammar`) is new: with
++`--spec-grammar` on (the fork's default), the greedy completion under a grammar now differs, token-for-token, from
++plain (no-draft) greedy decode on the same prompt/seed -- both outputs are still grammar-valid, but speculative
++decoding with grammar no longer reproduces what plain decode would have produced, which is the whole correctness
++contract `--spec-grammar` depends on. `src/llama-grammar.cpp` had zero fork code and zero merge conflicts; upstream
++rewrote `llama_grammar_reject_candidates_for_stack` as a non-recursive, index-based walk in `48c9f08b7` ("grammar:
++reject candidates in a loop, without a depth limit", landed to fix long-token tokenizers always-rejecting under
++depth 256). The regression is in that rewrite, not in anything this sync's conflict resolutions touched -- see
++"Decisions for the operator" in the 2026-11-10 session report for the root-cause investigation and why it was
++reported rather than patched here. Not yet: production-image build, canary, Dawn QA pass (out of scope for this
++sync per the task that requested it).
++
+ ## Upstream sync 2026-10-23 (merged upstream `36e36e63a`, added 2026-10-23)
+ 
+ Branch `upstream-sync-2026-10-23` (worktree `.worktrees/2026-10-23-upstream-sync`): `git merge upstream/master` into
+@@ -294,14 +417,20 @@ home-infrastructure artifact must change in the same series.
+    `git diff OLD..NEW -- src/llama-context.cpp | rg io_magic`, and check the
+    `get_data_ext` output still starts with magic + seq_id (8 bytes) before the payload.
+ 5. Flags the fleet uses (values-*.yaml `extraArgs`, chart templates): extract with
+-   `rg -oN -h -- '--?[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
+-   in home-infrastructure (non-comment lines), then confirm every
+-   flag appears in the new `llama-server --help` (current set: `--parallel/-np`,
+-   `--batch-size`, `--ubatch-size`, `--spec-type {ngram-mod,draft-dflash}`,
+-   `--spec-draft-n-max`, `--model-draft`, `--chat-template-kwargs`, `--cache-ram`,
+-   `--no-cache-idle-slots`, `--slot-save-path`, `--cpu-split`, `--split-balance`,
+-   `--split-workload`, `--split-calibrate`, `--cache-type-k/v`, `-fa`, `-ngl`,
+-   `--n-cpu-moe`, `-ts`, `--rpc`, `--fit`, `--reasoning-format`, `--embeddings`).
++   `rg -oNI -- '(^|[\s"=,\[])-{1,2}[a-z][a-z0-9-]+' deployments/llamacpp-rpc/values*.yaml deployments/llamacpp-rpc/templates`
++   in home-infrastructure (`-I`, not `-h`: in ripgrep 14 `-h` prints the help, so the previous form of this command
++   printed ripgrep's own usage; the output also holds shell flags from the CronJobs, `-exec`, `-mmin`, `-type`, ...: ignore those),
++   then confirm every `llama-server` flag appears in the new `llama-server --help`. Current set (extracted 2026-11-10 from
++   the values files and chart templates, every one present in `--help` after the 2026-11-10 sync): `--parallel/-np`,
++   `--batch-size`, `--ubatch-size`, `--ctx-size/-c` (built by the chart from `ctxSize`), `--model`, `--model-draft`,
++   `--mmproj`, `-hf/--hf-repo`, `--models-preset`, `--models-dir`, `--host`, `--port`, `--api-key`, `--metrics`,
++   `--embeddings`, `--pooling`, `--spec-type {ngram-mod,draft-mtp,draft-dflash}`, `--spec-draft-n-max`, `--spec-grammar`,
++   `--chat-template-kwargs`, `--reasoning`, `--reasoning-format`, `--cache-ram`, `--cache-reuse` (chart default 256),
++   `--slot-prompt-similarity` (chart default 0.5), `--ctx-checkpoints`, `--no-cache-idle-slots`, `--slot-save-path`,
++   `--load-mode`, `--cpu-split`, `--split-balance`, `--split-workload`, `--cache-type-k/v` (`-ctk/-ctv`), `-fa`, `-ngl`,
++   `--n-cpu-moe/-ncmoe`, `-ts`, `--rpc`, `--fit`, `--rope-scaling`, `--rope-scale`, `--yarn-orig-ctx`, and the sampling
++   defaults `--temp`, `--top-k`, `--top-p`, `--presence-penalty`. (`--split-calibrate`, listed here before, is no
++   longer passed by any values file or template.)
+ 6. Buffer-type / backend interface (`ggml/src/ggml-backend-impl.h`), batch API
+    (`llama_batch_ext`) and `common/` helper signatures: these produce compile breaks
+    in our out-of-tree initialisers and tests; a clean `git merge`/rebase is not proof.
+diff --git a/fleet-patches/0346-Fix-compile-breaks-the-2026-11-10-upstream-merge-lef.patch b/fleet-patches/0346-Fix-compile-breaks-the-2026-11-10-upstream-merge-lef.patch
+new file mode 100644
+index 000000000..55d02cedb
+--- /dev/null
++++ b/fleet-patches/0346-Fix-compile-breaks-the-2026-11-10-upstream-merge-lef.patch
+@@ -0,0 +1,225 @@
++From ea3f2dc9a13daed099bc37e72d3f4016c4d6203d Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Tue, 10 Nov 2026 13:39:42 -0600
++Subject: [PATCH] Fix compile breaks the 2026-11-10 upstream merge left outside
++ conflict markers
++
++Upstream changed three interfaces that fork-only code still used the old shape of, none flagged by git:
++
++- common_prompt_checkpoint::data_tgt/data_dft are now common_state_data (no-init allocator vector); the server's captured-checkpoint, slot-save and prompt-cache-spill paths still passed std::vector<uint8_t>.
++- common_get_device_memory_data_impl takes paths_model and hp_nsk; the fork's common_get_device_memory_data_with_extra (split-balance probe) still took a single path.
++- the new Clover MoE model calls build_conv_state expecting the concatenated tensor; the fork's build_conv_state returns {prefix, new_tokens} for ggml_ssm_conv_split, so clover-moe now uses that, like qwen35/qwen3next.
++
++Vulkan+RPC build with tests now links clean.
++
++Assisted-by: Claude Sonnet
++---
++ common/fit.cpp                  |  8 +++++---
++ common/fit.h                    |  2 +-
++ common/split-balance.cpp        |  6 +++---
++ src/models/clover-moe.cpp       |  4 ++--
++ tools/server/server-context.cpp | 20 ++++++++++----------
++ 5 files changed, 21 insertions(+), 19 deletions(-)
++
++diff --git a/common/fit.cpp b/common/fit.cpp
++index c4da4de88..2d673c198 100644
++--- a/common/fit.cpp
+++++ b/common/fit.cpp
++@@ -309,17 +309,18 @@ common_device_memory_data_vec common_get_device_memory_data(
++ }
++ 
++ common_device_memory_data_vec common_get_device_memory_data_with_extra(
++-        const char * path_model,
+++        const std::vector<std::string> & paths_model,
++         const llama_model_params * mparams,
++         const llama_context_params * cparams,
++         const common_fit_extra_model * extra,
++         std::vector<ggml_backend_dev_t> & devs,
++         uint32_t & hp_ngl,
++         ggml_log_level log_level) {
+++    uint32_t hp_nsk = 0;
++     uint32_t hp_nct = 0;
++     uint32_t hp_nex = 0;
++     std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
++-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+++            paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
++     // the graph node counts describe the main model, not the extra one probed below
++     const int32_t nodes_pp = g_last_graph_nodes_pp;
++     const int32_t nodes_tg = g_last_graph_nodes_tg;
++@@ -327,13 +328,14 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
++     if (extra != nullptr) {
++         std::vector<ggml_backend_dev_t> devs_extra;
++         uint32_t ngl_extra = 0;
+++        uint32_t nsk_extra = 0;
++         uint32_t nct_extra = 0;
++         uint32_t nex_extra = 0;
++         llama_context_params cparams_extra = *extra->cparams;
++         cparams_extra.n_ctx = cparams->n_ctx;
++         try {
++             const auto measured = common_get_device_memory_data_impl(
++-                extra->path_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+++                extra->paths_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
++             for (size_t je = 0; je < devs_extra.size(); je++) {
++                 for (size_t id = 0; id < devs.size(); id++) {
++                     if (devs_extra[je] == devs[id]) {
++diff --git a/common/fit.h b/common/fit.h
++index 34a6f6d04..298985a7c 100644
++--- a/common/fit.h
+++++ b/common/fit.h
++@@ -104,7 +104,7 @@ void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg);
++ // Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
++ // main model's devices the way common_fit_params accounts for it. extra may be nullptr.
++ common_device_memory_data_vec common_get_device_memory_data_with_extra(
++-                         const char * path_model,
+++       const std::vector<std::string> & paths_model,
++                  const llama_model_params * mparams,
++                const llama_context_params * cparams,
++        const common_fit_extra_model * extra,
++diff --git a/common/split-balance.cpp b/common/split-balance.cpp
++index e94f3f28d..3ae558fd2 100644
++--- a/common/split-balance.cpp
+++++ b/common/split-balance.cpp
++@@ -1435,7 +1435,7 @@ void common_split_balance_apply(
++     llama_model_params mp = mparams;
++     common_device_memory_data_vec mem;
++     try {
++-        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+++        mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
++     } catch (const std::exception & e) {
++         LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++         return;
++@@ -1473,7 +1473,7 @@ void common_split_balance_apply(
++     set_split(probe_split, probe);
++     mp.tensor_split = probe_split;
++     try {
++-        mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+++        mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
++     } catch (const std::exception & e) {
++         LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++         return;
++@@ -1522,7 +1522,7 @@ void common_split_balance_apply(
++         }
++         set_split(probe_split, n);
++         try {
++-            mem = common_get_device_memory_data_with_extra(params.model.path.c_str(), &mp, &cparams, extra, devs, n_layer, lvl);
+++            mem = common_get_device_memory_data_with_extra(params.model.get_paths(), &mp, &cparams, extra, devs, n_layer, lvl);
++         } catch (const std::exception & e) {
++             LOG_WRN("%s: could not measure device memory (%s), keeping the memory split\n", __func__, e.what());
++             return;
++diff --git a/src/models/clover-moe.cpp b/src/models/clover-moe.cpp
++index 9caaa5630..e06fa95e0 100644
++--- a/src/models/clover-moe.cpp
+++++ b/src/models/clover-moe.cpp
++@@ -327,13 +327,13 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
++     const int64_t conv_kernel_size = conv_kernel->ne[0];
++     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
++ 
++-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+++    auto [conv_prefix, conv_new_tokens] = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
++ 
++     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++     cb(state, "state_predelta", il);
++ 
++-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+++    ggml_tensor * conv_output_proper = ggml_ssm_conv_split(ctx0, conv_prefix, conv_new_tokens, conv_kernel);
++     cb(conv_output_proper, "conv_output_raw", il);
++ 
++     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
++diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
++index 0dccf160f..5db5663cf 100644
++--- a/tools/server/server-context.cpp
+++++ b/tools/server/server-context.cpp
++@@ -2900,7 +2900,7 @@ private:
++     // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
++     // id_task_ckpt: the task the checkpoint belongs to, when the slot may no longer hold it (captured checkpoints)
++     void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
++-            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr, int id_task_ckpt = -1) {
+++            common_state_data * data_tgt = nullptr, common_state_data * data_dft = nullptr, int id_task_ckpt = -1) {
++         const int id_task = id_task_ckpt >= 0 ? id_task_ckpt : slot.task ? slot.task->id : -1;
++ 
++         // evict checkpoints within min-step of a previous checkpoint, unless they were
++@@ -3121,7 +3121,7 @@ private:
++     static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
++ 
++     // the live draft state of a slot: the full draft context and the speculative state
++-    void capture_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
+++    void capture_slot_draft(const server_slot & slot, common_state_data & data_dft, std::vector<uint8_t> & data_spec) const {
++         data_dft.clear();
++         data_spec.clear();
++         if (ctx_dft != nullptr) {
++@@ -3132,7 +3132,7 @@ private:
++     }
++ 
++     // returns false if the draft state could not be written completely; slot is only used for logging, may be null
++-    bool save_slot_draft(const std::string & filepath, const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
+++    bool save_slot_draft(const std::string & filepath, const common_state_data & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
++         n_written = 0;
++         if (data_dft.empty() && data_spec.empty()) {
++             return true;
++@@ -3210,7 +3210,7 @@ private:
++             const server_slot * slot,
++             const std::function<size_t(const std::string &)> & write_state,
++             const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
++-            const std::vector<uint8_t> & data_dft,
+++            const common_state_data & data_dft,
++             const std::vector<uint8_t> & data_spec,
++             std::string & err) const {
++         const std::filesystem::path fspath = std::filesystem::u8path(filepath);
++@@ -3410,7 +3410,7 @@ private:
++             const server_tokens & tokens,
++             const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
++             const std::function<size_t(const std::string &, const std::vector<char> &)> & write_state,
++-            const std::vector<uint8_t> & data_dft,
+++            const common_state_data & data_dft,
++             const std::vector<uint8_t> & data_spec) {
++         const int64_t t_start = ggml_time_us();
++ 
++@@ -3534,7 +3534,7 @@ private:
++             return false; // skipped for another reason, e.g. already in the cache
++         }
++ 
++-        std::vector<uint8_t> data_dft;
+++        common_state_data data_dft;
++         std::vector<uint8_t> data_spec;
++         capture_slot_draft(slot, data_dft, data_spec);
++ 
++@@ -3569,7 +3569,7 @@ private:
++                 continue;
++             }
++ 
++-            std::vector<uint8_t> data_dft;
+++            common_state_data data_dft;
++             std::vector<uint8_t> data_spec;
++             capture_slot_draft(slot, data_dft, data_spec);
++ 
++@@ -3883,7 +3883,7 @@ private:
++ 
++                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
++ 
++-                    std::vector<uint8_t> data_dft;
+++                    common_state_data data_dft;
++                     std::vector<uint8_t> data_spec;
++                     capture_slot_draft(*slot, data_dft, data_spec);
++ 
++@@ -4370,7 +4370,7 @@ private:
++                         do_checkpoint ? "yes" : "no", cap.n_tokens, pos_min, pos_max);
++ 
++                 // the draft state: captured, not started yet, or read now and trimmed on restore
++-                std::vector<uint8_t> data_dft;
+++                common_state_data data_dft;
++                 bool read_dft_now = false;
++                 if (do_checkpoint && ctx_dft) {
++                     const size_t n_dft = ckpt_capture_dft ? llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, nullptr, 0, nullptr, nullptr) : 0;
++@@ -4388,7 +4388,7 @@ private:
++                 }
++ 
++                 if (do_checkpoint) {
++-                    std::vector<uint8_t> data(n);
+++                    common_state_data data(n);
++                     llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
++ 
++                     create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft, cap.id_task);
++-- 
++2.43.0
++
+diff --git a/fleet-patches/0347-Restore-the-fork-s-concat-free-conv-state-store-fix-.patch b/fleet-patches/0347-Restore-the-fork-s-concat-free-conv-state-store-fix-.patch
+new file mode 100644
+index 000000000..0c4cfdcee
+--- /dev/null
++++ b/fleet-patches/0347-Restore-the-fork-s-concat-free-conv-state-store-fix-.patch
+@@ -0,0 +1,281 @@
++From 7571530fa7ee35f913b9d67be887062f9a1ea08b Mon Sep 17 00:00:00 2001
++From: dgabehar <dgabehar@gmail.com>
++Date: Tue, 10 Nov 2026 13:50:24 -0600
++Subject: [PATCH] Restore the fork's concat-free conv-state store, fix three
++ more merge regressions
++
++Found by running ctest on the 2026-11-10 upstream merge:
++
++- delta-net-base.cpp / qwen4exp.cpp: the merge had swapped the fork's per-slot conv-window stores for upstream's build_conv_state_store(). That helper expects conv_x to be the materialized concat(history, tokens); the fork's build_conv_state/_split deliberately return {prefix, new_tokens} for ggml_ssm_conv_split and never build the concat, so the helper cut views out of a transposed tensor and hit the new GGML_ASSERT in ggml_view_impl (test-state-capture). Back to build_conv_window()/build_token_cols() as before the merge.
++- peg-parser.cpp: upstream's recursion limit indexes ctx.rule_depth, which only the root parse() sizes. The K2-Horizon lenient-fallback parse in chat.cpp starts at a rule on a fresh context, so rule_depth was empty and test-chat segfaulted. The rule parser now grows rule_depth on demand.
++- test-backend-ops.cpp: test_ssm_conv_split_graph viewed a transposed tensor and patched nb[0] by hand; upstream's view assert (#31584) rejects that. It now cuts the tail from the contiguous rows and transposes, like build_token_cols.
++- test-llama-context.cpp: four model threads load in one process; --split-balance's default (auto) memory probe swaps the same global log callback that fit_params=false already avoids, which crashed the run. The test sets split_balance to memory.
++
++Assisted-by: Claude Sonnet
++---
++ common/peg-parser.cpp         |   6 ++
++ src/models/delta-net-base.cpp | 113 ++++++++++++++++++++++++++++++++--
++ src/models/models.h           |  10 +++
++ src/models/qwen4exp.cpp       |  31 ++++++++--
++ tests/test-backend-ops.cpp    |   5 +-
++ tests/test-llama-context.cpp  |   3 +
++ 6 files changed, 157 insertions(+), 11 deletions(-)
++
++diff --git a/common/peg-parser.cpp b/common/peg-parser.cpp
++index 534b3ea01..7971c0ca7 100644
++--- a/common/peg-parser.cpp
+++++ b/common/peg-parser.cpp
++@@ -760,6 +760,12 @@ struct parser_executor {
++     }
++ 
++     common_peg_parse_result operator()(const common_peg_rule_parser & p) {
+++        // the root parse() sizes rule_depth for the whole arena; a context that starts at a rule instead
+++        // (the K2-Horizon lenient-fallback parse in chat.cpp) never went through it
+++        if (ctx.rule_depth.size() <= (size_t) p.child) {
+++            ctx.rule_depth.resize((size_t) p.child + 1, 0);
+++        }
+++
++         // only rules recurse, a recursive rule is entered once per input level
++         if (ctx.rule_depth[p.child] >= RULE_RECURSIVE_LIMIT) {
++             throw common_peg_recursion_error("input is nested more than " + std::to_string(RULE_RECURSIVE_LIMIT) + " levels deep");
++diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
++index b841c70f9..851abdda7 100644
++--- a/src/models/delta-net-base.cpp
+++++ b/src/models/delta-net-base.cpp
++@@ -443,6 +443,67 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
++     return build_delta_net_chunking(q, k, v, g, b, s, il);
++ }
++ 
+++// Build the width-(conv_kernel_size - 1) window starting at logical column
+++// `s_idx` of what used to be the materialized concat(prefix, new_tokens)
+++// buffer, without materializing that full buffer. The window either falls
+++// entirely inside `prefix` (s_idx == 0), entirely inside `new_tokens`
+++// (s_idx >= dm1), or straddles the boundary between them (0 < s_idx < dm1) --
+++// s_idx < dm1 only happens when n_t < dm1, i.e. during single/small-token
+++// decode steps, since prefill's n_t is normally far larger than the conv
+++// kernel width. The straddling case is the one the old concat-based code got
+++// "for free"; here it costs a small (at most dm1-wide) concat instead of one
+++// sized by the full n_t.
+++//
+++// new_tokens is a transposed view: its dim 0 (tokens) has a row-sized stride.
+++// ggml_view_* always gives a view a unit dim-0 stride, so a token range is cut
+++// from the untransposed [conv_channels, n_t, n_seqs] layout and transposed back.
+++static ggml_tensor * build_token_cols(
+++        ggml_context * ctx0,
+++        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], transposed view
+++        int64_t        start,
+++        int64_t        count,
+++        int64_t        conv_channels,
+++        int64_t        n_seqs) {
+++    ggml_tensor * rows = ggml_transpose(ctx0, new_tokens);
+++    GGML_ASSERT(rows->nb[0] == ggml_type_size(rows->type));
+++
+++    rows = ggml_view_3d(ctx0, rows,
+++            conv_channels, count, n_seqs,
+++            rows->nb[1], rows->nb[2],
+++            start * rows->nb[1]);
+++
+++    return ggml_transpose(ctx0, rows);
+++}
+++
+++ggml_tensor * build_conv_window(
+++        ggml_context * ctx0,
+++        ggml_tensor  * prefix,     // [dm1, conv_channels, n_seqs], contiguous
+++        ggml_tensor  * new_tokens, // [n_t, conv_channels, n_seqs], possibly non-contiguous
+++        int64_t        dm1,
+++        int64_t        conv_channels,
+++        int64_t        n_seqs,
+++        int64_t        s_idx) {
+++    GGML_ASSERT(s_idx >= 0 && s_idx <= new_tokens->ne[0]);
+++
+++    if (s_idx == 0) {
+++        return prefix;
+++    }
+++
+++    if (s_idx >= dm1) {
+++        return build_token_cols(ctx0, new_tokens, s_idx - dm1, dm1, conv_channels, n_seqs);
+++    }
+++
+++    ggml_tensor * prefix_part =
+++        ggml_view_3d(ctx0, prefix,
+++                dm1 - s_idx, conv_channels, n_seqs,
+++                prefix->nb[1], prefix->nb[2],
+++                s_idx * prefix->nb[0]);
+++
+++    ggml_tensor * new_tokens_part = build_token_cols(ctx0, new_tokens, 0, s_idx, conv_channels, n_seqs);
+++
+++    return ggml_concat(ctx0, prefix_part, new_tokens_part, 0);
+++}
+++
++ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_state(
++         llm_graph_input_rs * inp,
++         ggml_tensor *        conv_states_all,
++@@ -450,6 +511,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_sta
++         int64_t              conv_kernel_size,
++         int64_t              conv_channels,
++         int                  il) {
+++    const auto * mctx_cur = inp->mctx;
+++
+++    const auto kv_head  = mctx_cur->get_head();
+++    const auto mem_size = mctx_cur->get_size();
+++
++     const int64_t n_seqs = ubatch.n_seqs;
++     const int64_t dm1    = conv_kernel_size - 1;
++ 
++@@ -462,11 +528,48 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_conv_sta
++     ggml_tensor * new_tokens = ggml_transpose(ctx0, qkv_mixed);
++     cb(new_tokens, "qkv_mixed_transposed", il);
++ 
++-    // build_conv_state_store() (llama-graph.cpp) handles both branches below generically: a direct
++-    // copy when cparams.n_rs_seq == 0, and the [TAG_RECURRENT_ROLLBACK_SPLITS] vectorized ggml_set_rows
++-    // scatter otherwise. It reads conv_x's own tail n_cols columns as the window to store, so it needs
++-    // the raw conv_states_all storage (not the locally reshaped conv_states) and the new tokens only.
++-    build_conv_state_store(inp, conv_states_all, new_tokens, dm1, 0);
+++    const int64_t n_t = new_tokens->ne[0];
+++
+++    const int64_t row_count = dm1 * conv_channels;
+++
+++    const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+++
+++    if (cparams.n_rs_seq == 0) {
+++        const int64_t s_idx  = n_t;
+++        const int64_t s_slot = 0;
+++
+++        ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+++        cb(conv_state_last, "conv_state_last", il);
+++
+++        ggml_tensor * conv_state_update =
+++            ggml_view_2d(ctx0, conv_states_all,
+++                    row_count, n_seqs, conv_states_all->nb[1],
+++                    (s_slot * mem_size + kv_head) * row_size);
+++        cb(conv_state_update, "conv_state_update", il);
+++
+++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+++    } else {
+++        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+++        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+++        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+++
+++        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+++
+++        for (int64_t t = 1; t <= K; ++t) {
+++            const int64_t s_idx  = std::max<int64_t>(0, n_t - K + t);
+++            const int64_t s_slot = K - t;
+++
+++            ggml_tensor * conv_state_last = build_conv_window(ctx0, conv_states, new_tokens, dm1, conv_channels, n_seqs, s_idx);
+++
+++            ggml_tensor * conv_state_update =
+++                ggml_view_2d(ctx0,
+++                        conv_states_all, row_count, n_seqs,
+++                        conv_states_all->nb[1],
+++                        (s_slot * mem_size + kv_head) * row_size);
+++
+++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+++        }
+++    }
++ 
++     return { conv_states, new_tokens };
++ }
++diff --git a/src/models/models.h b/src/models/models.h
++index c145ec985..8ce2e1559 100644
++--- a/src/models/models.h
+++++ b/src/models/models.h
++@@ -17,6 +17,16 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor *
++     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
++ }
++ 
+++// width-(conv_kernel_size - 1) window of concat(prefix, new_tokens) without materializing it (delta-net-base.cpp)
+++ggml_tensor * build_conv_window(
+++        ggml_context * ctx0,
+++        ggml_tensor  * prefix,
+++        ggml_tensor  * new_tokens,
+++        int64_t        dm1,
+++        int64_t        conv_channels,
+++        int64_t        n_seqs,
+++        int64_t        s_idx);
+++
++ //
++ // base classes
++ //
++diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
++index 722bb77e8..5b4d4fe0c 100644
++--- a/src/models/qwen4exp.cpp
+++++ b/src/models/qwen4exp.cpp
++@@ -1380,6 +1380,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_conv_
++         int64_t              state_cols,
++         int64_t              channels,
++         int                  il) {
+++    const auto * mctx_cur = inp->mctx;
+++
+++    const auto kv_head = mctx_cur->get_head();
+++
++     const int64_t n_seqs    = ubatch.n_seqs;
++     const int64_t row_total = conv_states_all->ne[0];
++ 
++@@ -1397,10 +1401,29 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_conv_
++ 
++     ggml_tensor * new_tokens = ggml_transpose(ctx0, x);
++ 
++-    // build_conv_state_store() (llama-graph.cpp) covers the same [TAG_RECURRENT_ROLLBACK_SPLITS]
++-    // rollback-slot storage generically now (vectorized ggml_set_rows); the two-row subtlety this
++-    // function's docstring warns about is on the gather side above (rs_rows), not the store below.
++-    build_conv_state_store(inp, conv_states_all, new_tokens, state_cols, 0);
+++    const int64_t n_t = new_tokens->ne[0];
+++
+++    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
+++    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
+++    // (upstream's build_conv_state_store() needs the materialized concat(history, tokens), which this
+++    // function exists to avoid: it reads across the split instead, so the windows are cut by hand)
+++    const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+++    const uint32_t mem_size = mctx_cur->get_size();
+++
+++    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+++
+++    for (int64_t slot = 0; slot < n_slots; ++slot) {
+++        const int64_t s_idx = std::max<int64_t>(0, n_t - slot);
+++
+++        ggml_tensor * tail = build_conv_window(ctx0, state, new_tokens, state_cols, channels, n_seqs, s_idx);
+++
+++        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+++                state_cols * channels, n_seqs,
+++                conv_states_all->nb[1],
+++                (slot * mem_size + kv_head) * row_size);
+++
+++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+++    }
++ 
++     return { state, new_tokens };
++ }
++diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
++index f73608437..a456ca0f5 100644
++--- a/tests/test-backend-ops.cpp
+++++ b/tests/test-backend-ops.cpp
++@@ -4906,8 +4906,9 @@ struct test_ssm_conv_split_graph : public test_case {
++         ggml_tensor * nt = ggml_transpose(ctx, qkv);
++ 
++         // tail = last dm1 tokens of nt, made contiguous (n_t >= dm1)
++-        ggml_tensor * tv = ggml_view_3d(ctx, nt, dm1, channels, 1, nt->nb[1], nt->nb[2], (n_t - dm1) * nt->nb[0]);
++-        tv->nb[0] = nt->nb[0];
+++        // (cut from the untransposed rows, which are contiguous along dim 0: ggml_view_3d requires that of its source)
+++        ggml_tensor * tv = ggml_view_3d(ctx, qkv, channels, dm1, 1, qkv->nb[1], qkv->nb[2], (n_t - dm1) * qkv->nb[1]);
+++        tv = ggml_transpose(ctx, tv);
++         ggml_tensor * dst = ggml_view_2d(ctx, state_all, dm1 * channels, 1, state_all->nb[1], 0);
++         ggml_tensor * cp  = ggml_cpy(ctx, ggml_cont(ctx, tv), dst);
++ 
++diff --git a/tests/test-llama-context.cpp b/tests/test-llama-context.cpp
++index 62fedea50..921e5aba5 100644
++--- a/tests/test-llama-context.cpp
+++++ b/tests/test-llama-context.cpp
++@@ -362,6 +362,9 @@ int main(int argc, char ** argv) {
++     //   that points to the stack of the thread doing the fit, which is only safe while no other
++     //   thread is inside llama - and the models of this test are far too small to need it
++     params.fit_params = false;
+++    // --split-balance (fork) measures the device memory the same way, so its default (auto) swaps the
+++    //   same callback from every model thread; the split of a model this small does not matter
+++    params.split_balance = 0; // COMMON_SPLIT_BALANCE_MEMORY
++ 
++     const std::vector<const ctx_test *> cases = select_cases(test_filter);
++     if (cases.empty()) {
++-- 
++2.43.0
++
+diff --git a/fleet-patches/README.md b/fleet-patches/README.md
+index aab539c93..8842e247f 100644
+--- a/fleet-patches/README.md
++++ b/fleet-patches/README.md
+@@ -28,7 +28,7 @@ resolved (read the patch's own commit message for *why* the change exists,
+ re-derive the equivalent change against the new upstream code, `git am
+ --continue`).
+ 
+-## Current patches (regenerated 2026-11-03; fleet-patches last merged with upstream at `36e36e63a` on 2026-10-23, 999 commits behind `upstream/master`'s current tip `20a51f24a` as of this regen -- no new upstream merge in this regen, see note below)
++## Current patches (regenerated 2026-11-10; fleet-patches merged with upstream `202c1a229` on 2026-11-10, see FLEET.md "Upstream sync 2026-11-10")
+ 
+ | # | Commit | Summary |
+ |---|---|---|
+@@ -377,14 +377,18 @@ re-derive the equivalent change against the new upstream code, `git am
+ | 0343 | `3d5f8253c` | server: keep evicted prompt cache entries in the slot dir and restore them on a miss |
+ | 0344 | `5c97dad6e` | server: flush the prompt cache to the slot dir on SIGTERM/SIGINT |
+ | 0345 | `2f7d95d15` | server: fix review findings on the SIGTERM prompt-cache flush |
++| 0346 | `ea3f2dc9a` | Fix compile breaks the 2026-11-10 upstream merge left outside conflict markers |
++| 0347 | `7571530fa` | Restore the fork's concat-free conv-state store, fix three more merge regressions |
+ 
+ The `split-balance` / `vulkan: size submit batches` patches are the speed-aware
+ split and pipeline fixes (see FLEET.md, "Speed-aware split and pipeline
+ fixes"). Fork-only, not submitted upstream.
+ 
+-This mirror was regenerated on 2026-11-04 (345 patches, extended with the shutdown-flush
+-fix for the disk-backed prompt-cache feature, PR #34; no manual upstream merge yet --
+-that is tracked separately, fleet-patches is behind `upstream/master` as of this regen).
++This mirror was regenerated on 2026-11-10 (347 patches: the 345 of the previous mirror, plus the two
++commits that fix what the 2026-11-10 upstream merge broke; `BASE=202c1a229f5a83d1c9d758ed0f2d43760fa4bab0 TIP=HEAD`,
++no `EXCLUDE`, as for the 345-patch mirror). The merge commit itself carries no patch; its conflict resolutions
++are listed in FLEET.md. The CPU strided-concat hunk of 0334 is now covered by upstream's concat row kernel
++(only the test part of that patch is still live).
+ Patch numbers changed from the previous table; refer to patches by subject.
+ 
+ See `~/src/llama.cpp/CLAUDE.md`'s "Fleet patch maintenance" section for the
+-- 
+2.43.0
+
