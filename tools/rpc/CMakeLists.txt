@@ -32,6 +32,12 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
             $<TARGET_FILE:test-rpc-client-timeout>)
     set_property(TEST test-rpc-client-timeout PROPERTY LABELS main)
     set_property(TEST test-rpc-client-timeout PROPERTY TIMEOUT 60)
+
+    add_executable(test-rpc-unreachable ${PROJECT_SOURCE_DIR}/tests/test-rpc-unreachable.cpp)
+    target_link_libraries(test-rpc-unreachable PRIVATE ggml ggml-rpc)
+    target_include_directories(test-rpc-unreachable PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-rpc-unreachable COMMAND test-rpc-unreachable)
+    set_property(TEST test-rpc-unreachable PROPERTY LABELS main)
 endif()
 
 if(LLAMA_TOOLS_INSTALL)
