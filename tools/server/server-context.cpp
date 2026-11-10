@@ -2900,7 +2900,7 @@ private:
     // data_tgt/data_dft: the states captured at that point, or nullptr to read them now
     // id_task_ckpt: the task the checkpoint belongs to, when the slot may no longer hold it (captured checkpoints)
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max,
-            std::vector<uint8_t> * data_tgt = nullptr, std::vector<uint8_t> * data_dft = nullptr, int id_task_ckpt = -1) {
+            common_state_data * data_tgt = nullptr, common_state_data * data_dft = nullptr, int id_task_ckpt = -1) {
         const int id_task = id_task_ckpt >= 0 ? id_task_ckpt : slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3121,7 +3121,7 @@ private:
     static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
 
     // the live draft state of a slot: the full draft context and the speculative state
-    void capture_slot_draft(const server_slot & slot, std::vector<uint8_t> & data_dft, std::vector<uint8_t> & data_spec) const {
+    void capture_slot_draft(const server_slot & slot, common_state_data & data_dft, std::vector<uint8_t> & data_spec) const {
         data_dft.clear();
         data_spec.clear();
         if (ctx_dft != nullptr) {
@@ -3132,7 +3132,7 @@ private:
     }
 
     // returns false if the draft state could not be written completely; slot is only used for logging, may be null
-    bool save_slot_draft(const std::string & filepath, const std::vector<uint8_t> & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
+    bool save_slot_draft(const std::string & filepath, const common_state_data & data_dft, const std::vector<uint8_t> & data_spec, const server_slot * slot, size_t & n_written) const {
         n_written = 0;
         if (data_dft.empty() && data_spec.empty()) {
             return true;
@@ -3210,7 +3210,7 @@ private:
             const server_slot * slot,
             const std::function<size_t(const std::string &)> & write_state,
             const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
-            const std::vector<uint8_t> & data_dft,
+            const common_state_data & data_dft,
             const std::vector<uint8_t> & data_spec,
             std::string & err) const {
         const std::filesystem::path fspath = std::filesystem::u8path(filepath);
@@ -3410,7 +3410,7 @@ private:
             const server_tokens & tokens,
             const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
             const std::function<size_t(const std::string &, const std::vector<char> &)> & write_state,
-            const std::vector<uint8_t> & data_dft,
+            const common_state_data & data_dft,
             const std::vector<uint8_t> & data_spec) {
         const int64_t t_start = ggml_time_us();
 
@@ -3534,7 +3534,7 @@ private:
             return false; // skipped for another reason, e.g. already in the cache
         }
 
-        std::vector<uint8_t> data_dft;
+        common_state_data data_dft;
         std::vector<uint8_t> data_spec;
         capture_slot_draft(slot, data_dft, data_spec);
 
@@ -3569,7 +3569,7 @@ private:
                 continue;
             }
 
-            std::vector<uint8_t> data_dft;
+            common_state_data data_dft;
             std::vector<uint8_t> data_spec;
             capture_slot_draft(slot, data_dft, data_spec);
 
@@ -3883,7 +3883,7 @@ private:
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
 
-                    std::vector<uint8_t> data_dft;
+                    common_state_data data_dft;
                     std::vector<uint8_t> data_spec;
                     capture_slot_draft(*slot, data_dft, data_spec);
 
@@ -4370,7 +4370,7 @@ private:
                         do_checkpoint ? "yes" : "no", cap.n_tokens, pos_min, pos_max);
 
                 // the draft state: captured, not started yet, or read now and trimmed on restore
-                std::vector<uint8_t> data_dft;
+                common_state_data data_dft;
                 bool read_dft_now = false;
                 if (do_checkpoint && ctx_dft) {
                     const size_t n_dft = ckpt_capture_dft ? llama_state_seq_capture_get(ctx_dft, slot.id, cap.pos, nullptr, 0, nullptr, nullptr) : 0;
@@ -4388,7 +4388,7 @@ private:
                 }
 
                 if (do_checkpoint) {
-                    std::vector<uint8_t> data(n);
+                    common_state_data data(n);
                     llama_state_seq_capture_get(ctx_tgt, slot.id, cap.pos, data.data(), data.size(), nullptr, nullptr);
 
                     create_checkpoint(slot, cap.n_tokens, pos_min, pos_max, &data, read_dft_now ? nullptr : &data_dft, cap.id_task);

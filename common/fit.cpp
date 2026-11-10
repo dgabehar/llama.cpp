@@ -309,17 +309,18 @@ common_device_memory_data_vec common_get_device_memory_data(
 }
 
 common_device_memory_data_vec common_get_device_memory_data_with_extra(
-        const char * path_model,
+        const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         const common_fit_extra_model * extra,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
         ggml_log_level log_level) {
+    uint32_t hp_nsk = 0;
     uint32_t hp_nct = 0;
     uint32_t hp_nex = 0;
     std::vector<llama_device_memory_data> main = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
     // the graph node counts describe the main model, not the extra one probed below
     const int32_t nodes_pp = g_last_graph_nodes_pp;
     const int32_t nodes_tg = g_last_graph_nodes_tg;
@@ -327,13 +328,14 @@ common_device_memory_data_vec common_get_device_memory_data_with_extra(
     if (extra != nullptr) {
         std::vector<ggml_backend_dev_t> devs_extra;
         uint32_t ngl_extra = 0;
+        uint32_t nsk_extra = 0;
         uint32_t nct_extra = 0;
         uint32_t nex_extra = 0;
         llama_context_params cparams_extra = *extra->cparams;
         cparams_extra.n_ctx = cparams->n_ctx;
         try {
             const auto measured = common_get_device_memory_data_impl(
-                extra->path_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                extra->paths_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
             for (size_t je = 0; je < devs_extra.size(); je++) {
                 for (size_t id = 0; id < devs.size(); id++) {
                     if (devs_extra[je] == devs[id]) {

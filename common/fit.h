@@ -104,7 +104,7 @@ void common_fit_last_graph_nodes(int32_t & pp, int32_t & tg);
 // Same as common_get_device_memory_data, plus the memory of an extra model (draft/MTP) added to the
 // main model's devices the way common_fit_params accounts for it. extra may be nullptr.
 common_device_memory_data_vec common_get_device_memory_data_with_extra(
-                         const char * path_model,
+       const std::vector<std::string> & paths_model,
                  const llama_model_params * mparams,
                const llama_context_params * cparams,
        const common_fit_extra_model * extra,
